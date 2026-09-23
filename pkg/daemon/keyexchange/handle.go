@@ -203,6 +203,12 @@ func (m *Manager) HandleAuthFrame(data []byte, from *net.UDPAddr, fromRelay bool
 		// peers can both observe InboundDecryptStale on every incoming
 		// PILA and ping-pong replies at the relay's send cadence — the
 		// 466-establish-events storm against nasa-apod on 2026-05-26.
+		//
+		// The postInstall hook above has already run for this frame, so
+		// it must not record inbound liveness for a same-session PILA:
+		// doing so closed this gate on exactly the PILAs it exists for
+		// (2026-09-23 desync loop). tunnel.onKeyInstalled only records it
+		// for a real install.
 		if m.InboundDecryptStale(peerNodeID) && m.MarkReplyKeyExchangeSent(peerNodeID) {
 			m.SendKeyExchangeToNode(peerNodeID)
 		}

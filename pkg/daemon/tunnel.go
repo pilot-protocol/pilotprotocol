@@ -1440,20 +1440,30 @@ func (tm *TunnelManager) onKeyInstalled(ev keyexchange.PostInstallEvent) {
 	from := ev.From
 	fromRelay := ev.FromRelay
 
-	// A valid PILA install is proof of peer liveness — the Ed25519
-	// signature was verified by HandleAuthFrame before this hook fires
-	// (or for the unauthenticated path, the X25519 derivation succeeded,
-	// which also proves a live peer at the source address). Record it
-	// as a successful inbound event so handle.go's stale-recovery branch
-	// (InboundDecryptStale-gated reply) stops re-firing on every PILA
-	// arrival when AEAD data has not yet started flowing — e.g. when the
-	// peer's replay window holds back all encrypted data while the
-	// OutsideWindowDropThreshold gate works toward recovery. Without
-	// this, lastInboundDecrypt stays empty across the whole rekey
-	// settle-in window, the asymmetric-recovery branch keeps firing,
-	// and the per-peer 1s reply cooldown holds the ping-pong back but
-	// never lets the staleness flag clear.
-	tm.recordInboundDecrypt(peerNodeID)
+	// A key exchange that INSTALLED a session (first install or a real
+	// rekey) is proof of peer liveness — the Ed25519 signature was
+	// verified by HandleAuthFrame before this hook fires (or for the
+	// unauthenticated path, the X25519 derivation succeeded, which also
+	// proves a live peer at the source address). Record it as a
+	// successful inbound event so handle.go's stale-recovery branch
+	// (InboundDecryptStale-gated reply) does not fire on the handshake's
+	// own trailing PILAs before AEAD data has started flowing.
+	//
+	// A same-session PILA (hadCrypto && !keyChanged) must NOT stamp it.
+	// This hook runs BEFORE handle.go evaluates the stale-recovery reply
+	// gate, so stamping here closed that gate on every such PILA — and a
+	// same-key PILA is exactly what a peer that lost its half of our
+	// session sends us: it has our X25519 key but no session, and only our
+	// reply lets it re-derive one. With the stamp, that reply could never
+	// fire past the 250ms debounce, the peer's PILAs also kept our path
+	// watchdog convinced it was alive, and the pair stayed one-sided until
+	// a restart (2026-09-23 desync loop; the drop gates in handleEncrypted
+	// reach the same state). Receiving a key exchange is also not proof
+	// that the session carries traffic — see ClearPendingRekey, which for
+	// the same reason must not lift the rekey give-up cooldown.
+	if !ev.HadCrypto || ev.KeyChanged {
+		tm.recordInboundDecrypt(peerNodeID)
+	}
 
 	tm.mu.Lock()
 	if !fromRelay {
@@ -1513,8 +1523,27 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 	res := envelope.DecryptFrame(tm.envelope, data)
 	peerNodeID := res.PeerNodeID
 
+	// The three drop gates below (ErrOutsideWindow, ErrReplay, ErrAEAD)
+	// drop only OUR half of the session; the peer keeps its own. A peer
+	// that re-derived its half (restarted counter, new nonce prefix) no
+	// longer reaches them — envelope.DecryptFrame opens its new epoch
+	// instead — so they fire on same-epoch rejections and key divergence
+	// only. After a drop, our maybeRequestRekey PILA reaches the peer as a
+	// same-key exchange: a peer running this version answers it once we
+	// have been silent past KeyExchangeReplyStaleThreshold (onKeyInstalled
+	// no longer closes that reply gate) and accepts the session we then
+	// re-derive as our new epoch. A v1.11–v1.13 holder never answers a
+	// same-key exchange; that residual is fixed on its side by upgrading.
 	switch res.Err {
 	case envelope.ErrTooShort:
+		return
+	case envelope.ErrStaleEpoch:
+		// Authenticated, but a duplicate or too-old frame of an earlier
+		// peer send epoch (see envelope.DecryptFrame) — a straggler from
+		// before the peer re-derived, or a replay of one. Never a reason
+		// to touch the session.
+		slog.Debug("tunnel frame from an earlier peer epoch rejected",
+			"peer_node_id", peerNodeID, "counter", res.Counter)
 		return
 	case keyexchange.ErrNoKey:
 		// We have no key for this peer. Typically this happens after a local
@@ -1643,6 +1672,16 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 			}
 		}
 		return
+	}
+
+	if res.NewEpoch {
+		// The peer re-derived its half of our session (same keys, send
+		// counter restarted) — e.g. it dropped its half and answered our
+		// key exchange, or re-handshook after its own path reset. The
+		// envelope gave the new epoch a fresh replay window, so the session
+		// keeps working with no teardown on either side.
+		slog.Info("peer started a new session epoch, fresh receive window",
+			"peer_node_id", peerNodeID, "counter", res.Counter)
 	}
 
 	plaintext := res.Plaintext
@@ -2169,23 +2208,39 @@ func (tm *TunnelManager) AddPeer(nodeID uint32, addr *net.UDPAddr) {
 // previous tenant).
 func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 	tm.envelope.Drop(nodeID)
-	tm.RemovePeerPath(nodeID)
+	tm.mu.Lock()
+	delete(tm.peers, nodeID)
+	tm.mu.Unlock()
+	// L4-owned per-peer state (relayPeers, relayPinned, lastDirectRecv,
+	// blackholeMissCount, directClearCount, sendErrCount, lastOutboundSend).
+	tm.routing.RemovePeer(nodeID)
+	// L5-owned per-peer state (peerPubKeys, pendingRekey, lastInboundDecrypt).
+	tm.kx.RemovePeer(nodeID)
 }
 
-// RemovePeerPath is RemovePeer minus the session keys: it drops the peer's
+// RemovePeerPath is RemovePeer minus the session: it drops the peer's
 // endpoint, L4 routing metadata and L5 rekey bookkeeping so the next send
-// takes a freshly resolved path, but leaves the installed Crypto alone.
+// takes a freshly resolved path, but leaves the installed Crypto — and,
+// with it, the session's inbound-liveness timestamp — alone.
 //
 // Used by resetPeerPath. A path reset must not touch keys: they are not
-// bound to an endpoint, and dropping only OUR half of a session cannot be
-// undone in-process. The peer keeps its half, keyed to our X25519 key,
-// which is fixed for the lifetime of this process — so our re-handshake
-// PILA reaches it as a same-session keepalive: nothing to install, no
-// reply. The peer keeps sending under the session we threw away, every
-// frame hits "no key", and every rekey we send goes unanswered until a
-// restart brings a new X25519 key (2026-09-23 desync loop). Genuinely bad
-// keys are handled elsewhere: the envelope drop gates in handleEncrypted,
-// and keyChanged when the peer re-handshakes with a new key.
+// bound to an endpoint, and dropping only OUR half of a session is the
+// one state a v1.11–v1.13 peer never answers. The peer keeps its half,
+// keyed to our X25519 key, which is fixed for the lifetime of this
+// process — so our re-handshake PILA reaches it as a same-session
+// keepalive, which those versions ignore (their liveness stamp closes
+// their reply gate first). The peer keeps sending under the session we
+// threw away, every frame hits "no key", and every rekey we send goes
+// unanswered until a restart brings a new X25519 key (2026-09-23 desync
+// loop). The drop gates in handleEncrypted can still reach that state;
+// between peers running this version it recovers because onKeyInstalled
+// no longer closes the reply gate, but older holders cannot be fixed
+// from our side — which is why nothing that only suspects the PATH may
+// drop keys.
+//
+// A kept session whose re-resolve then fails has no tm.peers entry, so
+// nothing that walks tm.peers sees it; ReapDetachedSessions bounds its
+// lifetime.
 func (tm *TunnelManager) RemovePeerPath(nodeID uint32) {
 	tm.mu.Lock()
 	delete(tm.peers, nodeID)
@@ -2195,8 +2250,71 @@ func (tm *TunnelManager) RemovePeerPath(nodeID uint32) {
 	// blackholeMissCount, directClearCount, sendErrCount, lastOutboundSend).
 	tm.routing.RemovePeer(nodeID)
 
-	// L5-owned per-peer state (peerPubKeys, pendingRekey, lastInboundDecrypt).
-	tm.kx.RemovePeer(nodeID)
+	// L5-owned per-peer state (peerPubKeys, pendingRekey, reply rate
+	// limit). lastInboundDecrypt belongs to the session, so it survives
+	// when the session does.
+	tm.kx.ForgetPeerPath(nodeID, tm.envelope.Has(nodeID))
+}
+
+// ReapDetachedSessions drops sessions that no longer belong to any path:
+// an installed Crypto with no tm.peers entry whose peer has been
+// inbound-silent (no authenticated frame, no session install) for at
+// least idle. Returns how many were dropped. skip, if non-nil, exempts a
+// peer (the daemon passes peers with active connections).
+//
+// Such a session is left by a path reset that kept the session but could
+// not re-resolve the peer (registry unreachable, peer deregistered). It
+// is kept on purpose — if the peer is still there, its next frame
+// decrypts and (direct) re-attaches the path, or its next key exchange
+// re-attaches it, with no re-handshake — but nothing that walks tm.peers
+// (reapStalePeers, keepaliveSweep, the path watchdog) can see it, so
+// without this sweep every departed peer would leak its Crypto (AEAD
+// state plus up to SalvageMaxEntries of recent plaintext) for the life
+// of the process.
+func (tm *TunnelManager) ReapDetachedSessions(idle time.Duration, skip func(nodeID uint32) bool) int {
+	now := time.Now()
+	// One read-locked pass picks the candidates, so the common case (every
+	// session attached) never takes tm.mu for writing.
+	ids := tm.envelope.PeerIDs()
+	detached := ids[:0]
+	tm.mu.RLock()
+	for _, nodeID := range ids {
+		if _, attached := tm.peers[nodeID]; !attached {
+			detached = append(detached, nodeID)
+		}
+	}
+	tm.mu.RUnlock()
+
+	reaped := 0
+	for _, nodeID := range detached {
+		if skip != nil && skip(nodeID) {
+			continue
+		}
+		// tm.mu is held across the check and the drop so a concurrent
+		// re-attach (onKeyInstalled / handleEncrypted address learning
+		// write tm.peers under tm.mu) cannot interleave. Store and kx
+		// locks are leaves, so taking them under tm.mu is in order.
+		tm.mu.Lock()
+		if _, attached := tm.peers[nodeID]; attached {
+			tm.mu.Unlock()
+			continue
+		}
+		if last, ok := tm.kx.LastInboundDecrypt(nodeID); ok && now.Sub(last) < idle {
+			tm.mu.Unlock()
+			continue
+		}
+		pc := tm.envelope.Get(nodeID)
+		dropped := pc != nil && tm.envelope.CompareAndDrop(nodeID, pc)
+		tm.mu.Unlock()
+		if !dropped {
+			continue
+		}
+		tm.routing.RemovePeer(nodeID)
+		tm.kx.RemovePeer(nodeID)
+		reaped++
+		slog.Debug("reaped detached session", "peer_node_id", nodeID)
+	}
+	return reaped
 }
 
 // HasPeer checks if we have a tunnel to a node.

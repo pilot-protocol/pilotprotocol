@@ -5405,14 +5405,16 @@ func (d *Daemon) reRegister() {
 	}
 }
 
+// peerReapIdleTimeout is how long a peer with no active connections may
+// go without contact before reapStalePeers drops its per-peer state.
+const peerReapIdleTimeout = 5 * time.Minute
+
 // reapStalePeers removes tunnel peers that have no active connections
 // and haven't been contacted for peerReapIdleTimeout. Called periodically
 // from idleSweepLoop to prevent unbounded growth of per-peer maps
 // (tm.peers, routing relay/blackhole/send-err maps, keyexchange
 // pubkey/rekey state) in long-running daemons with peer churn.
 func (d *Daemon) reapStalePeers() {
-	const peerReapIdleTimeout = 5 * time.Minute
-
 	active := d.ports.ActiveNodeIDs()
 	now := time.Now()
 	peers := d.tunnels.PeerList()
@@ -5443,6 +5445,13 @@ func (d *Daemon) reapStalePeers() {
 			d.tunnels.RemovePeer(p.NodeID)
 		}
 	}
+
+	// Sessions a path reset kept but could not re-attach to a path (the
+	// re-resolve failed) are invisible to the loop above; drop them once
+	// the peer has been inbound-silent as long as a stale peer.
+	d.tunnels.ReapDetachedSessions(peerReapIdleTimeout, func(nodeID uint32) bool {
+		return active[nodeID]
+	})
 }
 
 // hostnameReannounceLoop periodically re-sets the daemon's hostname

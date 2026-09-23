@@ -18,7 +18,7 @@ package daemon
 // exactly once per process (right after start) and never again after the
 // first reset in that process (~4550 resets each).
 //
-// The chain, one test per link:
+// The chain:
 //
 //  1. The path-watchdog probe had no Dst. Every deployed version answers a
 //     ping with Src = ping.Dst, so the pong came back claiming node 0 and the
@@ -37,6 +37,30 @@ package daemon
 //     A fresh process generates a NEW X25519 keypair, so the peer sees
 //     keyChanged, reinstalls and replies, which is why only a restart
 //     recovered.
+//
+// Keeping the session across a path reset fixes the case above (the peer
+// still holds its half — "case A"), but a session can also be one-sided
+// the other way round ("case B"): the peer threw ITS half away (a
+// v1.13.x path reset or drop gate does exactly that) while we kept ours.
+// Two more links make case B, and the drop gates, recover in-process:
+//
+//  4. A peer that lost its half re-derives the same AEAD key from our PILA
+//     with its send counter restarted at 1 — under a NEW random nonce
+//     prefix. Our kept replay window used to reject that restarted counter
+//     as a replay, and the aged fast-drop then threw OUR half away too,
+//     leaving us keyless against a peer that now holds a fresh session.
+//     envelope.DecryptFrame now treats a never-seen prefix as the peer's
+//     new epoch and gives it a fresh replay window (each epoch keeps its
+//     own, so stragglers and replays of the old one are still judged).
+//  5. The liveness stamp in onKeyInstalled (link 3) is now only taken for a
+//     real install, so a peer that lost its half — and sends us same-key
+//     PILAs — gets our PILA back once we have heard nothing authenticated
+//     from it for KeyExchangeReplyStaleThreshold.
+//
+// All pairs below are two real TunnelManagers talking over loopback, each
+// inside a Daemon with a fake registry, so resetPeerPath, ensureTunnel,
+// the key-exchange loop, the gave-up hook and the real ping handler all run
+// their production code.
 
 import (
 	"crypto/ecdh"
@@ -56,12 +80,38 @@ import (
 
 const desyncTestWait = 2 * time.Second
 
-// startAuthLoopbackTunnel brings tm up the way a daemon does at startup:
-// X25519 encryption, a UDP socket on loopback, a node ID and an Ed25519
-// identity. Frames between two such tunnels go through the real readLoop
-// dispatch. Returns the identity's public key for the peer's verify func.
-func startAuthLoopbackTunnel(t *testing.T, tm *TunnelManager, nodeID uint32) ed25519.PublicKey {
+// desyncRecoverWait bounds recoveries that wait on the stale-recovery reply
+// gate: a side holding the session answers a same-key PILA only once it has
+// had no authenticated traffic from the peer for
+// KeyExchangeReplyStaleThreshold (6s), and the peer's PILAs come every
+// RekeyRetransmitInterval (4s) or rekeyRequestInterval (3s) — ~8-10s worst
+// case on a clean path.
+const desyncRecoverWait = 3 * keyexchange.KeyExchangeReplyStaleThreshold
+
+// desyncNode is one daemon in a desync test pair.
+type desyncNode struct {
+	d    *Daemon
+	tm   *TunnelManager
+	id   uint32
+	idn  *crypto.Identity
+	addr *net.UDPAddr
+	data chan string
+
+	answerPings atomic.Bool
+	// peerAddr is what this node's fake registry resolves its peer to;
+	// empty means "node not found" (peer deregistered).
+	peerAddr atomic.Value // string
+}
+
+// startDesyncNode brings a daemon's tunnel up the way the daemon does at
+// startup (X25519 encryption, a loopback UDP socket, node ID, Ed25519
+// identity) and runs the daemon's route loop reduced to what these tests
+// need: pings go to the real control handler (it answers the path probe),
+// data payloads go to n.data. id may be nil for a fresh identity.
+func startDesyncNode(t *testing.T, nodeID uint32, id *crypto.Identity) *desyncNode {
 	t.Helper()
+	d := New(Config{})
+	tm := d.tunnels
 	if err := tm.EnableEncryption(); err != nil {
 		t.Fatalf("EnableEncryption: %v", err)
 	}
@@ -70,12 +120,194 @@ func startAuthLoopbackTunnel(t *testing.T, tm *TunnelManager, nodeID uint32) ed2
 	}
 	t.Cleanup(func() { tm.Close() })
 	tm.SetNodeID(nodeID)
-	id, err := crypto.GenerateIdentity()
-	if err != nil {
-		t.Fatalf("GenerateIdentity: %v", err)
+	if id == nil {
+		var err error
+		if id, err = crypto.GenerateIdentity(); err != nil {
+			t.Fatalf("GenerateIdentity: %v", err)
+		}
 	}
 	tm.SetIdentity(id)
-	return id.PublicKey
+	n := &desyncNode{d: d, tm: tm, id: nodeID, idn: id, addr: tunnelUDPAddr(t, tm), data: make(chan string, 1024)}
+	n.answerPings.Store(true)
+	n.peerAddr.Store("")
+	go func() {
+		for in := range tm.RecvCh() {
+			if in.Packet.Protocol == protocol.ProtoControl {
+				if n.answerPings.Load() {
+					d.handleControlPacket(in.Packet)
+				}
+				continue
+			}
+			select {
+			case n.data <- string(in.Packet.Payload):
+			default:
+			}
+		}
+	}()
+	return n
+}
+
+// useRegistry points n at a fake registry that resolves peerID to
+// n.peerAddr (or "node not found" while it is empty) and knows the given
+// Ed25519 keys, so resetPeerPath/ensureTunnel run their full sequence.
+func (n *desyncNode) useRegistry(t *testing.T, peerID uint32, keys map[uint32]ed25519.PublicKey) {
+	t.Helper()
+	n.tm.SetPeerVerifyFunc(registryKeys(keys))
+	rc, stop := startFakeRegistry(t, func(req map[string]interface{}) map[string]interface{} {
+		if req["type"] != "resolve" {
+			return map[string]interface{}{}
+		}
+		addr, _ := n.peerAddr.Load().(string)
+		if addr == "" {
+			return map[string]interface{}{"type": "error", "error": "node not found"}
+		}
+		return map[string]interface{}{"node_id": float64(peerID), "real_addr": addr}
+	})
+	t.Cleanup(stop)
+	n.d.regConn.Store(rc)
+}
+
+// newDesyncNodes starts two daemons that can resolve and verify each other.
+// No session exists yet — see handshake / establishAgedSession.
+func newDesyncNodes(t *testing.T, aID, bID uint32) (a, b *desyncNode) {
+	t.Helper()
+	a, b = startDesyncNode(t, aID, nil), startDesyncNode(t, bID, nil)
+	keys := map[uint32]ed25519.PublicKey{aID: a.idn.PublicKey, bID: b.idn.PublicKey}
+	a.peerAddr.Store(b.addr.String())
+	b.peerAddr.Store(a.addr.String())
+	a.useRegistry(t, bID, keys)
+	b.useRegistry(t, aID, keys)
+	return a, b
+}
+
+// handshake runs the real key exchange a→b, like the first second of a
+// fresh process in the incident.
+func handshake(t *testing.T, a, b *desyncNode) {
+	t.Helper()
+	a.tm.AddPeer(b.id, b.addr)
+	waitUntil(t, "initial handshake", func() bool { return a.tm.HasCrypto(b.id) && b.tm.HasCrypto(a.id) })
+	// Past the duplicate debounce, so a later PILA is handled as a
+	// same-session keepalive (as in production, >=85s later) rather than
+	// coalesced; also lets the handshake's trailing PILAs settle.
+	time.Sleep(keyexchange.DuplicateHandshakeDebounce + 50*time.Millisecond)
+}
+
+// establishAgedSession installs, on both sides, the session a completed
+// handshake leaves — but aged past AgedCryptoFastDropAge, like every
+// session a path reset or drop gate meets in production (the watchdog
+// alone needs >=85s of silence). Each Crypto is built and backdated before
+// it is installed, so no other goroutine ever sees it change.
+func establishAgedSession(t *testing.T, a, b *desyncNode) {
+	t.Helper()
+	aged := time.Now().Add(-3 * keyexchange.AgedCryptoFastDropAge)
+	for _, side := range []struct{ self, peer *desyncNode }{{a, b}, {b, a}} {
+		pc, err := side.self.tm.deriveSecret(side.peer.tm.pubKey)
+		if err != nil {
+			t.Fatalf("deriveSecret: %v", err)
+		}
+		pc.Authenticated = true
+		pc.CreatedAt = aged
+		side.self.tm.envelope.Install(side.peer.id, pc)
+		side.self.tm.mu.Lock()
+		side.self.tm.peers[side.peer.id] = side.peer.addr
+		side.self.tm.mu.Unlock()
+		side.self.tm.kx.RecordInboundDecrypt(side.peer.id)
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(desyncTestWait)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// deliver sends one data packet from→to over the tunnel and reports
+// whether the receiver decrypted and delivered it within `within`. With no
+// key the send queues and requests a key exchange, as in production.
+func deliver(from, to *desyncNode, payload string, within time.Duration) bool {
+	pkt := newPacket(payload)
+	pkt.Src.Node = from.id
+	pkt.Dst.Node = to.id
+	_ = from.tm.Send(to.id, pkt)
+	deadline := time.After(within)
+	for {
+		select {
+		case got := <-to.data:
+			if got == payload {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+var desyncSeq atomic.Uint64
+
+// bothWays reports whether a fresh packet gets through in each direction.
+func bothWays(a, b *desyncNode, within time.Duration) bool {
+	n := desyncSeq.Add(1)
+	ab := deliver(a, b, fmt.Sprintf("a-to-b-%d", n), within)
+	ba := deliver(b, a, fmt.Sprintf("b-to-a-%d", n), within)
+	return ab && ba
+}
+
+// recovers keeps offering traffic both ways until it flows in both
+// directions again, and fails the test if that takes longer than limit.
+func recovers(t *testing.T, a, b *desyncNode, limit time.Duration, why string) {
+	t.Helper()
+	start := time.Now()
+	for time.Since(start) < limit {
+		if bothWays(a, b, 500*time.Millisecond) {
+			t.Logf("%s: traffic flows both ways again after %v", why, time.Since(start).Truncate(10*time.Millisecond))
+			return
+		}
+	}
+	t.Fatalf("%s: no two-way traffic within %v without a restart (A has key: %v, B has key: %v)",
+		why, limit, a.tm.HasCrypto(b.id), b.tm.HasCrypto(a.id))
+}
+
+func baseline(t *testing.T, a, b *desyncNode) {
+	t.Helper()
+	for i := 0; i < 3; i++ {
+		if !bothWays(a, b, desyncTestWait) {
+			t.Fatal("baseline: session does not carry data in both directions")
+		}
+	}
+}
+
+// sealFromPeer encrypts pkt exactly as peerNodeID's daemon would for us
+// under pc, returning the handleEncrypted input (frame minus PILS magic).
+func sealFromPeer(t *testing.T, pc *peerCrypto, peerNodeID uint32, counter uint64, pkt *protocol.Packet) []byte {
+	t.Helper()
+	return sealWithPrefix(t, pc, pc.NoncePrefix, peerNodeID, counter, pkt)
+}
+
+// sealWithPrefix is sealFromPeer with an explicit nonce prefix — the
+// prefix a peer's Crypto picks at derivation names its send epoch.
+func sealWithPrefix(t *testing.T, pc *peerCrypto, prefix [4]byte, peerNodeID uint32, counter uint64, pkt *protocol.Packet) []byte {
+	t.Helper()
+	plaintext, err := pkt.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	nonce := make([]byte, pc.AEAD.NonceSize())
+	copy(nonce[0:4], prefix[:])
+	binary.BigEndian.PutUint64(nonce[4:12], counter)
+	aad := make([]byte, 4)
+	binary.BigEndian.PutUint32(aad, peerNodeID)
+	ct := pc.AEAD.Seal(nil, nonce, plaintext, aad)
+	data := make([]byte, 4+12+len(ct))
+	binary.BigEndian.PutUint32(data[0:4], peerNodeID)
+	copy(data[4:16], nonce)
+	copy(data[16:], ct)
+	return data
 }
 
 // registryKeys is a verify func that knows exactly the given node pubkeys,
@@ -98,208 +330,126 @@ func tunnelUDPAddr(t *testing.T, tm *TunnelManager) *net.UDPAddr {
 	return addr
 }
 
-// newDesyncPair builds two daemons talking over loopback: laptop (the
-// side whose path gets reset, with a fake registry that resolves the peer
-// to its endpoint so resetPeerPath runs its full production sequence) and
-// peer. Both have authenticated identities and have completed the initial
-// handshake, like the first second of a fresh process in the incident.
-func newDesyncPair(t *testing.T, laptopID, peerID uint32) (laptop, peer *Daemon) {
-	t.Helper()
-	laptop, peer = New(Config{}), New(Config{})
-	a, b := laptop.tunnels, peer.tunnels
-	keys := map[uint32]ed25519.PublicKey{
-		laptopID: startAuthLoopbackTunnel(t, a, laptopID),
-		peerID:   startAuthLoopbackTunnel(t, b, peerID),
-	}
-	a.SetPeerVerifyFunc(registryKeys(keys))
-	b.SetPeerVerifyFunc(registryKeys(keys))
-	bAddr := tunnelUDPAddr(t, b)
-
-	rc, stopRegistry := startFakeRegistry(t, func(req map[string]interface{}) map[string]interface{} {
-		if req["type"] == "resolve" {
-			return map[string]interface{}{"node_id": float64(peerID), "real_addr": bAddr.String()}
-		}
-		return map[string]interface{}{}
-	})
-	t.Cleanup(stopRegistry)
-	laptop.regConn.Store(rc)
-
-	a.AddPeer(peerID, bAddr)
-	waitUntil(t, "initial handshake", func() bool { return a.HasCrypto(peerID) && b.HasCrypto(laptopID) })
-	// In production the watchdog fires >=85s after the handshake, so the
-	// peer treats a later PILA as a same-session keepalive rather than
-	// coalescing it as a duplicate of the handshake; the wait also lets the
-	// handshake's trailing PILAs settle.
-	time.Sleep(keyexchange.DuplicateHandshakeDebounce + 50*time.Millisecond)
-	return laptop, peer
-}
-
-func waitUntil(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(desyncTestWait)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
-}
-
-// deliveredWithin sends one data packet from→to over the tunnel and
-// reports whether the receiver decrypted and delivered it in time.
-func deliveredWithin(from *TunnelManager, fromID uint32, to *TunnelManager, toID uint32, payload string) bool {
-	pkt := newPacket(payload)
-	pkt.Src.Node = fromID
-	pkt.Dst.Node = toID
-	_ = from.Send(toID, pkt) // with no key it queues + rekeys; delivery is what we assert
-	deadline := time.After(desyncTestWait)
-	for {
-		select {
-		case in, ok := <-to.RecvCh():
-			if !ok {
-				return false
-			}
-			if string(in.Packet.Payload) == payload {
-				return true
-			}
-		case <-deadline:
-			return false
-		}
-	}
-}
-
-// sealFromPeer encrypts pkt exactly as peerNodeID's daemon would for us
-// under pc, returning the handleEncrypted input (frame minus PILS magic).
-func sealFromPeer(t *testing.T, pc *peerCrypto, peerNodeID uint32, counter uint64, pkt *protocol.Packet) []byte {
-	t.Helper()
-	plaintext, err := pkt.Marshal()
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	nonce := make([]byte, pc.AEAD.NonceSize())
-	copy(nonce[0:4], pc.NoncePrefix[:])
-	binary.BigEndian.PutUint64(nonce[4:12], counter)
-	aad := make([]byte, 4)
-	binary.BigEndian.PutUint32(aad, peerNodeID)
-	ct := pc.AEAD.Seal(nil, nonce, plaintext, aad)
-	data := make([]byte, 4+12+len(ct))
-	binary.BigEndian.PutUint32(data[0:4], peerNodeID)
-	copy(data[4:16], nonce)
-	copy(data[16:], ct)
-	return data
-}
+// --- case A: the peer still holds its half -------------------------------
 
 // TestPathResetKeepsSessionWithPeerThatStillHoldsIt is link 3, the reason
 // the loop never converged: after resetPeerPath the peer, which never lost
-// anything, must still be able to talk to us over its existing session.
+// anything, must still be able to talk to us over its existing session —
+// on a busy session and on one that went quiet (both sides past the
+// stale-recovery threshold, so the reset's PILA is answered).
 func TestPathResetKeepsSessionWithPeerThatStillHoldsIt(t *testing.T) {
-	const laptopID, peerID uint32 = 230204, 16392
-	dA, dB := newDesyncPair(t, laptopID, peerID)
-	a, b := dA.tunnels, dB.tunnels
+	for _, quiet := range []bool{false, true} {
+		name := "busy"
+		if quiet {
+			name = "quiet"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			a, b := newDesyncNodes(t, 230204, 16392)
+			establishAgedSession(t, a, b)
+			baseline(t, a, b)
+			if quiet {
+				old := time.Now().Add(-2 * pathSilenceThreshold)
+				a.tm.kx.SetLastInboundDecryptForTest(b.id, old)
+				b.tm.kx.SetLastInboundDecryptForTest(a.id, old)
+			}
+			aPC, bPC := a.tm.envelope.Get(b.id), b.tm.envelope.Get(a.id)
 
-	if !deliveredWithin(b, peerID, a, laptopID, "baseline-b-to-a") ||
-		!deliveredWithin(a, laptopID, b, peerID, "baseline-a-to-b") {
-		t.Fatal("baseline: session does not carry data in both directions")
-	}
-
-	res := dA.resetPeerPath(peerID)
-	if res.ResolveErr != "" || !res.PilaPushed {
-		t.Fatalf("reset did not run its full sequence: %+v", res)
-	}
-	if !res.SessionKept {
-		t.Errorf("reset must report the established session as kept: %+v", res)
-	}
-
-	// The peer noticed nothing and keeps using its session.
-	if !deliveredWithin(b, peerID, a, laptopID, "after-reset-b-to-a") {
-		t.Fatalf("BUG: after resetPeerPath we can no longer decrypt the peer's traffic "+
-			"(we have key: %v, peer has key: %v). The reset dropped our session keys; the peer "+
-			"still holds its half, keyed to our unchanged X25519 key, so it treats our recovery "+
-			"PILA as a same-session keepalive and never replies: the \"no key\" -> \"rekey gave up\" "+
-			"-> \"reset peer path\" loop that only a restart (new X25519 key) escapes",
-			a.HasCrypto(peerID), b.HasCrypto(laptopID))
-	}
-	if !deliveredWithin(a, laptopID, b, peerID, "after-reset-a-to-b") {
-		t.Fatalf("BUG: after resetPeerPath the peer can no longer decrypt our traffic (we have key: %v)",
-			a.HasCrypto(peerID))
+			res := a.d.resetPeerPath(b.id)
+			if res.ResolveErr != "" || !res.PilaPushed || !res.SessionKept {
+				t.Fatalf("reset did not run its full sequence with the session kept: %+v", res)
+			}
+			if !bothWays(a, b, desyncTestWait) {
+				t.Fatalf("BUG: after resetPeerPath the session no longer carries traffic "+
+					"(we have key: %v, peer has key: %v). Dropping our half leaves the peer "+
+					"treating our recovery PILA as a same-session keepalive: the \"no key\" -> "+
+					"\"rekey gave up\" -> \"reset peer path\" loop that only a restart escapes",
+					a.tm.HasCrypto(b.id), b.tm.HasCrypto(a.id))
+			}
+			if a.tm.envelope.Get(b.id) != aPC || b.tm.envelope.Get(a.id) != bPC {
+				t.Fatal("a path reset against a peer that holds the session must not reinstall either half")
+			}
+		})
 	}
 }
 
-// TestPathResetOnLivePathSettlesWithoutGivingUp: once the session survives
-// the reset, the peer answers the recovery PILA with nothing (same session),
-// so the rekey it armed can only be cleared by an inbound decrypt. A quiet
-// peer's next keepalive is up to ~30s away, past the ~24s rekey give-up,
-// which would fire a spurious "rekey gave up" and another reset. The reset
-// must solicit that decrypt itself (path probe → pong) within one RTT.
-func TestPathResetOnLivePathSettlesWithoutGivingUp(t *testing.T) {
-	const laptopID, peerID uint32 = 230204, 242944
-	dA, dB := newDesyncPair(t, laptopID, peerID)
-	a, b := dA.tunnels, dB.tunnels
+// TestPathResetOnKeptSessionIsFireAndForget covers the kept-session reset's
+// PILA: it must not arm the rekey retransmit machinery. A peer holding the
+// session answers that PILA with nothing, so if the single path probe (or
+// its pong) is lost, the retransmits would flip a healthy direct peer to
+// relay after ~4s (RekeyRelayFallbackAfter) and give up after ~20s,
+// firing another full reset. Liveness is proven by the probe instead.
+func TestPathResetOnKeptSessionIsFireAndForget(t *testing.T) {
+	t.Run("live path", func(t *testing.T) {
+		t.Parallel()
+		a, b := newDesyncNodes(t, 230204, 242944)
+		establishAgedSession(t, a, b)
+		stale := time.Now().Add(-2 * pathSilenceThreshold)
+		a.tm.kx.SetLastInboundDecryptForTest(b.id, stale)
 
-	// The peer's route loop, reduced to what matters here: answer pings.
-	go func() {
-		for in := range b.RecvCh() {
-			if in.Packet.Protocol == protocol.ProtoControl {
-				dB.handleControlPacket(in.Packet)
-			}
+		res := a.d.resetPeerPath(b.id)
+		if res.ResolveErr != "" || !res.PilaPushed || !res.SessionKept {
+			t.Fatalf("reset did not run its full sequence with the session kept: %+v", res)
 		}
-	}()
-
-	res := dA.resetPeerPath(peerID)
-	if res.ResolveErr != "" || !res.PilaPushed || !res.SessionKept {
-		t.Fatalf("reset did not run its full sequence with the session kept: %+v", res)
-	}
-	waitUntil(t, "pending rekey cleared by an inbound decrypt from the live path", func() bool {
-		return !a.kx.PendingRekeyHas(peerID)
+		if a.tm.kx.PendingRekeyHas(b.id) {
+			t.Fatal("a kept session's reset PILA must not arm a pending rekey")
+		}
+		waitUntil(t, "the probe's pong to refresh inbound liveness", func() bool {
+			last, ok := a.tm.LastInboundDecrypt(b.id)
+			return ok && last.After(stale.Add(time.Minute))
+		})
 	})
-	if _, ok := a.LastInboundDecrypt(peerID); !ok {
-		t.Fatal("live path must re-record inbound liveness after the reset")
-	}
+	t.Run("probe lost", func(t *testing.T) {
+		t.Parallel()
+		a, b := newDesyncNodes(t, 230204, 242944)
+		establishAgedSession(t, a, b)
+		b.answerPings.Store(false) // the probe or its pong is lost
+
+		res := a.d.resetPeerPath(b.id)
+		if !res.SessionKept || !res.PilaPushed {
+			t.Fatalf("reset did not keep the session: %+v", res)
+		}
+		if a.tm.kx.PendingRekeyHas(b.id) {
+			t.Fatalf("BUG: a kept session's reset PILA armed a pending rekey (attempts=%d): "+
+				"with the probe lost, its retransmits flip a healthy direct peer to relay "+
+				"and give up into another full reset", a.tm.kx.PendingRekeyAttempts(b.id))
+		}
+		a.tm.rekeyRetransmitTick()
+		if a.tm.IsRelayPeer(b.id) {
+			t.Fatal("a healthy direct peer was flipped to relay")
+		}
+		if !bothWays(a, b, desyncTestWait) {
+			t.Fatal("the kept session must keep carrying traffic")
+		}
+	})
 }
 
 // TestPathProbePongRefreshesLiveness is link 1: the pong a peer sends back
 // for our path probe must pass the identity binding and count as inbound
 // liveness, or the watchdog resets every quiet peer it probes.
 func TestPathProbePongRefreshesLiveness(t *testing.T) {
-	const laptopID, peerID uint32 = 230204, 179172
-	dA, dB := newDesyncPair(t, laptopID, peerID)
-	a, b := dA.tunnels, dB.tunnels
+	t.Parallel()
+	a, b := newDesyncNodes(t, 230204, 179172)
+	handshake(t, a, b)
 
 	// The peer has been quiet past the silence threshold: the watchdog
-	// probes it.
+	// probes it, and the peer's real control handler answers, as every
+	// deployed version does: pong.Src = probe.Dst.
 	stale := time.Now().Add(-2 * pathSilenceThreshold)
-	a.kx.SetLastInboundDecryptForTest(peerID, stale)
-	if err := a.SendPathProbe(peerID); err != nil {
+	a.tm.kx.SetLastInboundDecryptForTest(b.id, stale)
+	if err := a.tm.SendPathProbe(b.id); err != nil {
 		t.Fatalf("SendPathProbe: %v", err)
 	}
-
-	// The peer's real control handler answers, as every deployed version
-	// does: pong.Src = probe.Dst.
-	var probe *protocol.Packet
-	deadline := time.After(desyncTestWait)
-	for probe == nil {
-		select {
-		case in := <-b.RecvCh():
-			if in.Packet.Protocol == protocol.ProtoControl && in.Packet.DstPort == protocol.PortPing {
-				probe = in.Packet
-			}
-		case <-deadline:
-			t.Fatal("peer never received the path probe")
-		}
-	}
-	dB.handleControlPacket(probe)
-
-	deadlineT := time.Now().Add(desyncTestWait)
-	for time.Now().Before(deadlineT) {
-		if last, ok := a.LastInboundDecrypt(peerID); ok && last.After(stale.Add(time.Minute)) {
+	deadline := time.Now().Add(desyncTestWait)
+	for time.Now().Before(deadline) {
+		if last, ok := a.tm.LastInboundDecrypt(b.id); ok && last.After(stale.Add(time.Minute)) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("BUG: the peer's pong did not refresh inbound liveness (probe Dst=%d, so pong Src=%d): "+
-		"the identity binding drops it as spoofed and the watchdog resets a healthy path",
-		probe.Dst.Node, probe.Dst.Node)
+	t.Fatal("BUG: the peer's pong did not refresh inbound liveness: without Dst on the probe " +
+		"the pong claims Src=0, the identity binding drops it as spoofed and the watchdog " +
+		"resets a healthy path")
 }
 
 // TestLegacyUnstampedKeepaliveCountsAsLiveness is link 2: the zero-Src NAT
@@ -366,5 +516,307 @@ func TestLegacyUnstampedKeepaliveCountsAsLiveness(t *testing.T) {
 	case in := <-tm2.RecvCh():
 		t.Fatalf("zero-Src frame with a payload must not be delivered, got %q", in.Packet.Payload)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// --- case B: the peer lost its half ---------------------------------------
+
+// dropHalfLikeOldReset is what every v1.10–v1.13 peer's resetPeerPath
+// (watchdog, rekey gave up, prefer-direct) does to its half of the
+// session: RemovePeer drops the keys with the path, then ensureTunnel's
+// AddPeer pushes a fresh PILA — under the same X25519 key, since the
+// process did not restart.
+func dropHalfLikeOldReset(n, peer *desyncNode, pushPILA bool) {
+	n.tm.RemovePeer(peer.id)
+	if pushPILA {
+		n.tm.AddPeer(peer.id, peer.addr)
+	}
+}
+
+// TestPathResetRecoversPeerThatLostItsHalf: the peer already threw its half
+// away, then our side resets the path (watchdog, rekey gave up or
+// prefer-direct). The session we keep must converge with the one the peer
+// re-derives from our PILA — whose send counter restarts at 1 — without
+// either side restarting, and without our half being dropped on the way.
+func TestPathResetRecoversPeerThatLostItsHalf(t *testing.T) {
+	t.Parallel()
+	a, b := newDesyncNodes(t, 230204, 16392)
+	establishAgedSession(t, a, b)
+	baseline(t, a, b)
+	ours := a.tm.envelope.Get(b.id)
+
+	dropHalfLikeOldReset(b, a, false)
+	res := a.d.resetPeerPath(b.id)
+	if !res.SessionKept || !res.PilaPushed {
+		t.Fatalf("reset did not keep our session: %+v", res)
+	}
+	if !bothWays(a, b, desyncTestWait) {
+		t.Fatalf("BUG: the peer re-derived the session from our PILA but traffic does not flow "+
+			"(we have key: %v, peer has key: %v). Its restarted send counter hit our kept replay "+
+			"window, the aged fast-drop threw our half away, and the peer — now holding a fresh "+
+			"session — ignores our re-handshake as a same-session keepalive",
+			a.tm.HasCrypto(b.id), b.tm.HasCrypto(a.id))
+	}
+	if a.tm.envelope.Get(b.id) != ours {
+		t.Fatal("our half must survive: the peer's new epoch gets a fresh window, it does not drop the session")
+	}
+}
+
+// TestSimultaneousPathResetsWithPeerThatDropsItsHalf: one dead path makes
+// both watchdogs fire. The peer runs v1.10–v1.13 (its reset drops its half
+// and pushes a PILA), we run this build. Both orders must converge.
+func TestSimultaneousPathResetsWithPeerThatDropsItsHalf(t *testing.T) {
+	for _, order := range []string{"peer-first", "we-first"} {
+		t.Run(order, func(t *testing.T) {
+			t.Parallel()
+			a, b := newDesyncNodes(t, 230204, 16392)
+			establishAgedSession(t, a, b)
+			baseline(t, a, b)
+			ours := a.tm.envelope.Get(b.id)
+
+			if order == "peer-first" {
+				dropHalfLikeOldReset(b, a, true)
+				a.d.resetPeerPath(b.id)
+			} else {
+				// Our reset completes first — its PILA reached the peer as
+				// a same-session keepalive and the probe was answered —
+				// and only then does the peer drop its half. We now hold
+				// fresh liveness, so our answer to its PILAs waits out the
+				// stale-recovery threshold.
+				before := time.Now()
+				a.d.resetPeerPath(b.id)
+				waitUntil(t, "our reset's probe to be answered", func() bool {
+					last, ok := a.tm.LastInboundDecrypt(b.id)
+					return ok && last.After(before)
+				})
+				dropHalfLikeOldReset(b, a, true)
+			}
+			recovers(t, a, b, desyncRecoverWait, order)
+			if a.tm.envelope.Get(b.id) != ours {
+				t.Fatal("our half must survive both resets")
+			}
+		})
+	}
+}
+
+// TestPeerThatLostItsHalfIsAnsweredWithoutAReset: the peer threw its half
+// away and asks for ours with same-key PILAs; nothing on our side resets.
+// Link 5: we must answer once the peer has been silent past the
+// stale-recovery threshold. Before, onKeyInstalled stamped liveness on
+// every such PILA before the reply gate ran, so the reply never fired —
+// and those PILAs also kept our path watchdog from ever noticing.
+func TestPeerThatLostItsHalfIsAnsweredWithoutAReset(t *testing.T) {
+	t.Parallel()
+	a, b := newDesyncNodes(t, 230204, 242944)
+	establishAgedSession(t, a, b)
+	baseline(t, a, b)
+	ours := a.tm.envelope.Get(b.id)
+
+	dropHalfLikeOldReset(b, a, true)
+	recovers(t, a, b, desyncRecoverWait, "peer lost its half")
+	if a.tm.envelope.Get(b.id) != ours {
+		t.Fatal("answering the peer must not reinstall our half")
+	}
+}
+
+// TestPeerRestartMidSessionRecovers: the peer's process restarts (new
+// X25519 key and port, same node ID and identity) and dials us again. We
+// must pick the new session up in place.
+func TestPeerRestartMidSessionRecovers(t *testing.T) {
+	t.Parallel()
+	a, b := newDesyncNodes(t, 230204, 179172)
+	establishAgedSession(t, a, b)
+	baseline(t, a, b)
+	old := a.tm.envelope.Get(b.id)
+
+	b.tm.Close() // the old process is gone
+	b2 := startDesyncNode(t, b.id, b.idn)
+	keys := map[uint32]ed25519.PublicKey{a.id: a.idn.PublicKey, b.id: b.idn.PublicKey}
+	b2.peerAddr.Store(a.addr.String())
+	b2.useRegistry(t, a.id, keys)
+	a.peerAddr.Store(b2.addr.String())
+
+	b2.tm.AddPeer(a.id, a.addr)
+	recovers(t, a, b2, desyncRecoverWait, "peer restarted")
+	if a.tm.envelope.Get(b.id) == old {
+		t.Fatal("the restarted peer's new X25519 key must replace the old session")
+	}
+}
+
+// --- the drop gates --------------------------------------------------------
+
+// TestDropGateOnOurHalfRecoversWithoutRestart: one of handleEncrypted's
+// drop gates throws OUR half away while the peer keeps its own — here the
+// aged fast path on an authenticated in-window replay (a duplicate
+// delivery, or a late relay-buffered frame for the outside-window gate).
+// The peer runs this build: it must answer our re-handshake once we have
+// been silent past the stale-recovery threshold, and the session we then
+// re-derive — send counter restarted under a new prefix — must be accepted
+// by its kept window as our new epoch.
+func TestDropGateOnOurHalfRecoversWithoutRestart(t *testing.T) {
+	t.Parallel()
+	a, b := newDesyncNodes(t, 230204, 16392)
+	establishAgedSession(t, a, b)
+	baseline(t, a, b)
+
+	// Re-deliver B's first frame to A: authenticated, current epoch,
+	// already seen. On an aged session the replay gate drops A's half.
+	replay := sealFromPeer(t, b.tm.envelope.Get(a.id), b.id, 1, newPacket("duplicate"))
+	conn, err := net.DialUDP("udp", nil, a.addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(append(append([]byte{}, protocol.TunnelMagicSecure[:]...), replay...)); err != nil {
+		t.Fatalf("write replay: %v", err)
+	}
+	waitUntil(t, "the replay drop gate to drop our half", func() bool { return !a.tm.HasCrypto(b.id) })
+	if !b.tm.HasCrypto(a.id) {
+		t.Fatal("setup: the peer must still hold its half")
+	}
+
+	recovers(t, a, b, desyncRecoverWait, "drop gate")
+}
+
+// TestPeerNewEpochDoesNotTripAgedDropGates is link 4 at the tunnel layer:
+// a peer that re-derived our session (same AEAD key, counter restarted at
+// 1 under a new nonce prefix) is delivered from its first frame, with no
+// drop and no rekey; frames of its previous epoch are judged in that
+// epoch's own window without touching the session either.
+func TestPeerNewEpochDoesNotTripAgedDropGates(t *testing.T) {
+	t.Parallel()
+	const peerID uint32 = 0x44444444
+	tm := NewTunnelManager()
+	t.Cleanup(func() { tm.Close() })
+	if err := tm.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if err := tm.EnableEncryption(); err != nil {
+		t.Fatalf("EnableEncryption: %v", err)
+	}
+	tm.SetNodeID(0x33333333)
+	peerAddr := mustUDPAddr(t, "127.0.0.1:56789")
+	peerPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("peer keygen: %v", err)
+	}
+	pc, err := tm.deriveSecret(peerPriv.PublicKey().Bytes())
+	if err != nil {
+		t.Fatalf("deriveSecret: %v", err)
+	}
+	pc.CreatedAt = time.Now().Add(-time.Hour)
+	tm.mu.Lock()
+	tm.peers[peerID] = peerAddr
+	tm.mu.Unlock()
+	tm.envelope.Install(peerID, pc)
+
+	pkt := func(s string) *protocol.Packet {
+		p := newPacket(s)
+		p.Src.Node = peerID
+		return p
+	}
+	recv := func(want string) {
+		t.Helper()
+		select {
+		case in := <-tm.RecvCh():
+			if string(in.Packet.Payload) != want {
+				t.Fatalf("delivered %q, want %q", in.Packet.Payload, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%q was not delivered", want)
+		}
+	}
+	rekeyRequested := func() bool {
+		tm.rekeyMu.Lock()
+		defer tm.rekeyMu.Unlock()
+		_, ok := tm.lastRekeyReq[peerID]
+		return ok
+	}
+
+	oldEpoch := [4]byte{1, 1, 1, 1}
+	newEpoch := [4]byte{2, 2, 2, 2}
+	for i := uint64(1); i <= 300; i++ { // past the 256-frame window
+		tm.handleEncrypted(sealWithPrefix(t, pc, oldEpoch, peerID, i, pkt("old")), peerAddr)
+		recv("old")
+	}
+
+	// The peer re-derives: its first frame is counter 1, outside our
+	// window — on the aged session the old code dropped it on sight.
+	tm.handleEncrypted(sealWithPrefix(t, pc, newEpoch, peerID, 1, pkt("new-1")), peerAddr)
+	recv("new-1")
+	tm.handleEncrypted(sealWithPrefix(t, pc, newEpoch, peerID, 2, pkt("new-2")), peerAddr)
+	recv("new-2")
+	if tm.envelope.Get(peerID) != pc || rekeyRequested() {
+		t.Fatal("the peer's new epoch must not drop the session or request a rekey")
+	}
+
+	// Frames of the previous epoch are judged in that epoch's own window:
+	// a late one it never saw is delivered, a duplicate is dropped — and
+	// neither drops the session or requests a rekey.
+	tm.handleEncrypted(sealWithPrefix(t, pc, oldEpoch, peerID, 301, pkt("straggler")), peerAddr)
+	recv("straggler")
+	tm.handleEncrypted(sealWithPrefix(t, pc, oldEpoch, peerID, 300, pkt("duplicate")), peerAddr)
+	select {
+	case in := <-tm.RecvCh():
+		t.Fatalf("a duplicate from the peer's previous epoch was delivered: %q", in.Packet.Payload)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if tm.envelope.Get(peerID) != pc || rekeyRequested() {
+		t.Fatal("a previous-epoch frame must not drop the session or request a rekey")
+	}
+
+	// The new epoch's window is untouched by all of that.
+	tm.handleEncrypted(sealWithPrefix(t, pc, newEpoch, peerID, 3, pkt("new-3")), peerAddr)
+	recv("new-3")
+}
+
+// --- a reset whose re-resolve fails ---------------------------------------
+
+// TestResetWithFailedResolveKeepsDetachedSessionBounded: the reset keeps
+// the session but cannot re-resolve the peer, so the session has no path
+// entry. A live peer re-attaches it with its next frame; a departed peer's
+// session is reaped once it has been silent as long as a stale peer —
+// instead of leaking for the life of the process.
+func TestResetWithFailedResolveKeepsDetachedSessionBounded(t *testing.T) {
+	t.Parallel()
+	a, b := newDesyncNodes(t, 230204, 16392)
+	establishAgedSession(t, a, b)
+	baseline(t, a, b)
+
+	a.peerAddr.Store("") // registry: "node not found"
+	res := a.d.resetPeerPath(b.id)
+	if !res.SessionKept || res.ResolveErr == "" {
+		t.Fatalf("want a kept session with a failed re-resolve, got %+v", res)
+	}
+	if a.tm.HasPeer(b.id) || !a.tm.HasCrypto(b.id) {
+		t.Fatalf("want a detached session (no path, keys kept): hasPeer=%v hasCrypto=%v",
+			a.tm.HasPeer(b.id), a.tm.HasCrypto(b.id))
+	}
+
+	// Registry blip, peer alive: the sweep keeps it, and the peer's next
+	// (direct) frame re-attaches the path.
+	a.d.reapStalePeers()
+	if !a.tm.HasCrypto(b.id) {
+		t.Fatal("a detached session with a live peer must not be reaped")
+	}
+	if !deliver(b, a, "reattach", desyncTestWait) || !a.tm.HasPeer(b.id) {
+		t.Fatal("the peer's next frame must decrypt and re-attach the path")
+	}
+	if !bothWays(a, b, desyncTestWait) {
+		t.Fatal("the re-attached session must carry traffic both ways")
+	}
+
+	// Peer gone for good: another failed reset detaches it again, and
+	// once it has been silent past peerReapIdleTimeout the sweep drops it.
+	b.tm.Close()
+	a.d.resetPeerPath(b.id)
+	a.tm.kx.SetLastInboundDecryptForTest(b.id, time.Now().Add(-2*peerReapIdleTimeout))
+	a.d.reapStalePeers()
+	if a.tm.HasCrypto(b.id) || a.tm.envelope.Len() != 0 {
+		t.Fatalf("BUG: a departed peer's detached session leaked (hasCrypto=%v, sessions=%d): "+
+			"nothing that walks tm.peers can ever reclaim it", a.tm.HasCrypto(b.id), a.tm.envelope.Len())
+	}
+	if _, ok := a.tm.LastInboundDecrypt(b.id); ok {
+		t.Fatal("reaping a detached session must also clear its per-peer liveness state")
 	}
 }

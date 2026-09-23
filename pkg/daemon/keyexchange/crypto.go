@@ -149,7 +149,8 @@ type Crypto struct {
 	NoncePrefix [4]byte // random prefix for nonce domain separation
 
 	// Replay detection (H8 fix): sliding window bitmap instead of simple
-	// high-water mark.
+	// high-water mark. This is the window of the peer's newest send epoch;
+	// see CheckAndRecordEpochNonce.
 	ReplayMu     sync.Mutex
 	MaxRecvNonce uint64                        // highest nonce received
 	ReplayBitmap [ReplayWindowSize / 64]uint64 // bitmap for nonces in [max-windowSize, max]
@@ -212,6 +213,115 @@ type Crypto struct {
 	// when the peer dropped our stale-keyed frames.
 	SalvageMu sync.Mutex
 	Salvage   []SalvageEntry
+
+	// Receive epochs, guarded by ReplayMu. Every sender picks a fresh
+	// random NoncePrefix each time it derives a Crypto (every version
+	// since v1.9 does this in DeriveSecret), and its counter only ever
+	// grows within one Crypto. So the prefix on an authenticated frame
+	// names the sender's session epoch: a prefix we have not seen before
+	// means the peer re-derived its half of the session (same X25519
+	// keys, so the same AEAD key, but a counter restarted at 1). Each
+	// epoch gets its own replay window. MaxRecvNonce/ReplayBitmap are the
+	// window of the NEWEST epoch (recvPrefix); older epochs keep theirs in
+	// olderEpochs. See CheckAndRecordEpochNonce.
+	recvPrefix    [4]byte
+	recvPrefixSet bool
+	olderEpochs   [RetainedRecvEpochs]recvEpochWindow
+	olderCount    int
+	epochClock    uint64
+}
+
+// RetainedRecvEpochs bounds how many earlier peer epochs a Crypto keeps a
+// replay window for, besides the newest. A peer re-derives rarely, so a
+// handful covers any real churn (late stragglers of the previous epoch,
+// replays of it); the least recently used one is forgotten first.
+const RetainedRecvEpochs = 4
+
+// recvEpochWindow is the replay window of one earlier peer epoch.
+type recvEpochWindow struct {
+	prefix  [4]byte
+	max     uint64
+	bitmap  [ReplayWindowSize / 64]uint64
+	lastUse uint64
+}
+
+// RecvEpoch says which of the peer's send epochs an authenticated frame
+// was judged in by CheckAndRecordEpochNonce.
+type RecvEpoch int
+
+const (
+	// RecvEpochNewest: the peer's newest epoch — the window MaxRecvNonce
+	// and ReplayBitmap track. Also the first frame on a fresh Crypto.
+	RecvEpochNewest RecvEpoch = iota
+	// RecvEpochNew: a prefix never seen on this Crypto, replacing an
+	// earlier newest epoch — the peer re-derived its half of the session.
+	// The frame starts a fresh newest window; the previous one is kept.
+	RecvEpochNew
+	// RecvEpochOlder: an earlier epoch still retained, judged against its
+	// own window. Nothing about it says anything about the newest epoch.
+	RecvEpochOlder
+)
+
+// CheckAndRecordEpochNonce is CheckAndRecordNonce for a frame whose nonce
+// carried prefix: it judges (and records) counter in the replay window of
+// the frame's own epoch. A never-seen prefix becomes the newest epoch with
+// a fresh window, keeping the previous newest window for its stragglers.
+// A frame of a retained older epoch is judged against that epoch's window
+// and never touches the newest one, so no frame can lock the peer's live
+// epoch out: its own frames always meet its own window. An epoch that is
+// no longer retained comes back as a new one (like any frame on a fresh
+// window after a re-handshake), which again leaves every other epoch's
+// window intact.
+//
+// Must be called with c.ReplayMu held, and only for frames that passed
+// AEAD authentication.
+func (c *Crypto) CheckAndRecordEpochNonce(prefix [4]byte, counter uint64) (bool, RecvEpoch) {
+	c.epochClock++
+	if !c.recvPrefixSet {
+		c.recvPrefix = prefix
+		c.recvPrefixSet = true
+	}
+	if prefix == c.recvPrefix {
+		return c.CheckAndRecordNonce(counter), RecvEpochNewest
+	}
+	for i := 0; i < c.olderCount; i++ {
+		w := &c.olderEpochs[i]
+		if w.prefix != prefix {
+			continue
+		}
+		w.lastUse = c.epochClock
+		// Judge the frame in its own window: swap it in, check, swap back.
+		c.MaxRecvNonce, w.max = w.max, c.MaxRecvNonce
+		c.ReplayBitmap, w.bitmap = w.bitmap, c.ReplayBitmap
+		ok := c.CheckAndRecordNonce(counter)
+		c.MaxRecvNonce, w.max = w.max, c.MaxRecvNonce
+		c.ReplayBitmap, w.bitmap = w.bitmap, c.ReplayBitmap
+		return ok, RecvEpochOlder
+	}
+
+	// A new epoch: keep the current newest window among the older ones
+	// (forgetting the least recently used if full) and start fresh.
+	slot := c.olderCount
+	if slot < RetainedRecvEpochs {
+		c.olderCount++
+	} else {
+		slot = 0
+		for i := 1; i < RetainedRecvEpochs; i++ {
+			if c.olderEpochs[i].lastUse < c.olderEpochs[slot].lastUse {
+				slot = i
+			}
+		}
+	}
+	c.olderEpochs[slot] = recvEpochWindow{
+		prefix:  c.recvPrefix,
+		max:     c.MaxRecvNonce,
+		bitmap:  c.ReplayBitmap,
+		lastUse: c.epochClock,
+	}
+	c.recvPrefix = prefix
+	c.MaxRecvNonce = 0
+	c.ReplayBitmap = [ReplayWindowSize / 64]uint64{}
+	return c.CheckAndRecordNonce(counter), RecvEpochNew
 }
 
 // CheckAndRecordNonce returns true if the nonce is valid (not replayed,
@@ -263,14 +373,15 @@ func (c *Crypto) CheckAndRecordNonce(counter uint64) bool {
 }
 
 // WouldAcceptNonce reports whether counter would be accepted by
-// CheckAndRecordNonce WITHOUT mutating any replay state. It is the
-// read-only pre-check L6 (envelope) runs before the (expensive) AEAD-Open:
-// obvious replays / out-of-window frames are rejected here so the crypto
-// work is skipped, but — crucially — nothing is recorded. The replay
-// window is only advanced by CheckAndRecordNonce, and L6 calls that ONLY
-// after AEAD.Open authenticates the frame. This ordering is what stops a
-// forged high-counter frame (which fails AEAD) from pinning MaxRecvNonce
-// and wedging every subsequent genuine frame out of the window.
+// CheckAndRecordNonce WITHOUT mutating any replay state — a read-only
+// verdict. (L6's DecryptFrame no longer pre-checks with it: the window a
+// frame is judged in depends on its receive epoch, which only an
+// authenticated frame may decide, so it runs AEAD.Open first and then
+// CheckAndRecordEpochNonce in one critical section.) The replay window is
+// only advanced by CheckAndRecordNonce, and L6 calls that ONLY after
+// AEAD.Open authenticates the frame. This ordering is what stops a forged
+// high-counter frame (which fails AEAD) from pinning MaxRecvNonce and
+// wedging every subsequent genuine frame out of the window.
 //
 // Must be called with c.ReplayMu held. The logic mirrors the accept/reject
 // verdicts of CheckAndRecordNonce exactly, minus the writes.
