@@ -32,10 +32,19 @@
 // truncates, so it creates nothing where someone else could have
 // planted a link.
 //
-// Options.Anywhere and Options.Within set where it applies: the daemon
-// rotates by default only a log inside ~/.pilot, where launchd and
-// `pilotctl daemon start` put it, and a log elsewhere only when the
-// operator asks for rotation explicitly.
+// A rotation that dies between the copy and the compress (crash, kill)
+// leaves <log>.pilot.1 behind; the next rotation in that directory
+// finishes it. That includes another log's copy: `pilotctl daemon start`
+// names each daemon's log pilot-<pid>.log, so no later daemon writes to
+// the name a crashed one staged under. A rotation holds its staged copy
+// flock(2)ed from creation until it is compressed, which is how a copy
+// another live daemon is still working on is told apart and left alone.
+//
+// Options.Anywhere, Options.Within and Options.Files set where it
+// applies: the daemon rotates by default only a log Pilot set up —
+// inside ~/.pilot, where install.sh's launchd job and `pilotctl daemon
+// start` put it, or the Homebrew service's log — and a log elsewhere
+// only when the operator asks for rotation explicitly.
 //
 // When the log is not a regular file — journald under systemd, a
 // terminal, a pipe — there is nothing to cap and the package does
@@ -52,6 +61,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -64,10 +74,15 @@ type Options struct {
 	// without keeping any.
 	MaxBackups int
 	// Anywhere rotates the log wherever it lives. Without it only a log
-	// inside one of the Within directories (at any depth) is rotated, so
-	// the zero Options rotate nothing.
+	// inside one of the Within directories (at any depth), or at one of
+	// the Files paths, is rotated, so the zero Options rotate nothing.
 	Anywhere bool
 	Within   []string
+	// Files are single logs in scope in a directory that is not Pilot's
+	// as a whole, such as the Homebrew service's
+	// <prefix>/var/log/pilot-daemon.log. A log matches one by name within
+	// the same directory, the directory compared by identity.
+	Files []string
 }
 
 // Rotator caps one log file, identified by the descriptor the process
@@ -78,6 +93,7 @@ type Rotator struct {
 	maxBackups int
 	anywhere   bool
 	within     []string
+	files      []string
 }
 
 // New returns a Rotator that rotates f once it exceeds opts.MaxBytes.
@@ -92,12 +108,17 @@ func New(f *os.File, opts Options) *Rotator {
 		maxBackups: backups,
 		anywhere:   opts.Anywhere,
 		within:     opts.Within,
+		files:      opts.Files,
 	}
 }
 
-// errOutOfScope reports a log outside the directories rotation is
-// limited to (Options.Within).
+// errOutOfScope reports a log outside the places rotation is limited to
+// (Options.Within, Options.Files).
 var errOutOfScope = errors.New("log is outside the directories rotation is limited to")
+
+// errBusy reports a staged copy that another rotation holds locked: one
+// still in progress, in this process or another.
+var errBusy = errors.New("staged copy is in use by another rotation")
 
 // Watch checks f every interval until ctx is done, rotating it whenever it
 // has grown past opts.MaxBytes. It returns false, starting nothing, when
@@ -177,27 +198,31 @@ func (r *Rotator) rotate(fi os.FileInfo) (bool, error) {
 		return false, fmt.Errorf("%w: %s", errOutOfScope, path)
 	}
 
-	staged := ""
+	var staged *os.File
 	if src != nil {
 		if r.maxBackups > 0 {
 			staged, backupErr = stage(src, path, r.maxBackups)
 		}
 		_ = src.Close()
 	}
+	if staged != nil {
+		// Closing it releases the lock that marks the copy as in use.
+		defer staged.Close()
+	}
 
 	if err := truncate(r.file); err != nil {
-		if staged != "" {
+		if staged != nil {
 			// Keep the next round from compressing a duplicate.
-			_ = os.Remove(staged)
+			_ = os.Remove(staged.Name())
 		}
 		return false, fmt.Errorf("truncate log: %w", err)
 	}
 
 	backup := ""
-	if staged != "" {
+	if staged != nil {
 		backup = backupName(path, 1)
-		if err := compress(staged, backup); err != nil {
-			backupErr = fmt.Errorf("compress %s: %w", staged, err)
+		if err := compress(staged.Name(), backup); err != nil {
+			backupErr = fmt.Errorf("compress %s: %w", staged.Name(), err)
 			backup = ""
 		}
 	}
@@ -206,6 +231,10 @@ func (r *Rotator) rotate(fi os.FileInfo) (bool, error) {
 		"size_bytes", fi.Size(),
 		"max_bytes", r.maxBytes,
 		"backup", backup)
+	if staged != nil {
+		// After this log's own rotation, so the log is capped first.
+		finishOrphans(path)
+	}
 	return true, backupErr
 }
 
@@ -238,11 +267,11 @@ func namesFile(path string, fi os.FileInfo) bool {
 	return err == nil && os.SameFile(fi, pfi)
 }
 
-// inScope reports whether path lies inside one of r.within. Directories
-// are compared by identity, so a symlinked ~/.pilot, or /var against
-// macOS's /private/var, still matches.
+// inScope reports whether path is one of r.files or lies inside one of
+// r.within. Directories are compared by identity, so a symlinked
+// ~/.pilot, or /var against macOS's /private/var, still matches.
 func (r *Rotator) inScope(path string) bool {
-	if r.anywhere {
+	if r.anywhere || r.isScopedFile(path) {
 		return true
 	}
 	var roots []os.FileInfo
@@ -271,23 +300,50 @@ func (r *Rotator) inScope(path string) bool {
 	}
 }
 
+// isScopedFile reports whether path is one of r.files: the same name in
+// the same directory, compared by identity.
+func (r *Rotator) isScopedFile(path string) bool {
+	var dir os.FileInfo
+	for _, f := range r.files {
+		if filepath.Base(f) != filepath.Base(path) {
+			continue
+		}
+		if dir == nil {
+			fi, err := os.Stat(filepath.Dir(path))
+			if err != nil {
+				return false
+			}
+			dir = fi
+		}
+		if fi, err := os.Stat(filepath.Dir(f)); err == nil && os.SameFile(fi, dir) {
+			return true
+		}
+	}
+	return false
+}
+
 // stage prepares this round's backup: it finishes an interrupted
 // rotation, shifts the older generations up and copies the log (src,
-// open at offset 0) to <path>.pilot.1, whose name it returns. An error
-// means no backup is kept this round.
-func stage(src *os.File, path string, keep int) (string, error) {
+// open at offset 0) to <path>.pilot.1, which it returns open and locked
+// for the caller to close once it is compressed. An error means no
+// backup is kept this round; nothing has moved when the interrupted
+// rotation could not be finished.
+func stage(src *os.File, path string, keep int) (*os.File, error) {
 	if err := checkDir(filepath.Dir(path)); err != nil {
-		return "", fmt.Errorf("keeping no backup: %w", err)
+		return nil, fmt.Errorf("keeping no backup: %w", err)
 	}
-	finishInterrupted(path)
+	if err := finishStaged(path, false); err != nil {
+		return nil, fmt.Errorf("keeping no backup: finish interrupted rotation %s: %w", stagingName(path), err)
+	}
 	if err := shiftBackups(path, keep); err != nil {
-		return "", fmt.Errorf("keeping no backup: %w", err)
+		return nil, fmt.Errorf("keeping no backup: %w", err)
 	}
 	staged := stagingName(path)
-	if err := copyTo(src, staged); err != nil {
-		return "", fmt.Errorf("copy log to %s: %w", staged, err)
+	held, err := createStaged(src, staged)
+	if err != nil {
+		return nil, fmt.Errorf("copy log to %s: %w", staged, err)
 	}
-	return staged, nil
+	return held, nil
 }
 
 // truncate empties the log through the writer's own descriptor.
@@ -310,13 +366,20 @@ func backupName(path string, gen int) string {
 	return fmt.Sprintf("%s.pilot.%d.gz", path, gen)
 }
 
+// stagingSuffix names the uncompressed copy a rotation gzips into
+// generation 1.
+const stagingSuffix = ".pilot.1"
+
 // stagingName is the uncompressed copy a rotation gzips into generation 1.
 func stagingName(path string) string {
-	return path + ".pilot.1"
+	return path + stagingSuffix
 }
 
 // ownerOf is fileOwner; tests swap it to simulate another user's files.
 var ownerOf = fileOwner
+
+// tryLock is flock; tests swap it to simulate a filesystem without locks.
+var tryLock = flock
 
 // ours reports whether fi is a regular file owned by this process's user,
 // the only kind of file logcap reads back, renames or removes.
@@ -418,40 +481,133 @@ func shiftBackups(path string, keep int) error {
 	return nil
 }
 
-// finishInterrupted compresses a <path>.pilot.1 left by a rotation that
-// stopped between the copy and the compress (crash, kill). Its slot is
-// free: the shift that preceded the copy already moved the old
-// <path>.pilot.1.gz up. When it cannot, the staged copy stays where it is
-// and this round keeps no backup (copyTo never replaces a file).
-func finishInterrupted(path string) {
-	staged := stagingName(path)
+// finishStaged compresses <log>.pilot.1, a copy left by a rotation that
+// stopped between the copy and the compress (crash, kill), into
+// <log>.pilot.1.gz. That slot is free: the shift that preceded the copy
+// already moved the old generation 1 up. When it cannot, the copy stays
+// where it is for a later round. A copy a rotation still holds locked is
+// in progress, not interrupted: it is left alone and errBusy returned.
+//
+// For another log's copy (orphan, see finishOrphans) it also leaves alone
+// an empty copy, which a live rotation may have created and not yet
+// locked, and does nothing where the filesystem has no flock, as it then
+// cannot tell a dead rotation's copy from a live one's.
+func finishStaged(log string, orphan bool) error {
+	staged := stagingName(log)
 	exists, err := lookup(staged)
-	if err == nil && !exists {
+	if err != nil || !exists {
+		return err
+	}
+	f, err := openOurs(staged)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if orphan && fi.Size() == 0 {
+		return nil
+	}
+	switch err := tryLock(f); {
+	case err == nil:
+	case errors.Is(err, errBusy):
+		return err
+	case orphan:
+		return nil
+	}
+	// A rotation that held the lock until just now removed the name when
+	// it finished; what is there now, if anything, is a new copy.
+	if !namesFile(staged, fi) {
+		return errBusy
+	}
+	return compress(staged, backupName(log, 1))
+}
+
+// finishOrphans finishes the interrupted rotations of the other logs in
+// path's directory (finishStaged). `pilotctl daemon start` gives each
+// daemon a log of its own, pilot-<pid>.log, so the copy a daemon staged
+// before it died is under a name no later daemon rotates. Best effort: a
+// copy it cannot finish stays for a later round.
+func finishOrphans(path string) {
+	dir := filepath.Dir(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Warn("log rotation: could not look for interrupted backups", "dir", dir, "err", err)
 		return
 	}
-	if err == nil {
-		err = compress(staged, backupName(path, 1))
-	}
-	if err != nil {
-		slog.Warn("log rotation: could not finish interrupted backup", "path", staged, "err", err)
+	own := filepath.Base(stagingName(path))
+	for _, e := range entries {
+		log, ok := strings.CutSuffix(e.Name(), stagingSuffix)
+		if !ok || log == "" || e.Name() == own {
+			continue
+		}
+		if err := finishStaged(filepath.Join(dir, log), true); err != nil && !errors.Is(err, errBusy) {
+			slog.Warn("log rotation: could not finish interrupted backup", "path", filepath.Join(dir, e.Name()), "err", err)
+		}
 	}
 }
 
-// copyTo copies src (from its current offset to EOF) into a new file at
-// dst. O_EXCL|O_NOFOLLOW: it never writes into an existing file or
-// through a link, and removes only the file it created.
-func copyTo(src *os.File, dst string) error {
+// createStaged copies src (from its current offset to EOF) into a new
+// file at dst and returns dst open and locked: the lock marks the copy as
+// in use, so that no other daemon takes it for an interrupted one, until
+// the caller has compressed it and closes the returned file.
+// O_EXCL|O_NOFOLLOW: it never writes into an existing file or through a
+// link, and removes only the file it created.
+func createStaged(src *os.File, dst string) (*os.File, error) {
 	// #nosec G304 -- dst is derived from the daemon's own log path.
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|oNoFollow, 0o600)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	held, err := holdStaged(dst, out)
+	if err != nil {
+		// Not removed: the name may no longer be this file, or another
+		// rotation is finishing it.
+		_ = out.Close()
+		return nil, err
 	}
 	_, err = io.Copy(out, src)
+	// Closing out reports a delayed write error (NFS) before the log is
+	// truncated; held keeps the lock.
 	if err = errors.Join(err, out.Close()); err != nil {
 		_ = os.Remove(dst)
-		return err
+		_ = held.Close()
+		return nil, err
 	}
-	return nil
+	return held, nil
+}
+
+// holdStaged opens the copy just created as out through a descriptor of
+// its own, and locks that one, so out can be closed while the lock stays.
+// The copy is still empty, and so passed over by finishOrphans; if
+// another rotation of the same log took it anyway before the lock, it is
+// left to that one. Where the filesystem has no flock, it carries on
+// unlocked.
+func holdStaged(dst string, out *os.File) (*os.File, error) {
+	// #nosec G304 -- dst is derived from the daemon's own log path.
+	held, err := os.OpenFile(dst, os.O_RDONLY|oNoFollow, 0)
+	if err != nil {
+		return nil, err
+	}
+	ofi, oerr := out.Stat()
+	hfi, herr := held.Stat()
+	if err = errors.Join(oerr, herr); err == nil && !os.SameFile(ofi, hfi) {
+		err = fmt.Errorf("%s was replaced while being created", dst)
+	}
+	if err == nil {
+		if lerr := tryLock(held); errors.Is(lerr, errBusy) {
+			err = fmt.Errorf("%s: %w", dst, lerr)
+		} else if !namesFile(dst, hfi) {
+			err = fmt.Errorf("%s was taken over by another rotation", dst)
+		}
+	}
+	if err != nil {
+		_ = held.Close()
+		return nil, err
+	}
+	return held, nil
 }
 
 // compress gzips src into dst via a temp file, so a partial dst never

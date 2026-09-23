@@ -115,7 +115,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
-	logMaxSize := flag.Int("log-max-size", 50, "rotate the daemon log once it exceeds this many MB (copy-truncate into gzipped <log>.pilot.N.gz backups). By default only a log inside ~/.pilot is rotated (launchd's daemon.log, pilotctl's pilot-<pid>.log); a log elsewhere only when this is set explicitly, here or in config.json. 0 disables")
+	logMaxSize := flag.Int("log-max-size", 50, "rotate the daemon log once it exceeds this many MB (copy-truncate into gzipped <log>.pilot.N.gz backups). By default only a log Pilot set up is rotated: one inside ~/.pilot (install.sh's launchd daemon.log, pilotctl's pilot-<pid>.log) or the Homebrew service's <brew prefix>/var/log/pilot-daemon.log; a log elsewhere only when this is set explicitly, here or in config.json. 0 disables")
 	logMaxBackups := flag.Int("log-max-backups", 3, "gzipped generations kept by -log-max-size rotation (<log>.pilot.1.gz ... <log>.pilot.N.gz); 0 keeps none")
 	sandbox := flag.Bool("sandbox", false, "restrict all file I/O to the sandbox directory (see -sandbox-dir)")
 	sandboxDir := flag.String("sandbox-dir", "", "confinement root when -sandbox is set (default: ~/.pilot)")
@@ -228,13 +228,15 @@ func main() {
 	// launchd never rotates StandardOutPath/StandardErrorPath (daemon.log
 	// reached 22 MB on one laptop), so cap it from the inside. No-op when
 	// stderr isn't a regular file (journald, a terminal, a pipe), and by
-	// default for a log outside ~/.pilot, which an operator may rotate by
-	// other means. Lives for the daemon's lifetime; process exit stops it.
+	// default for a log Pilot did not set up (outside ~/.pilot, and not
+	// the Homebrew service's), which an operator may rotate by other
+	// means. Lives for the daemon's lifetime; process exit stops it.
 	logcap.Watch(context.Background(), os.Stderr, logcap.Options{
 		MaxBytes:   int64(*logMaxSize) << 20,
 		MaxBackups: *logMaxBackups,
 		Anywhere:   flagExplicit("log-max-size", fileConfig),
 		Within:     pilotDirs(),
+		Files:      pilotLogFiles(),
 	}, time.Minute)
 
 	// Sandbox: validate all configured file paths are under the confinement

@@ -4,6 +4,7 @@ package main
 
 import (
 	"flag"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -67,5 +68,65 @@ func TestPilotDirs(t *testing.T) {
 	want := []string{filepath.Join(home, ".pilot"), filepath.Join(alt, ".pilot")}
 	if got := pilotDirs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("pilotDirs = %v, want %v", got, want)
+	}
+}
+
+// TestHomebrewServiceLog: the pilot-daemon Pilot's Homebrew formula
+// installed maps to the log its `brew services` block sets,
+// <prefix>/var/log/pilot-daemon.log — however it was started: through
+// <prefix>/opt/pilotprotocol (the service's run path), the linked
+// <prefix>/bin, or the Cellar itself. Any other binary maps to nothing.
+func TestHomebrewServiceLog(t *testing.T) {
+	prefix := t.TempDir()
+	// macOS's temp dir is under the /var -> /private/var link; the
+	// result is built from the resolved executable path.
+	realPrefix, err := filepath.EvalSymlinks(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := func(rel string) string {
+		t.Helper()
+		p := filepath.Join(prefix, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	link := func(target, rel string) string {
+		t.Helper()
+		p := filepath.Join(prefix, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	cellar := file("Cellar/pilotprotocol/1.13.9/bin/pilot-daemon")
+	opt := filepath.Join(link("../Cellar/pilotprotocol/1.13.9", "opt/pilotprotocol"), "bin", "pilot-daemon")
+	linked := link("../Cellar/pilotprotocol/1.13.9/bin/pilot-daemon", "bin/pilot-daemon")
+	want := filepath.Join(realPrefix, "var", "log", "pilot-daemon.log")
+	for _, exe := range []string{cellar, opt, linked} {
+		if got, ok := homebrewServiceLog(exe); !ok || got != want {
+			t.Errorf("homebrewServiceLog(%s) = (%q, %v), want (%q, true)", exe, got, ok, want)
+		}
+	}
+
+	for _, exe := range []string{
+		file(".pilot/bin/pilot-daemon"),                                      // install.sh
+		file("usr/local/bin/pilot-daemon"),                                   // a manual install
+		file("Cellar/otherformula/1.0/bin/pilot-daemon"),                     // another formula
+		file("Cellar/pilotprotocol/1.13.9/bin/pilotctl"),                     // another binary
+		file("Cellar/pilotprotocol/1.13.9/libexec/pilot-daemon"),             // not the formula's bin
+		filepath.Join(prefix, "Cellar/pilotprotocol/9.9.9/bin/pilot-daemon"), // missing
+	} {
+		if got, ok := homebrewServiceLog(exe); ok {
+			t.Errorf("homebrewServiceLog(%s) = %q, want no Homebrew service log", exe, got)
+		}
 	}
 }

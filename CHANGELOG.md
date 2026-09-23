@@ -18,13 +18,22 @@ Detailed per-release notes are on the
   `daemon.log.pilot.1.gz` … `daemon.log.pilot.N.gz` (`-log-max-backups`,
   default 3). Truncation is safe for every writer — the file is opened
   append-only and shared by child processes. Both flags can also be set in
-  `~/.pilot/config.json` (`log_max_size`, `log_max_backups`). No-op under
-  systemd/journald or on a terminal.
-  - By default only a log inside `~/.pilot` is rotated — where launchd and
-    `pilotctl daemon start` put it (also `$PILOT_HOME/.pilot`). If you send the
-    daemon's output somewhere else, rotation stays off unless you set
-    `-log-max-size` explicitly, on the command line or in `config.json`, so
-    your own rotation (logrotate, newsyslog) keeps working as before.
+  `~/.pilot/config.json` (`log_max_size`, `log_max_backups`). No-op when the
+  output goes to journald, a pipe or a terminal.
+  - By default only a log Pilot set up is rotated: one inside `~/.pilot`,
+    where install.sh's launchd job and `pilotctl daemon start` put it (also
+    `$PILOT_HOME/.pilot`), and the Homebrew service's
+    `$(brew --prefix)/var/log/pilot-daemon.log` when the daemon is the one
+    `brew install pilotprotocol` installed (`brew services`, launchd or
+    systemd). If you send the daemon's output somewhere else, rotation stays
+    off unless you set `-log-max-size` explicitly, on the command line or in
+    `config.json`, so your own rotation (logrotate, newsyslog) keeps working
+    as before.
+  - A rotation interrupted by a crash or kill is finished by the next one in
+    that directory, including one left under a previous daemon's
+    `pilot-<pid>.log` name. A rotation holds its uncompressed copy
+    (`<log>.pilot.1`) locked with `flock` until it is compressed, so a copy
+    another running daemon is still working on is left alone.
   - It never touches files it did not create. The `.pilot` infix keeps its
     backups apart from logrotate's and newsyslog's names (`daemon.log.1`,
     `daemon.log.2.gz`, …). It skips a symlink or another user's file at one

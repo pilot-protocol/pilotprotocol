@@ -384,10 +384,12 @@ func TestCheckKeepsNoBackupInSharedDirectory(t *testing.T) {
 			f := openLog(t, path)
 			writeFile(t, backupName(path, 1), "ours-1")
 			writeFile(t, stagingName(path), "ours-staged")
+			orphan := stagingName(filepath.Join(dir, "pilot-22.log"))
+			writeFile(t, orphan, "another log's staged copy")
 
 			write(t, f, strings.Repeat("f", 50))
 			rotateWithoutBackup(t, New(f, anywhere(10, 3)), path)
-			want := []string{"daemon.log", filepath.Base(stagingName(path)), filepath.Base(backupName(path, 1))}
+			want := []string{"daemon.log", filepath.Base(stagingName(path)), filepath.Base(backupName(path, 1)), filepath.Base(orphan)}
 			sort.Strings(want)
 			if got := dirNames(t, dir); !equal(got, want) {
 				t.Fatalf("dir = %v, want %v (nothing created, moved or removed)", got, want)
@@ -489,6 +491,85 @@ func TestWatchScopedToWithinDirs(t *testing.T) {
 		if got := Watch(ctx, tc.f, tc.opts, time.Hour); got != tc.want {
 			t.Errorf("%s: Watch = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestWatchScopedToFiles: a log named in Files is watched, matched by
+// name within the same directory (compared by identity), while the rest
+// of that directory stays out of scope — the Homebrew service log, next
+// to other formulae's logs in <prefix>/var/log.
+func TestWatchScopedToFiles(t *testing.T) {
+	root := t.TempDir()
+	varLog := filepath.Join(root, "brew", "var", "log")
+	sub := filepath.Join(varLog, "sub")
+	elsewhere := filepath.Join(root, "elsewhere")
+	for _, d := range []string{sub, elsewhere} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkToVarLog := filepath.Join(root, "var-log-link")
+	symlink(t, varLog, linkToVarLog)
+	serviceLog := filepath.Join(varLog, "pilot-daemon.log")
+
+	service := openLog(t, serviceLog)
+	neighbour := openLog(t, filepath.Join(varLog, "postgresql.log"))
+	sameNameElsewhere := openLog(t, filepath.Join(elsewhere, "pilot-daemon.log"))
+	sameNameBelow := openLog(t, filepath.Join(sub, "pilot-daemon.log"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scoped := func(files ...string) Options {
+		return Options{MaxBytes: 1 << 30, MaxBackups: 1, Files: files}
+	}
+	for _, tc := range []struct {
+		name string
+		f    *os.File
+		opts Options
+		want bool
+	}{
+		{"the file", service, scoped(serviceLog), true},
+		{"the file, via a symlinked dir", service, scoped(filepath.Join(linkToVarLog, "pilot-daemon.log")), true},
+		{"the file, next to Within", service, Options{MaxBytes: 1 << 30, MaxBackups: 1, Within: []string{elsewhere}, Files: []string{serviceLog}}, true},
+		{"another file in its dir", neighbour, scoped(serviceLog), false},
+		{"same name, another dir", sameNameElsewhere, scoped(serviceLog), false},
+		{"same name, a subdirectory", sameNameBelow, scoped(serviceLog), false},
+		{"missing dir", service, scoped(filepath.Join(root, "absent", "pilot-daemon.log")), false},
+	} {
+		if got := Watch(ctx, tc.f, tc.opts, time.Hour); got != tc.want {
+			t.Errorf("%s: Watch = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestCheckStopsWhenFileLeavesScope: a Files log renamed — even within
+// its directory, as newsyslog would — is no longer the daemon's to rotate.
+func TestCheckStopsWhenFileLeavesScope(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pilot-daemon.log")
+	f := openLog(t, path)
+	content := strings.Repeat("j", 50)
+	write(t, f, content)
+	r := New(f, Options{MaxBytes: 10, MaxBackups: 3, Files: []string{path}})
+
+	renamed := path + ".0"
+	if err := os.Rename(path, renamed); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := r.Check()
+	if rotated || !errors.Is(err, errOutOfScope) {
+		t.Fatalf("Check = (%v, %v), want (false, errOutOfScope)", rotated, err)
+	}
+	if got := readFile(t, renamed); got != content {
+		t.Fatalf("out-of-scope log changed: %d bytes", len(got))
+	}
+
+	if err := os.Rename(renamed, path); err != nil {
+		t.Fatal(err)
+	}
+	mustRotate(t, r)
+	if got := gunzip(t, backupName(path, 1)); got != content {
+		t.Fatalf("backup = %q, want the log", got)
 	}
 }
 
