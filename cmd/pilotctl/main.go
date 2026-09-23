@@ -157,7 +157,7 @@ func fatalCode(code string, format string, args ...interface{}) {
 	} else {
 		fmt.Fprintf(os.Stderr, "error: %s\n", msg)
 	}
-	os.Exit(1)
+	exitAfterFatal(code, msg)
 }
 
 // classifyDaemonError inspects an error string from the daemon and, when it
@@ -214,7 +214,7 @@ func fatalHint(code, hint, format string, args ...interface{}) {
 		// fatalHint knows where the output ends, because only it exits.
 		printNextSteps(exitNextSteps)
 	}
-	os.Exit(1)
+	exitAfterFatal(code, msg)
 }
 
 func fatal(format string, args ...interface{}) {
