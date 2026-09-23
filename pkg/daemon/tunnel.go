@@ -1534,16 +1534,37 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 	// no longer closes that reply gate) and accepts the session we then
 	// re-derive as our new epoch. A v1.11–v1.13 holder never answers a
 	// same-key exchange; that residual is fixed on its side by upgrading.
+	// The replay and outside-window gates judge the age of the peer's
+	// newest epoch, not of our Crypto, so an epoch the peer just started
+	// on a session we kept gets the same drain grace as a fresh session.
 	switch res.Err {
 	case envelope.ErrTooShort:
 		return
 	case envelope.ErrStaleEpoch:
 		// Authenticated, but a duplicate or too-old frame of an earlier
-		// peer send epoch (see envelope.DecryptFrame) — a straggler from
-		// before the peer re-derived, or a replay of one. Never a reason
-		// to touch the session.
+		// peer send epoch, or any frame of a retired one (see
+		// envelope.DecryptFrame) — a straggler from before the peer
+		// re-derived, or a replay. Never a reason to touch the session,
+		// but a rejected nonce all the same, so it is reported like one.
 		slog.Debug("tunnel frame from an earlier peer epoch rejected",
 			"peer_node_id", peerNodeID, "counter", res.Counter)
+		tm.publishEvent("security.nonce_replay", map[string]interface{}{
+			"peer_hash": redactID(fmt.Sprintf("%d", peerNodeID)), "counter": res.Counter,
+		})
+		return
+	case envelope.ErrRecvEpochsExhausted:
+		// The peer opened a new send epoch on a Crypto that already
+		// tracks keyexchange.MaxRecvEpochs of them. Making room by
+		// forgetting an epoch would let its recorded frames be accepted
+		// again, so the session is replaced instead: drop our half and
+		// re-handshake, like the drop gates below.
+		pc := tm.envelope.Get(peerNodeID)
+		if tm.envelope.ShouldDropOnRecvEpochsExhausted(peerNodeID, pc) &&
+			tm.envelope.CompareAndDrop(peerNodeID, pc) {
+			slog.Warn("tunnel: peer re-derived the session more often than one session tracks, dropping session and re-handshaking",
+				"peer_node_id", peerNodeID, "max_epochs", keyexchange.MaxRecvEpochs)
+			tm.maybeRequestRekey(peerNodeID, from)
+		}
 		return
 	case keyexchange.ErrNoKey:
 		// We have no key for this peer. Typically this happens after a local
@@ -1674,7 +1695,7 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	if res.NewEpoch {
+	if res.Epoch == keyexchange.RecvEpochNew {
 		// The peer re-derived its half of our session (same keys, send
 		// counter restarted) — e.g. it dropped its half and answered our
 		// key exchange, or re-handshook after its own path reset. The
@@ -1750,12 +1771,23 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 	// between. Skipping the beacon-source case prevents pinning the peer
 	// to the beacon's listen port (relay traffic carries the original
 	// from=beaconAddr, which is not the peer's real direct addr).
-	cleared := tm.routing.ClearRelayOnDirect(peerNodeID, from)
-	if from != nil && !tm.routing.IsFromBeacon(from) {
-		tm.routing.RecordDirectRecv(peerNodeID, time.Now())
-		tm.mu.Lock()
-		tm.peers[peerNodeID] = from
-		tm.mu.Unlock()
+	//
+	// Only a frame of the peer's newest send epoch that did not itself
+	// open that epoch moves the path. Every epoch of a session shares one
+	// AEAD key, so a frame of an earlier epoch (a straggler its own window
+	// still accepts) or the first frame of an epoch this Crypto never saw
+	// may be a recorded frame re-sent from anywhere, and the peer's source
+	// address on it is stale at best. Delivery and liveness are unchanged;
+	// the peer's next frame of its current epoch updates the path.
+	cleared := false
+	if res.Epoch == keyexchange.RecvEpochNewest {
+		cleared = tm.routing.ClearRelayOnDirect(peerNodeID, from)
+		if from != nil && !tm.routing.IsFromBeacon(from) {
+			tm.routing.RecordDirectRecv(peerNodeID, time.Now())
+			tm.mu.Lock()
+			tm.peers[peerNodeID] = from
+			tm.mu.Unlock()
+		}
 	}
 	if cleared {
 		slog.Info("relay→direct auto-cleared on direct packet receipt",

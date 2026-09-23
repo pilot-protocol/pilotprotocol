@@ -254,8 +254,11 @@ type peerPathReset struct {
 //     re-derived half restarts its send counter under a new nonce prefix;
 //     envelope.DecryptFrame recognises the new epoch and gives it a fresh
 //     replay window, so its first frame (the pong) is accepted instead of
-//     tripping the aged replay fast-drop on our kept half. Our send
-//     counter simply continues, which its fresh window accepts.
+//     tripping the aged replay fast-drop on our kept half. The drop gates
+//     then judge that epoch by its own age, so its early duplicates and
+//     late frames get the grace of a fresh session, not the aged fast
+//     path of the Crypto we kept. Our send counter simply continues,
+//     which its fresh window accepts.
 //
 // Dropping our keys on a later reset (main's behaviour) is deliberately
 // NOT used as an escalation: by the time a second reset could fire, the

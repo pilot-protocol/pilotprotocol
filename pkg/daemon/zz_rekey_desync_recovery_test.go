@@ -57,6 +57,14 @@ package daemon
 //     PILAs — gets our PILA back once we have heard nothing authenticated
 //     from it for KeyExchangeReplyStaleThreshold.
 //
+// Link 4 has two consequences of its own. The epoch a peer starts on a
+// session we kept is new even though our Crypto is aged, so the replay and
+// outside-window gates judge the newest epoch's age (else one early
+// duplicate dropped our half again). And every epoch shares the AEAD key,
+// so every recorded frame of every earlier epoch still authenticates: an
+// epoch whose window is evicted is retired, never re-opened, and only a
+// frame of the peer's live epoch moves our path to it.
+//
 // All pairs below are two real TunnelManagers talking over loopback, each
 // inside a Daemon with a fake registry, so resetPeerPath, ensureTunnel,
 // the key-exchange loop, the gave-up hook and the real ping handler all run
@@ -76,6 +84,7 @@ import (
 	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/protocol"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon/keyexchange"
+	"github.com/pilot-protocol/pilotprotocol/pkg/daemon/routing"
 )
 
 const desyncTestWait = 2 * time.Second
@@ -818,5 +827,331 @@ func TestResetWithFailedResolveKeepsDetachedSessionBounded(t *testing.T) {
 	}
 	if _, ok := a.tm.LastInboundDecrypt(b.id); ok {
 		t.Fatal("reaping a detached session must also clear its per-peer liveness state")
+	}
+}
+
+// --- a peer epoch on a kept session: drain grace and replays ---------------
+
+// agedTunnelWithPeer is one TunnelManager holding an aged session with a
+// peer that exists only as the frames the test seals for it, and the
+// peer's path.
+func agedTunnelWithPeer(t *testing.T) (tm *TunnelManager, pc *peerCrypto, peerID uint32, peerAddr *net.UDPAddr) {
+	t.Helper()
+	peerID = 0x44444444
+	tm = NewTunnelManager()
+	t.Cleanup(func() { tm.Close() })
+	if err := tm.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if err := tm.EnableEncryption(); err != nil {
+		t.Fatalf("EnableEncryption: %v", err)
+	}
+	tm.SetNodeID(0x33333333)
+	peerAddr = mustUDPAddr(t, "127.0.0.1:56789")
+	peerPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("peer keygen: %v", err)
+	}
+	if pc, err = tm.deriveSecret(peerPriv.PublicKey().Bytes()); err != nil {
+		t.Fatalf("deriveSecret: %v", err)
+	}
+	pc.CreatedAt = time.Now().Add(-time.Hour)
+	tm.mu.Lock()
+	tm.peers[peerID] = peerAddr
+	tm.mu.Unlock()
+	tm.envelope.Install(peerID, pc)
+	return tm, pc, peerID, peerAddr
+}
+
+// recvOnly reports what tm delivers to its application within d, if
+// anything.
+func recvOnly(tm *TunnelManager, d time.Duration) (string, bool) {
+	select {
+	case in := <-tm.RecvCh():
+		return string(in.Packet.Payload), true
+	case <-time.After(d):
+		return "", false
+	}
+}
+
+func peerPath(tm *TunnelManager, peerID uint32) string {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	if a := tm.peers[peerID]; a != nil {
+		return a.String()
+	}
+	return ""
+}
+
+// TestPeersNewEpochOnKeptSessionGetsDrainGrace: the replay and
+// outside-window gates judge the age of the peer's newest epoch, not of
+// our Crypto. A session we keep across a reset is always aged (the
+// watchdog alone needs ~85s of silence), but the epoch the peer starts on
+// it by re-deriving is brand new, and drains the same early duplicates and
+// late frames as a fresh session. Judged by the Crypto's age, the first
+// such frame dropped our half — and a v1.10.9–v1.13 peer, which then holds
+// the fresh half, never answers a same-key exchange: the pair wedged.
+func TestPeersNewEpochOnKeptSessionGetsDrainGrace(t *testing.T) {
+	for _, tc := range []string{"duplicate", "late frame"} {
+		t.Run(tc, func(t *testing.T) {
+			t.Parallel()
+			a, b := newDesyncNodes(t, 230204, 16392)
+			establishAgedSession(t, a, b)
+			baseline(t, a, b)
+			ours := a.tm.envelope.Get(b.id)
+
+			// Case B: the peer threw its half away, then our reset keeps
+			// ours; the peer re-derives from our PILA and traffic flows.
+			dropHalfLikeOldReset(b, a, false)
+			a.d.resetPeerPath(b.id)
+			if !bothWays(a, b, desyncTestWait) || a.tm.envelope.Get(b.id) != ours {
+				t.Fatal("setup: case B must converge on our kept half")
+			}
+			theirs := b.tm.envelope.Get(a.id)
+
+			p := newPacket("drain")
+			p.Src.Node = b.id
+			switch tc {
+			case "duplicate":
+				// An early frame of the peer's new epoch arrives twice
+				// (relay re-delivery / UDP duplicate).
+				redeliverTo(t, a, sealFromPeer(t, theirs, b.id, 1, p))
+			case "late frame":
+				// A burst past the window, then an early frame held up on
+				// the relay lands.
+				for i := 0; i < keyexchange.ReplayWindowSize+44; i++ {
+					if !deliver(b, a, fmt.Sprintf("burst-%d", i), desyncTestWait) {
+						t.Fatalf("burst frame %d not delivered", i)
+					}
+				}
+				redeliverTo(t, a, sealFromPeer(t, theirs, b.id, 2, p))
+			}
+			time.Sleep(200 * time.Millisecond)
+
+			if a.tm.envelope.Get(b.id) != ours {
+				t.Fatalf("BUG: one %s of the peer's brand-new epoch dropped our kept half (we have key: %v); "+
+					"a v1.10.9–v1.13 peer holding the fresh half never answers our re-handshake", tc, a.tm.HasCrypto(b.id))
+			}
+			if !bothWays(a, b, desyncTestWait) {
+				t.Fatal("the session must keep carrying traffic both ways")
+			}
+		})
+	}
+}
+
+// redeliverTo sends frame to n's tunnel socket from a different UDP
+// source, as a relay re-delivery or a network duplicate would.
+func redeliverTo(t *testing.T, n *desyncNode, frame []byte) {
+	t.Helper()
+	conn, err := net.DialUDP("udp", nil, n.addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(append(append([]byte{}, protocol.TunnelMagicSecure[:]...), frame...)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// TestRecordedFramesOfEarlierEpochsAreNeverReaccepted: every epoch of a
+// session shares one AEAD key, so every recorded frame of every earlier
+// peer epoch still authenticates. Once more epochs had passed than
+// RetainedRecvEpochs keeps windows for, an evicted epoch used to come back
+// as a "new" one with a fresh window: replaying recorded frames of 6+
+// epochs round-robin re-opened the replayed epoch every time, and every
+// replay was delivered — and moved our path to the peer to the replayer's
+// address. Evicted epochs are now retired: rejected for good.
+func TestRecordedFramesOfEarlierEpochsAreNeverReaccepted(t *testing.T) {
+	t.Parallel()
+	tm, pc, peerID, peerAddr := agedTunnelWithPeer(t)
+	attacker := mustUDPAddr(t, "127.0.0.1:56790")
+
+	const epochs = 3 * (keyexchange.RetainedRecvEpochs + 2)
+	var recorded [][]byte
+	for k := 0; k < epochs; k++ {
+		prefix := [4]byte{0xE0, 0, 0, byte(k)}
+		p := newPacket(fmt.Sprintf("cmd-%d", k))
+		p.Src.Node = peerID
+		f := sealWithPrefix(t, pc, prefix, peerID, 1, p)
+		tm.handleEncrypted(f, peerAddr)
+		if got, ok := recvOnly(tm, time.Second); !ok || got != fmt.Sprintf("cmd-%d", k) {
+			t.Fatalf("genuine frame of epoch %d: delivered %q (%v)", k, got, ok)
+		}
+		recorded = append(recorded, f)
+	}
+
+	// The attacker re-sends every earlier epoch's recorded frame, byte for
+	// byte, round-robin, from its own address.
+	for round := 0; round < 20; round++ {
+		for _, f := range recorded[:epochs-1] {
+			tm.handleEncrypted(f, attacker)
+		}
+	}
+	if got, ok := recvOnly(tm, 100*time.Millisecond); ok {
+		t.Fatalf("BUG: a recorded frame of an earlier epoch was delivered again: %q", got)
+	}
+	if got := peerPath(tm, peerID); got != peerAddr.String() {
+		t.Fatalf("BUG: replayed frames moved our path to the peer to %s (peer is at %s)", got, peerAddr)
+	}
+	if tm.envelope.Get(peerID) != pc {
+		t.Fatal("replays of earlier epochs must not touch the session")
+	}
+
+	// The peer's live epoch is unaffected.
+	p := newPacket("live")
+	p.Src.Node = peerID
+	tm.handleEncrypted(sealWithPrefix(t, pc, [4]byte{0xE0, 0, 0, byte(epochs - 1)}, peerID, 2, p), peerAddr)
+	if got, ok := recvOnly(tm, time.Second); !ok || got != "live" {
+		t.Fatalf("the live epoch's next frame: delivered %q (%v)", got, ok)
+	}
+}
+
+// TestOnlyTheLiveEpochMovesThePath: a frame of an earlier epoch (a
+// straggler its window still accepts) or the first frame of an epoch this
+// Crypto never saw is delivered, but it is not proof of where the peer is
+// now — with one AEAD key for every epoch, it may be a recorded frame
+// re-sent from anywhere — so it does not move the path or clear relay
+// mode. The peer's next frame of its live epoch does.
+func TestOnlyTheLiveEpochMovesThePath(t *testing.T) {
+	t.Parallel()
+	tm, pc, peerID, peerAddr := agedTunnelWithPeer(t)
+	elsewhere := mustUDPAddr(t, "127.0.0.1:56791")
+	oldEpoch, newEpoch := [4]byte{1, 1, 1, 1}, [4]byte{2, 2, 2, 2}
+	frame := func(prefix [4]byte, counter uint64, payload string) []byte {
+		p := newPacket(payload)
+		p.Src.Node = peerID
+		return sealWithPrefix(t, pc, prefix, peerID, counter, p)
+	}
+	expect := func(want string) {
+		t.Helper()
+		if got, ok := recvOnly(tm, time.Second); !ok || got != want {
+			t.Fatalf("delivered %q (%v), want %q", got, ok, want)
+		}
+	}
+
+	tm.handleEncrypted(frame(oldEpoch, 1, "old-1"), peerAddr)
+	expect("old-1")
+	tm.SetRelayPeer(peerID, true)
+
+	tm.handleEncrypted(frame(newEpoch, 1, "new-1"), elsewhere)
+	expect("new-1")
+	if got := peerPath(tm, peerID); got != peerAddr.String() {
+		t.Fatalf("the first frame of a new epoch moved the path to %s", got)
+	}
+	// Enough direct frames to clear relay mode, were they of the live epoch.
+	for i := 0; i < routing.DirectClearsRequired; i++ {
+		payload := fmt.Sprintf("straggler-%d", i)
+		tm.handleEncrypted(frame(oldEpoch, uint64(2+i), payload), elsewhere)
+		expect(payload)
+	}
+	if got := peerPath(tm, peerID); got != peerAddr.String() {
+		t.Fatalf("a straggler of an earlier epoch moved the path to %s", got)
+	}
+	if !tm.routing.IsRelayPeer(peerID) {
+		t.Fatal("frames outside the live epoch cleared relay mode")
+	}
+
+	for i := 0; i < routing.DirectClearsRequired; i++ {
+		payload := fmt.Sprintf("new-%d", 2+i)
+		tm.handleEncrypted(frame(newEpoch, uint64(2+i), payload), elsewhere)
+		expect(payload)
+	}
+	if got := peerPath(tm, peerID); got != elsewhere.String() {
+		t.Fatalf("the live epoch's frames must still learn the peer's new address: path %s, want %s", got, elsewhere)
+	}
+	if tm.routing.IsRelayPeer(peerID) {
+		t.Fatal("direct frames of the live epoch must still clear relay mode")
+	}
+}
+
+// forcePeerEpoch makes b throw its half of the session away and re-derive
+// it from a's answer: a new b send epoch on a's kept Crypto. a's liveness
+// for b is backdated past KeyExchangeReplyStaleThreshold first, so a
+// answers b's first same-key PILA instead of after 6s of real silence.
+func forcePeerEpoch(t *testing.T, a, b *desyncNode, why string) {
+	t.Helper()
+	time.Sleep(keyexchange.KeyExchangeReplyMinInterval) // a's reply rate limit
+	a.tm.kx.SetLastInboundDecryptForTest(b.id, time.Now().Add(-2*keyexchange.KeyExchangeReplyStaleThreshold))
+	dropHalfLikeOldReset(b, a, true)
+	recovers(t, a, b, desyncRecoverWait, why)
+}
+
+// TestReplaysAcrossManyPeerEpochsEndToEnd is the same attack on two real
+// daemons: the peer re-derives our kept session RetainedRecvEpochs+2
+// times (each a real drop and key exchange), an observer records one
+// genuine frame per epoch, and re-sends those of every earlier epoch —
+// more than the windows a Crypto retains — from the peer's socket and
+// from its own. None may reach our application or move our path.
+func TestReplaysAcrossManyPeerEpochsEndToEnd(t *testing.T) {
+	t.Parallel()
+	a, b := newDesyncNodes(t, 230204, 16392)
+	establishAgedSession(t, a, b)
+	baseline(t, a, b)
+	ours := a.tm.envelope.Get(b.id)
+
+	const epochs = keyexchange.RetainedRecvEpochs + 3
+	var recorded [][]byte
+	for k := 0; k < epochs; k++ {
+		if k > 0 {
+			forcePeerEpoch(t, a, b, fmt.Sprintf("epoch %d", k))
+		}
+		if a.tm.envelope.Get(b.id) != ours {
+			t.Fatalf("setup: our half was replaced at epoch %d", k)
+		}
+		payload := fmt.Sprintf("cmd-%d", k)
+		p := newPacket(payload)
+		p.Src.Node, p.Dst.Node = b.id, a.id
+		pt, err := p.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := b.tm.encryptFrame(b.tm.envelope.Get(a.id), pt)
+		if err := b.tm.writeFrame(a.id, a.addr, f); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.After(desyncTestWait)
+	wait:
+		for {
+			select {
+			case got := <-a.data:
+				if got == payload {
+					break wait
+				}
+			case <-deadline:
+				t.Fatalf("genuine %s not delivered", payload)
+			}
+		}
+		recorded = append(recorded, f)
+	}
+	time.Sleep(100 * time.Millisecond)
+	for len(a.data) > 0 {
+		<-a.data
+	}
+
+	atk, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer atk.Close()
+	for round := 0; round < 10; round++ {
+		for _, f := range recorded[:epochs-1] {
+			_ = b.tm.writeFrame(a.id, a.addr, f)
+			_, _ = atk.WriteToUDP(f, a.addr)
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	replayed := map[string]int{}
+	for len(a.data) > 0 {
+		replayed[<-a.data]++
+	}
+	if len(replayed) > 0 {
+		t.Fatalf("BUG: recorded frames of earlier epochs were delivered again: %v", replayed)
+	}
+	if got := peerPath(a.tm, b.id); got != b.addr.String() {
+		t.Fatalf("BUG: replays moved our path to the peer to %s (peer is at %s, replayer at %s)", got, b.addr, atk.LocalAddr())
+	}
+	if a.tm.envelope.Get(b.id) != ours || !bothWays(a, b, desyncTestWait) {
+		t.Fatal("the session must be untouched and keep carrying traffic both ways")
 	}
 }
