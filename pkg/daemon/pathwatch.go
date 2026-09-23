@@ -30,9 +30,10 @@ import (
 // Recovery: still silent after the probe budget → the peer's path is
 // declared dead and resetPeerPath runs the same in-place re-establish
 // sequence as `pilotctl prefer-direct`: drop cached resolve/endpoint,
-// drop the tunnel, clear rekey cooldowns, re-resolve, and proactively
-// push a fresh PILA. Per-peer, in-place, seconds — instead of a full
-// daemon restart that drops every healthy session too.
+// drop the tunnel (but not the session keys), clear rekey cooldowns,
+// re-resolve, proactively push a fresh PILA and probe. Per-peer,
+// in-place, seconds — instead of a full daemon restart that drops every
+// healthy session too.
 //
 // Backward compatibility (v1.10.0 fleet): old peers send keepalives on
 // the same cadence (their keepalives bump our lastInboundDecrypt), and
@@ -88,6 +89,7 @@ var pathWatchResetPeer = func(d *Daemon, nodeID uint32) {
 		"peer_node_id", nodeID,
 		"had_tunnel", res.HadTunnel,
 		"was_relay_active", res.WasRelayActive,
+		"session_kept", res.SessionKept,
 		"pila_pushed", res.PilaPushed,
 		"resolve_error", res.ResolveErr)
 }
@@ -209,6 +211,7 @@ type peerPathReset struct {
 	HadTunnel      bool
 	WasRelayActive bool
 	WasRelayPinned bool
+	SessionKept    bool // an established session survived the reset
 	PilaPushed     bool
 	ResolveErr     string
 }
@@ -226,17 +229,59 @@ type peerPathReset struct {
 //     while a future direct receive can promote the path.
 //   - forgetPeerResolution drops the cached resolve/endpoint so
 //     ensureTunnel hits the registry fresh instead of short-circuiting.
-//   - RemovePeer wipes the tunnel + per-peer metadata; it also wipes the
-//     relay flags as a side effect, so the captured relay-active state is
-//     re-applied (without the pin) right after.
+//   - RemovePeerPath wipes the tunnel + per-peer metadata but KEEPS the
+//     session keys (see RemovePeerPath for why dropping them wedged the
+//     peer until a restart). It also wipes the relay flags as a side
+//     effect, so the captured relay-active state is re-applied (without
+//     the pin) right after.
 //   - ClearLastRekeyReq / ClearRekeyGaveUp lift the per-peer rekey
-//     cooldowns that survive RemovePeer — without this the recovery PILA
+//     cooldowns that survive RemovePeerPath — without this the recovery PILA
 //     would be silently skipped by the 3s rate gate.
 //   - ensureTunnel + sendKeyExchangeToNode push a fresh signed PILA
 //     immediately, making recovery deterministic instead of waiting for
 //     the peer's next keepalive. Best-effort: with the registry
 //     unreachable the state reset still happened and the next inbound
 //     packet from the peer triggers the rekey path.
+//
+// When a session survived (SessionKept), the reset works for both
+// possible states of the peer, with no second reset and no restart:
+//
+//   - The peer still holds its half (the 2026-09-23 case): the PILA is a
+//     same-session keepalive to it, and the path probe sent right after
+//     gets a pong within one RTT on a live path, refreshing liveness.
+//   - The peer lost its half (e.g. a v1.13 peer's own reset or drop gate
+//     threw it away): the PILA lets it re-derive, and it replies. Its
+//     re-derived half restarts its send counter under a new nonce prefix;
+//     envelope.DecryptFrame recognises the new epoch and gives it a fresh
+//     replay window, so its first frame (the pong) is accepted instead of
+//     tripping the aged replay fast-drop on our kept half. The drop gates
+//     then judge that epoch by its own age, so its early duplicates and
+//     late frames get the grace of a fresh session, not the aged fast
+//     path of the Crypto we kept. Our send counter simply continues,
+//     which its fresh window accepts.
+//
+// Dropping our keys on a later reset (main's behaviour) is deliberately
+// NOT used as an escalation: by the time a second reset could fire, the
+// peer has re-derived from our first PILA, so a drop would leave US
+// keyless against a peer holding a fresh session — the state v1.11–v1.13
+// peers never answer.
+//
+// For a kept session the PILA is fire-and-forget: its pending rekey is
+// cleared right away. A peer holding the session answers it with
+// nothing, so the rekey could only clear on an inbound decrypt; if the
+// one probe or its pong was lost, the retransmits would flip a healthy
+// direct peer to relay after ~4s (RekeyRelayFallbackAfter) and give up
+// after ~20s, firing onRekeyGaveUp's full reset for nothing. A peer that
+// lost its half does not need our retransmits either: it keeps sending
+// its own PILAs (its pending rekey, or "no key" on our probe/keepalives),
+// and HandleAuthFrame answers those once it has been silent for
+// KeyExchangeReplyStaleThreshold. Liveness of a kept session is the path
+// watchdog's job, and the session's lastInboundDecrypt survives the
+// reset so the watchdog keeps measuring it.
+//
+// If the re-resolve fails, a kept session is left detached (no tm.peers
+// entry, as on main); the peer's next frame or key exchange re-attaches
+// it, and ReapDetachedSessions drops it if the peer stays silent.
 func (d *Daemon) resetPeerPath(nodeID uint32) peerPathReset {
 	res := peerPathReset{
 		HadTunnel:      d.tunnels.HasPeer(nodeID),
@@ -251,8 +296,9 @@ func (d *Daemon) resetPeerPath(nodeID uint32) peerPathReset {
 	d.forgetPeerResolution(nodeID)
 
 	if res.HadTunnel {
-		d.tunnels.RemovePeer(nodeID)
+		d.tunnels.RemovePeerPath(nodeID)
 	}
+	res.SessionKept = d.tunnels.IsEncrypted(nodeID)
 	if res.WasRelayActive {
 		d.tunnels.SetRelayPeer(nodeID, true)
 	}
@@ -271,6 +317,14 @@ func (d *Daemon) resetPeerPath(nodeID uint32) peerPathReset {
 	} else {
 		d.tunnels.sendKeyExchangeToNode(nodeID)
 		res.PilaPushed = true
+		if res.SessionKept {
+			// Fire-and-forget (see above): no retransmits, no relay
+			// fallback, no give-up for a session that is still installed.
+			d.tunnels.clearPendingRekey(nodeID)
+			if err := d.tunnels.SendPathProbe(nodeID); err != nil {
+				slog.Debug("path reset: probe send failed", "peer_node_id", nodeID, "err", err)
+			}
+		}
 	}
 	return res
 }
@@ -316,6 +370,7 @@ func (d *Daemon) onRekeyGaveUp(nodeID uint32) {
 			"peer_node_id", nodeID,
 			"had_tunnel", res.HadTunnel,
 			"was_relay_active", res.WasRelayActive,
+			"session_kept", res.SessionKept,
 			"pila_pushed", res.PilaPushed,
 			"resolve_error", res.ResolveErr)
 		d.publishEvent("tunnel.path_suspect", map[string]any{

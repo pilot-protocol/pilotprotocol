@@ -210,8 +210,9 @@ func (s *Store) ShouldDropOnDecryptFail(peerNodeID uint32, c *Crypto) bool {
 // ShouldDropOnOutsideWindow mirrors ShouldDropOnDecryptFail for the
 // outside-replay-window divergence path. Returns true when the peer's
 // OutsideWindowCount has reached OutsideWindowDropThreshold AND the
-// Crypto is older than OutsideWindowDropGrace AND it is still the
-// currently-installed entry for peerNodeID.
+// peer's newest send epoch on the Crypto (Crypto.dropGateAge) is older
+// than OutsideWindowDropGrace AND it is still the currently-installed
+// entry for peerNodeID.
 //
 // The caller (L7 handleEncrypted) is responsible for dropping the
 // Crypto via CompareAndDrop and triggering a fresh key exchange when
@@ -226,16 +227,24 @@ func (s *Store) ShouldDropOnOutsideWindow(peerNodeID uint32, c *Crypto) bool {
 	}
 	c.ReplayMu.Lock()
 	rejections := c.OutsideWindowCount
+	age := c.dropGateAge(time.Now())
 	c.ReplayMu.Unlock()
 	if rejections == 0 {
 		return false
 	}
-	age := time.Since(c.CreatedAt)
 	// Aged-Crypto fast path: a session that has lived past
 	// AgedCryptoFastDropAge cannot be in a transient post-rekey
 	// drain state. ANY outside-window event from it is real
 	// divergence — drop on the first occurrence so very-quiet
 	// peers recover without needing to send the full threshold.
+	//
+	// The age is that of the peer's newest send epoch: the rejections
+	// counted are in that epoch's window, and an epoch the peer started
+	// by re-deriving a session we kept is in exactly that drain state,
+	// however old the Crypto is. Judging it by the Crypto's age dropped
+	// our half on its first late frame — against a v1.10.9–v1.13 peer,
+	// which now held the fresh half and never answers a same-key
+	// exchange, a wedge.
 	if age < AgedCryptoFastDropAge {
 		if rejections < OutsideWindowDropThreshold {
 			return false
@@ -251,8 +260,9 @@ func (s *Store) ShouldDropOnOutsideWindow(peerNodeID uint32, c *Crypto) bool {
 // ShouldDropOnReplay is the symmetric counterpart to
 // ShouldDropOnOutsideWindow for the in-window replay-collision path.
 // Returns true when ReplayCount has reached ReplayDropThreshold AND
-// the Crypto is older than ReplayDropGrace AND it is still the
-// currently-installed entry for peerNodeID.
+// the peer's newest send epoch on the Crypto (Crypto.dropGateAge) is
+// older than ReplayDropGrace AND it is still the currently-installed
+// entry for peerNodeID.
 //
 // The caller (L7 handleEncrypted) is responsible for the side effect:
 // drop via CompareAndDrop and request a fresh key exchange. This
@@ -269,17 +279,20 @@ func (s *Store) ShouldDropOnReplay(peerNodeID uint32, c *Crypto) bool {
 	}
 	c.ReplayMu.Lock()
 	replays := c.ReplayCount
+	age := c.dropGateAge(time.Now())
 	c.ReplayMu.Unlock()
 	if replays == 0 {
 		return false
 	}
-	age := time.Since(c.CreatedAt)
 	// Aged-Crypto fast path: see ShouldDropOnOutsideWindow comment.
 	// A settled (>AgedCryptoFastDropAge) session cannot be in
 	// post-rekey duplicate-delivery drain — a single replay is
 	// real divergence (peer restart). Quiet peers that send only
 	// 1 frame after restart recover here instead of waiting for
-	// the count threshold they may never reach.
+	// the count threshold they may never reach. As there, "settled"
+	// is judged by the peer's newest send epoch: a duplicate of an
+	// early frame of an epoch that just started is exactly the
+	// post-rekey drain the threshold and grace exist for.
 	if age < AgedCryptoFastDropAge {
 		if replays < ReplayDropThreshold {
 			return false
@@ -290,6 +303,23 @@ func (s *Store) ShouldDropOnReplay(peerNodeID uint32, c *Crypto) bool {
 	}
 	current := s.Get(peerNodeID)
 	return current == c
+}
+
+// ShouldDropOnRecvEpochsExhausted reports whether c, still the installed
+// entry for peerNodeID, has refused a new peer send epoch because it
+// already tracks MaxRecvEpochs of them (RecvEpochExhausted). The caller
+// (L7 handleEncrypted) drops it via CompareAndDrop and requests a fresh
+// key exchange: the Crypto that replaces it starts with no epochs, and
+// making room by forgetting one would let that epoch's recorded frames
+// be accepted again.
+func (s *Store) ShouldDropOnRecvEpochsExhausted(peerNodeID uint32, c *Crypto) bool {
+	if c == nil {
+		return false
+	}
+	c.ReplayMu.Lock()
+	exhausted := c.recvEpochsExhausted()
+	c.ReplayMu.Unlock()
+	return exhausted && s.Get(peerNodeID) == c
 }
 
 // RecordSalvage stashes a plaintext send into the per-peer ring buffer.

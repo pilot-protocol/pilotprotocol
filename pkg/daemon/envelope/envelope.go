@@ -50,8 +50,13 @@ type DecryptResult struct {
 	//   keyexchange.ErrNoKey — no Crypto installed for this peer (caller
 	//     should trigger a rekey request).
 	//   ErrReplay — replay-window check rejected the nonce.
-	//   ErrOutsideWindow — counter older than the window (likely peer
-	//     replaced their crypto and counter restarted from low).
+	//   ErrOutsideWindow — counter older than the window. (A peer that
+	//     replaced its crypto restarts its counter under a new nonce
+	//     prefix; that is a successful decrypt with Epoch RecvEpochNew.)
+	//   ErrStaleEpoch — an earlier peer epoch's window rejected the nonce,
+	//     or the frame belongs to a retired epoch.
+	//   ErrRecvEpochsExhausted — a new peer epoch refused because the
+	//     Crypto already tracks keyexchange.MaxRecvEpochs of them.
 	//   ErrAEAD — AEAD-Open failed (key divergence or corruption).
 	//   ErrTooShort — frame structurally invalid.
 	Err error
@@ -59,6 +64,16 @@ type DecryptResult struct {
 	// MaxRecvNonce is the recv-nonce high-water-mark observed under
 	// ReplayMu, captured for caller logging without re-locking.
 	MaxRecvNonce uint64
+
+	// Epoch is the peer send epoch a successful decrypt was judged in (see
+	// keyexchange.Crypto.CheckAndRecordEpochNonce): RecvEpochNewest for
+	// the peer's current epoch; RecvEpochNew when the frame opened a new
+	// one (a nonce prefix never seen on this Crypto — the peer re-derived
+	// its half of the session, and a fresh replay window was started for
+	// it); RecvEpochOlder for a straggler of an earlier epoch accepted by
+	// that epoch's own window. Only a RecvEpochNewest frame speaks for the
+	// peer's current path. Meaningful only when Err is nil.
+	Epoch keyexchange.RecvEpoch
 }
 
 // Framing-level errors. Pure verdicts on the wire-format / AEAD path —
@@ -69,6 +84,18 @@ var (
 	ErrOutsideWindow = errors.New("envelope: counter outside replay window")
 	ErrAEAD          = errors.New("envelope: AEAD authentication failed")
 	ErrTooShort      = errors.New("envelope: frame too short")
+	// ErrStaleEpoch: the frame authenticated but belongs to an earlier
+	// peer send epoch, and that epoch's own replay window rejected it (a
+	// duplicate or too-old straggler of the peer's previous session, or a
+	// replay of one) — or the epoch is retired, and all its frames are
+	// rejected. It touches neither the newest epoch's window nor any of
+	// the drop-gate counters.
+	ErrStaleEpoch = errors.New("envelope: replayed or out-of-window frame from an earlier peer epoch")
+	// ErrRecvEpochsExhausted: the frame authenticated and opens a new peer
+	// send epoch, but the Crypto already tracks keyexchange.MaxRecvEpochs
+	// epochs. The frame is refused and nothing is recorded; the caller
+	// drops the session (keyexchange.Store.ShouldDropOnRecvEpochsExhausted).
+	ErrRecvEpochsExhausted = errors.New("envelope: new peer epoch refused, session tracks too many")
 )
 
 // EncryptFrame encrypts plaintext using the Crypto installed for dst in
@@ -123,16 +150,24 @@ func EncryptWith(store *keyexchange.Store, c *keyexchange.Crypto, plaintext []by
 // consults Result.Err to decide rekey requests, drop policy, etc.
 //
 // Ordering (authenticate-before-anything — the remote-DoS fix):
-//  1. A read-only pre-check (WouldAcceptNonce) computes the replay verdict
-//     WITHOUT mutating any state; it never advances MaxRecvNonce.
-//  2. AEAD.Open authenticates the frame. A frame that fails Open is junk:
-//     it returns ErrAEAD and bumps only DecryptFailCount (threshold-gated,
-//     no aged fast-drop), so it can neither advance the window nor drive
-//     the OutsideWindow/Replay teardown counters.
-//  3. Only an authenticated frame reaches the replay verdict. If the
-//     pre-check rejected it, rejectResult bumps OutsideWindow/Replay —
-//     now provably from a real peer. Otherwise CheckAndRecordNonce commits
-//     the nonce (advancing MaxRecvNonce / setting the bit).
+//  1. AEAD.Open authenticates the frame before any replay state is read
+//     for a verdict or written. A frame that fails Open is junk: it
+//     returns ErrAEAD and bumps only DecryptFailCount (threshold-gated, no
+//     aged fast-drop), so it can neither advance the window, start a new
+//     receive epoch, nor drive the OutsideWindow/Replay teardown counters.
+//  2. Only an authenticated frame reaches the replay verdict, taken with
+//     the commit in one ReplayMu critical section, in the replay window of
+//     the frame's own send epoch — named by its nonce prefix (see
+//     keyexchange.Crypto.CheckAndRecordEpochNonce). A prefix never seen on
+//     this Crypto means the peer re-derived its half of the session — same
+//     AEAD key, send counter restarted at 1 — so it gets a fresh window
+//     instead of every frame of it being rejected as a replay.
+//  3. A rejection in the newest epoch's window goes through rejectResult,
+//     which bumps OutsideWindow/Replay — now provably from a real peer, and
+//     always about the peer's newest epoch. A rejection in an earlier
+//     epoch's window, or any frame of a retired epoch, is ErrStaleEpoch and
+//     feeds no drop gate. An epoch is never forgotten, so no recorded
+//     frame is ever judged by a fresh window on the same Crypto.
 //
 // Driving the teardown counters only from authenticated frames is what
 // stops a single forged PILS frame — junk ciphertext carrying a victim
@@ -141,9 +176,17 @@ func EncryptWith(store *keyexchange.Store, c *keyexchange.Crypto, plaintext []by
 // fast-drop into a rekey storm. No replay-window mutation happens on the
 // AEAD-fail path, so MaxRecvNonce is likewise untouched by a forged frame.
 //
+// Recognising a new epoch here is what lets a session in which only ONE
+// side re-derived converge without tearing down the other side's half
+// (the one state v1.11–v1.13 peers never answer): before, the first
+// frame of the peer's new epoch landed on our old window as a replay,
+// the aged fast-drop threw our half away, and the peer — which now held
+// a fresh session — ignored our re-handshake as a same-session keepalive.
+//
 // The grace-gated drop decisions (ShouldDropOnDecryptFail /
-// ShouldDropOnOutsideWindow / ShouldDropOnReplay) live on keyexchange.Store;
-// this function only signals via DecryptResult.Err.
+// ShouldDropOnOutsideWindow / ShouldDropOnReplay /
+// ShouldDropOnRecvEpochsExhausted) live on keyexchange.Store; this
+// function only signals via DecryptResult.Err.
 func DecryptFrame(store *keyexchange.Store, data []byte) DecryptResult {
 	if len(data) < 4+12+16 { // nodeID + 12-byte nonce + min GCM tag
 		return DecryptResult{Err: ErrTooShort}
@@ -158,11 +201,8 @@ func DecryptFrame(store *keyexchange.Store, data []byte) DecryptResult {
 	}
 
 	recvCounter := binary.BigEndian.Uint64(nonce[len(nonce)-8:])
-
-	c.ReplayMu.Lock()
-	accept := c.WouldAcceptNonce(recvCounter)
-	maxN := c.MaxRecvNonce
-	c.ReplayMu.Unlock()
+	var prefix [4]byte
+	copy(prefix[:], nonce[:4])
 
 	aad := make([]byte, 4)
 	binary.BigEndian.PutUint32(aad, peerNodeID)
@@ -171,6 +211,7 @@ func DecryptFrame(store *keyexchange.Store, data []byte) DecryptResult {
 		store.EncryptFail.Add(1)
 		c.ReplayMu.Lock()
 		c.DecryptFailCount++
+		maxN := c.MaxRecvNonce
 		c.ReplayMu.Unlock()
 		return DecryptResult{
 			PeerNodeID:   peerNodeID,
@@ -180,43 +221,58 @@ func DecryptFrame(store *keyexchange.Store, data []byte) DecryptResult {
 		}
 	}
 
-	if !accept {
-		return rejectResult(c, peerNodeID, recvCounter, maxN)
-	}
-
+	// Authenticated. Epoch selection, replay verdict and commit in one
+	// critical section, so a concurrent frame cannot slip between them.
 	c.ReplayMu.Lock()
-	committed := c.CheckAndRecordNonce(recvCounter)
-	maxN = c.MaxRecvNonce
+	committed, epoch := c.CheckAndRecordEpochNonce(prefix, recvCounter)
+	maxN := c.MaxRecvNonce
+	if committed {
+		// The key works. The consecutive replay/outside-window counts are
+		// about the newest epoch's window, so only a frame of that epoch
+		// clears them.
+		c.DecryptFailCount = 0
+		if epoch != keyexchange.RecvEpochOlder {
+			c.OutsideWindowCount = 0
+			c.ReplayCount = 0
+		}
+	}
 	c.ReplayMu.Unlock()
 
 	if !committed {
+		switch epoch {
+		case keyexchange.RecvEpochOlder, keyexchange.RecvEpochRetired:
+			// A duplicate or too-old frame of an earlier epoch, or a frame
+			// of a retired one: never a sign that the peer's current
+			// session is broken, so it does not feed the drop gates.
+			return DecryptResult{
+				PeerNodeID:   peerNodeID,
+				Counter:      recvCounter,
+				MaxRecvNonce: maxN,
+				Err:          ErrStaleEpoch,
+			}
+		case keyexchange.RecvEpochExhausted:
+			return DecryptResult{
+				PeerNodeID:   peerNodeID,
+				Counter:      recvCounter,
+				MaxRecvNonce: maxN,
+				Err:          ErrRecvEpochsExhausted,
+			}
+		}
 		return rejectResult(c, peerNodeID, recvCounter, maxN)
 	}
-
-	// Successful decrypt — reset all three fault counters under one lock.
-	c.ReplayMu.Lock()
-	if c.DecryptFailCount != 0 {
-		c.DecryptFailCount = 0
-	}
-	if c.OutsideWindowCount != 0 {
-		c.OutsideWindowCount = 0
-	}
-	if c.ReplayCount != 0 {
-		c.ReplayCount = 0
-	}
-	c.ReplayMu.Unlock()
 
 	return DecryptResult{
 		Plaintext:    plaintext,
 		PeerNodeID:   peerNodeID,
 		Counter:      recvCounter,
 		MaxRecvNonce: maxN,
+		Epoch:        epoch,
 	}
 }
 
 // rejectResult builds the DecryptResult for a nonce the replay window
-// rejects, and bumps the matching consecutive-fault counter. Both call
-// sites are past AEAD.Open, so the OutsideWindow/Replay counters it bumps
+// rejects, and bumps the matching consecutive-fault counter. Its call
+// site is past AEAD.Open, so the OutsideWindow/Replay counters it bumps
 // are only ever driven by authenticated frames. maxN is the MaxRecvNonce
 // observed under ReplayMu at the point of rejection, used both for the
 // caller's logging and to classify the rejection as in-window replay vs.

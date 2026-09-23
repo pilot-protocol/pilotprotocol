@@ -709,6 +709,15 @@ func (m *Manager) SetReplyWhitelistMatchAll(on bool) {
 
 // RemovePeer wipes per-peer L5 state (called from TunnelManager.RemovePeer).
 func (m *Manager) RemovePeer(nodeID uint32) {
+	m.ForgetPeerPath(nodeID, false)
+}
+
+// ForgetPeerPath wipes the per-peer L5 bookkeeping a path reset must not
+// carry over: cached pubkeys, the pending rekey and the reply rate-limit.
+// keepLiveness preserves lastInboundDecrypt — when the session itself
+// survives the reset, its inbound liveness is still true and the path
+// watchdog and the stale-recovery reply gate keep reading it.
+func (m *Manager) ForgetPeerPath(nodeID uint32, keepLiveness bool) {
 	m.pubKeysMu.Lock()
 	delete(m.peerPubKeys, nodeID)
 	delete(m.negPubKeys, nodeID)
@@ -716,7 +725,9 @@ func (m *Manager) RemovePeer(nodeID uint32) {
 
 	m.rkPendingMu.Lock()
 	delete(m.pendingRekey, nodeID)
-	delete(m.lastInboundDecrypt, nodeID)
+	if !keepLiveness {
+		delete(m.lastInboundDecrypt, nodeID)
+	}
 	delete(m.lastKeyExchangeReply, nodeID)
 	m.rkPendingMu.Unlock()
 }
