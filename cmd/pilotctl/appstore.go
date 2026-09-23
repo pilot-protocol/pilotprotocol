@@ -1440,7 +1440,7 @@ func cmdAppStoreInstall(args []string) {
 	}
 
 	// Write manifest.json (0644 — readable by everyone in the user's group; not secret).
-	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), raw, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), raw, 0o644); err != nil { // #nosec G306 G703 -- manifest is public metadata read by the daemon's supervisor; stagingDir is appStoreRoot()/<m.ID>.staging (m.ID reverse-DNS validated by m.Validate()), confined to the install root
 		fatalHint("io_error", "check install root permissions", "write manifest: %v", withStagingDiscarded(stagingDir, err))
 	}
 
