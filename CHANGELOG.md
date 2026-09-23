@@ -18,8 +18,41 @@ Detailed per-release notes are on the
   `false` (the default) to switch app auto-updates back on. Pilot daemon/CLI
   binary updates are never affected. Honors the existing
   `PILOT_UPDATER_NO_APP_UPGRADE` as a back-compat alias.
+- **`pilotctl daemon start --transport <udp|compat> --proxy <auto|off|URL>`.**
+  Also read from config.json (`transport`, `proxy`; set them with
+  `pilotctl config --set`) and, for the transport, `$PILOT_TRANSPORT`. Both are
+  forwarded to pilot-daemon only when set, and dropped with a warning when the
+  paired daemon binary predates them, so a new pilotctl still starts an older
+  daemon. A proxy URL with credentials travels as `$PILOT_PROXY`, never on the
+  daemon's argv, and is shown redacted by `pilotctl config`.
+- **`daemon start` forwards the proxy/TLS environment** (`HTTPS_PROXY`,
+  `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` in both cases, `PILOT_PROXY`,
+  `PILOT_TRANSPORT`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) to the daemon on both the
+  fork and `--foreground` paths, and passes through `--compat-beacon`,
+  `--registry-trust`, `--registry-fingerprint` and `--tls-trust`.
+- **`install.sh --transport compat`** (or `PILOT_TRANSPORT=compat`) for hosts
+  that block UDP or reach the internet only through an authenticating HTTPS
+  proxy: writes `transport=compat` + `proxy=auto` into config.json and
+  generates compat service units. Every installer download goes through
+  `$HTTPS_PROXY` (CONNECT to :443 by hostname only); service setup without
+  root/systemd/launchd degrades to a printed `pilotctl daemon start` hint,
+  download failures name the proxy (redacted) and the hosts it must allow.
 
 ### Fixed
+- **Compat daemons started by `pilotctl` were pinned to the raw-TCP registry.**
+  `pilotctl init` writes `34.71.57.205:9000` into config.json and `daemon
+  start` forwarded it as an explicit `-registry`, which stops pilot-daemon from
+  switching to `registry.pilotprotocol.network:443` (TLS) in compat mode — the
+  handshake then failed, or the proxy refused the `:9000` CONNECT. In compat
+  mode the compiled-in registry/beacon defaults are now left to the daemon.
+- **`PILOT_TRANSPORT=compat` had no effect through `pilotctl daemon start`.**
+  pilot-daemon's `-transport` flag defaults to `udp`, masking the env var;
+  pilotctl now resolves it and passes an explicit `-transport`.
+- **`pilotctl daemon start` on a fresh home failed with "PID file locked".**
+  Without an existing `~/.pilot`, the PID-file claim hit ENOENT and was
+  reported as a concurrent start on every attempt.
+- **`daemon start --endpoint` / `--motd-feed-url` / `--motd-interval`** were
+  documented but never forwarded to the daemon.
 - **The `pilotctl skills disable` opt-out now survives updates and explicit
   reconciles.** A forced reconcile — `pilotctl skills check`, `pilotctl update`,
   or an installer re-run — bypassed the disabled flag and re-injected skills a
