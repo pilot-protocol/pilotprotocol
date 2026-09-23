@@ -20,6 +20,17 @@ Detailed per-release notes are on the
   `PILOT_UPDATER_NO_APP_UPGRADE` as a back-compat alias.
 
 ### Fixed
+- **Watchdog restarts no longer orphan app-store apps.** When the inbound-path
+  watchdog gave up on a wedged transport it called `os.Exit(86)` directly,
+  skipping the graceful shutdown that stops plugins — so every installed app
+  (each in its own process group) was left running on every respawn. One
+  laptop accumulated 94 copies of each of 12 apps (~2.8 GB RSS) in a week.
+  The watchdog now asks the daemon's shutdown loop to stop the daemon and its
+  plugins, then exits with code 86 as before so launchd/systemd still respawn
+  it; a 15 s hard deadline forces the exit if the teardown hangs. Startup
+  failures after plugins have started now stop them before exiting, too.
+  (Complements the app-store's orphan reaping at spawn,
+  pilot-protocol/app-store#38.)
 - **The `pilotctl skills disable` opt-out now survives updates and explicit
   reconciles.** A forced reconcile — `pilotctl skills check`, `pilotctl update`,
   or an installer re-run — bypassed the disabled flag and re-injected skills a

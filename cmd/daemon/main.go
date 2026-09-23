@@ -501,7 +501,8 @@ func main() {
 	// Plugin Start methods don't depend on d.Start having run; ports
 	// and tunnels are constructed in daemon.New.
 	if err := rt.StartPlugins(context.Background()); err != nil {
-		log.Fatalf("plugin startup: %v", err)
+		// StartAll leaves the plugins it already started running.
+		fatalAfterPluginStart(rt.StopPlugins, "plugin startup: %v", err)
 	}
 
 	// PILOT-343/344/345: apply rate-limit whitelists BEFORE Start so the
@@ -512,8 +513,13 @@ func main() {
 	applyNodeIDWhitelist("reply", *replyWhitelist, "PILOT_REPLY_WHITELIST", d.SetReplyWhitelist, d.SetReplyWhitelistMatchAll)
 	applyNodeIDWhitelist("rekey", *rekeyWhitelist, "PILOT_REKEY_WHITELIST", d.SetRekeyWhitelist, d.SetRekeyWhitelistMatchAll)
 
+	// Route the daemon's supervisor-respawn exits (rx watchdog) through
+	// the shutdown loop below instead of an immediate os.Exit, so they
+	// stop the plugins — and the app-store's child apps — first.
+	daemon.SetExitHandler(forwardExitRequest)
+
 	if err := d.Start(); err != nil {
-		log.Fatalf("daemon start: %v", err)
+		fatalAfterPluginStart(rt.StopPlugins, "daemon start: %v", err)
 	}
 
 	rolloutRefreshCtx, rolloutRefreshCancel := context.WithCancel(context.Background())
@@ -612,47 +618,25 @@ func main() {
 	// deliberate restart-time administrative change.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	restartRequested := false
-shutdownLoop:
-	for {
-		select {
-		case received := <-sig:
-			if received == syscall.SIGHUP {
-				if enterpriseControls == nil {
-					slog.Warn("enterprise control reload ignored: no attachment is configured")
-				} else if err := enterpriseControls.Reload(); err != nil {
-					slog.Error("enterprise control reload rejected; keeping current signed state", "err", err)
-				} else {
-					slog.Info("enterprise control reloaded")
-				}
-				continue
-			}
-			break shutdownLoop
-		case lifecycle := <-remoteLifecycleRequests:
-			restartRequested = lifecycle == "restart"
-			break shutdownLoop
+	cause := awaitShutdown(sig, remoteLifecycleRequests, supervisorExitRequests, func() {
+		if enterpriseControls == nil {
+			slog.Warn("enterprise control reload ignored: no attachment is configured")
+		} else if err := enterpriseControls.Reload(); err != nil {
+			slog.Error("enterprise control reload rejected; keeping current signed state", "err", err)
+		} else {
+			slog.Info("enterprise control reloaded")
 		}
-	}
+	})
 	signal.Stop(sig)
 	rolloutRefreshCancel()
 	receiptExportCancel()
 	fleetControlCancel()
 
-	// Order matters: Daemon.Stop publishes daemon.shutting_down to the
-	// bus before tearing down ports/IPC/tunnels. Plugins (notably
-	// webhook) are still subscribed at that point, so the event flows
-	// through. StopPlugins then drains each plugin's queue. Reversing
-	// this order would lose the shutdown event because the webhook's
-	// bus subscription would be cancelled before doStop publishes.
-	slog.Info("shutting down")
-	d.Stop()
-
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := rt.StopPlugins(stopCtx); err != nil {
-		slog.Warn("plugin shutdown error", "err", err)
-	}
-	stopCancel()
-	if restartRequested {
+	// Daemon.Stop then StopPlugins (see teardown for why the order
+	// matters). A daemon-requested exit leaves here via os.Exit with its
+	// code once the teardown finishes.
+	shutdown(cause, func() { d.Stop() }, rt.StopPlugins, os.Exit)
+	if cause.restart {
 		executable, err := os.Executable()
 		if err != nil {
 			slog.Error("resolve daemon executable for remote restart", "err", err)
