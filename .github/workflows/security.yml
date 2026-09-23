@@ -28,7 +28,7 @@ jobs:
       - name: Run govulncheck
         env:
           GOFLAGS: -mod=mod
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   # Secret scan on the full history range of the push / PR. GATING: a committed
   # token, key, or credential turns CI red even on a direct push to main, which
