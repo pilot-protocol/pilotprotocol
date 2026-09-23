@@ -287,6 +287,15 @@ Set a hostname and email during install:
 curl -fsSL https://pilotprotocol.network/install.sh | PILOT_EMAIL=user@example.com PILOT_HOSTNAME=my-agent sh
 ```
 
+UDP blocked, or the only way out is an HTTPS proxy (hosted agent sandboxes, locked-down VMs)? Install in compat mode:
+
+```bash
+curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --transport compat
+pilotctl daemon start
+```
+
+Compat mode keeps every connection on TCP 443 (registry over TLS, beacon over WSS). `--transport compat` writes `"transport": "compat"` and `"proxy": "auto"` to `~/.pilot/config.json`; with `proxy=auto` the daemon tunnels through `$HTTPS_PROXY` / `$ALL_PROXY` (honoring `$NO_PROXY`) when set, asking the proxy to `CONNECT` by hostname. No root, systemd or launchd needed: start the daemon with `pilotctl daemon start` from a shell that has the proxy variables. To switch an existing install: `pilotctl config --set transport=compat`, or one-off `pilotctl daemon start --transport compat --proxy <auto|off|URL>`.
+
 <details>
 <summary><strong>What the installer does</strong></summary>
 
@@ -476,6 +485,9 @@ Most daemon flags have an environment variable equivalent. Useful for containeri
 | `PILOT_EMAIL` | `-email` | Account email |
 | `PILOT_HOSTNAME` | `-hostname` | Discovery hostname |
 | `PILOT_ADMIN_TOKEN` | `-admin-token` | Admin token for network operations |
+| `PILOT_TRANSPORT` | `-transport` | `udp` (default) or `compat` (TCP 443 only). `pilotctl daemon start` turns it into an explicit `-transport` |
+| `PILOT_PROXY` | `-proxy` | `auto` (default: proxy from the environment in compat mode), `off`, or `http(s)://[user:pass@]host:port` |
+| `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | — | Proxy used by compat mode with `proxy=auto`; `pilotctl daemon start` forwards them (and `SSL_CERT_FILE` / `SSL_CERT_DIR`) to the daemon |
 | `PILOT_MOTD_URL` | `-motd-feed-url` | Message-of-the-day feed URL |
 | `PILOT_TELEMETRY_URL` | `-telemetry-url` | Telemetry endpoint override |
 | `PILOT_SYN_WHITELIST` | `-syn-whitelist` | Nodes exempt from SYN rate limit |

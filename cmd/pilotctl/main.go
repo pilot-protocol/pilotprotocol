@@ -287,7 +287,7 @@ func getRegistry() string {
 	if s, ok := cfg["registry"].(string); ok && s != "" {
 		return s
 	}
-	return "34.71.57.205:9000"
+	return productionRegistryAddr
 }
 
 // getBeacon mirrors getRegistry for the beacon address: env override,
@@ -304,7 +304,7 @@ func getBeacon() string {
 	if s, ok := cfg["beacon"].(string); ok && s != "" {
 		return s
 	}
-	return "34.71.57.205:9001"
+	return productionBeaconAddr
 }
 
 func loadConfig() map[string]interface{} {
@@ -602,10 +602,15 @@ func nodeIDFromDaemon() int64 {
 
 func connectRegistry() *registry.Client {
 	addr := getRegistry()
+	// TODO(netproxy): dial through common/netproxy (HTTPS_PROXY CONNECT by
+	// hostname, TLS for the compat registry) once pilotctl bumps to a common
+	// release with the registry dialer option. Until then this raw-TCP dial
+	// bypasses any egress proxy, so registry commands fail in proxy-only
+	// sandboxes; registryDialHint says so.
 	rc, err := registry.Dial(addr)
 	if err != nil {
 		fatalHint("connection_failed",
-			fmt.Sprintf("check that the registry is running at %s, or set PILOT_REGISTRY", addr),
+			registryDialHint(addr),
 			"cannot reach registry at %s", addr)
 	}
 	return rc
@@ -704,13 +709,19 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 	}
 
 	// Branch 3 — unknown peer, not trusted. Refuse if private.
+	// TODO(netproxy): same raw-TCP registry dial as connectRegistry — it
+	// bypasses HTTPS_PROXY until common/netproxy lands in pilotctl.
 	rc, err := registry.Dial(getRegistry())
 	if err != nil {
 		// Registry unreachable — be conservative and refuse rather than
 		// silently let an untrusted tunnel attempt go through to a peer
 		// we can't characterise.
+		hint := fmt.Sprintf("run: pilotctl handshake %s", addr)
+		if envProxyURL() != "" {
+			hint += " (or pass --no-auto-handshake); " + registryDialHint(getRegistry())
+		}
 		fatalHint("trust_required",
-			fmt.Sprintf("run: pilotctl handshake %s", addr),
+			hint,
 			"cannot verify peer visibility (registry unreachable: %v); refusing tunnel to untrusted node", err)
 	}
 	defer rc.Close()
@@ -1056,6 +1067,29 @@ Flags:
   --motd-feed-url <url>        message-of-the-day feed (empty to disable; env PILOT_MOTD_URL)
   --motd-interval <duration>   message-of-the-day poll interval (default: 15m)
   --enterprise-control <path>  owner-only managed control attachment
+  --transport <udp|compat>     tunnel transport (default: $PILOT_TRANSPORT, config
+                               "transport", else udp). compat = TLS/WSS over TCP 443
+                               only, for UDP-blocked hosts; the raw-TCP default
+                               registry/beacon are then left to the daemon, which
+                               uses registry.pilotprotocol.network:443
+  --proxy <auto|off|URL>       outbound proxy (default: config "proxy", else the
+                               daemon's $PILOT_PROXY or auto). auto = in compat mode
+                               use $HTTPS_PROXY/$ALL_PROXY (honoring $NO_PROXY);
+                               off = never; http(s)://[user:pass@]host:port = always.
+                               A URL with credentials is passed via env, not argv
+  --compat-beacon <url>        beacon WSS URL for compat mode
+  --registry-trust <mode>      registry TLS trust: pinned or system
+  --registry-fingerprint <hex> registry certificate SHA-256 (with --registry-trust pinned)
+  --tls-trust <mode>           compat beacon TLS trust: system or pinned
+
+Environment passed through to the daemon (never scrubbed):
+  HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
+  NO_PROXY no_proxy PILOT_PROXY PILOT_TRANSPORT SSL_CERT_FILE SSL_CERT_DIR
+
+--transport / --proxy are forwarded only when set; if the pilot-daemon binary
+is too old to know one, it is dropped with a warning instead of crashing it.
+Behind an HTTPS proxy with UDP blocked (e.g. hosted agent sandboxes):
+  pilotctl config --set transport=compat && pilotctl daemon start
 `,
 	"daemon stop": `Usage: pilotctl daemon stop
 
@@ -1308,6 +1342,9 @@ Common keys:
   beacon       beacon address (overrides $PILOT_BEACON)
   socket       daemon socket path (overrides $PILOT_SOCKET)
   hostname     default hostname passed to daemon start
+  transport    daemon transport: udp or compat ($PILOT_TRANSPORT overrides)
+  proxy        daemon proxy: auto, off, or http(s)://[user:pass@]host:port
+               (credentials are redacted when shown)
 `,
 	"version": `Usage: pilotctl version
 
@@ -1514,7 +1551,7 @@ Bootstrap:
   pilotctl config [--set key=value]
 
 Daemon lifecycle:
-  pilotctl daemon start [--config <path>] [--registry <addr>] [--beacon <addr>] [--email <addr>] [--webhook <url>] [--trust-auto-approve]
+  pilotctl daemon start [--config <path>] [--registry <addr>] [--beacon <addr>] [--email <addr>] [--webhook <url>] [--trust-auto-approve] [--transport <udp|compat>] [--proxy <auto|off|URL>]
   pilotctl daemon stop
   pilotctl daemon status
 
@@ -1611,6 +1648,9 @@ Diagnostic commands:
 Environment:
   PILOT_REGISTRY     Registry address (default: 34.71.57.205:9000)
   PILOT_SOCKET       Daemon socket path (default: /tmp/pilot.sock)
+  PILOT_TRANSPORT    daemon start transport: udp or compat (TCP 443 only)
+  PILOT_PROXY        daemon proxy policy: auto, off, or http(s)://[user:pass@]host:port
+  HTTPS_PROXY        proxy used by compat mode (proxy=auto) and pilotctl's HTTP calls
 
 Version:
   pilotctl version
@@ -2087,14 +2127,32 @@ func cmdConfig(args []string) {
 		if len(parts) != 2 {
 			fatalCode("invalid_argument", "usage: pilotctl config --set key=value")
 		}
+		// Validate the keys daemon start interprets, so a typo fails here
+		// rather than on the next daemon start. Empty clears the key.
+		if parts[1] != "" {
+			switch parts[0] {
+			case "transport":
+				if err := validateTransport(parts[1]); err != nil {
+					fatalCode("invalid_argument", "config: %v", err)
+				}
+			case "proxy":
+				if err := validateProxySetting(parts[1]); err != nil {
+					fatalCode("invalid_argument", "config: %v", err)
+				}
+			}
+		}
 		cfg := loadConfig()
 		cfg[parts[0]] = parts[1]
 		if err := saveConfig(cfg); err != nil {
 			fatalCode("internal", "save config: %v", err)
 		}
+		shown := parts[1]
+		if parts[0] == "proxy" {
+			shown = redactProxyURL(shown)
+		}
 		outputOK(map[string]interface{}{
 			"key":   parts[0],
-			"value": parts[1],
+			"value": shown,
 		})
 		return
 	}
@@ -2110,6 +2168,10 @@ func cmdConfig(args []string) {
 	}
 	if _, ok := cfg["socket"]; !ok {
 		cfg["socket"] = getSocket()
+	}
+	// config.json is 0600 for a reason; a proxy URL may carry credentials.
+	if p, ok := cfg["proxy"].(string); ok {
+		cfg["proxy"] = redactProxyURL(p)
 	}
 	if jsonOutput {
 		output(cfg)
@@ -2201,9 +2263,9 @@ func contextCatalog() map[string]interface{} {
 
 			// Daemon lifecycle
 			"daemon start": map[string]interface{}{
-				"args":        []string{"[--registry <addr>]", "[--beacon <addr>]", "[--listen <addr>]", "[--identity <path>]", "[--email <addr>]", "[--hostname <name>]", "[--log-level <level>]", "[--public]", "[--foreground]", "[--socket <path>]"},
-				"description": "Start the daemon as a background process. Blocks until registered, then exits",
-				"returns":     "node_id, address, pid, socket, hostname, log_file",
+				"args":        []string{"[--registry <addr>]", "[--beacon <addr>]", "[--listen <addr>]", "[--identity <path>]", "[--email <addr>]", "[--hostname <name>]", "[--log-level <level>]", "[--public]", "[--foreground]", "[--socket <path>]", "[--transport <udp|compat>]", "[--proxy <auto|off|URL>]"},
+				"description": "Start the daemon as a background process. Blocks until registered, then exits. --transport compat (or config transport=compat / $PILOT_TRANSPORT) runs over TCP 443 only for UDP-blocked hosts; --proxy auto (default) then routes through $HTTPS_PROXY",
+				"returns":     "node_id, address, pid, socket, hostname, log_file, transport (when set), proxy (when set, credentials redacted)",
 			},
 			"daemon stop": map[string]interface{}{
 				"args":        []string{},
@@ -2543,8 +2605,11 @@ func contextCatalog() map[string]interface{} {
 			"--json": "Output structured JSON for all commands. Success: {status:ok, data:{...}}. Error: {status:error, code:string, message:string}",
 		},
 		"environment": map[string]interface{}{
-			"PILOT_REGISTRY": "Registry address (default: 34.71.57.205:9000)",
-			"PILOT_SOCKET":   "Daemon socket path (default: /tmp/pilot.sock)",
+			"PILOT_REGISTRY":  "Registry address (default: 34.71.57.205:9000)",
+			"PILOT_SOCKET":    "Daemon socket path (default: /tmp/pilot.sock)",
+			"PILOT_TRANSPORT": "daemon start transport: udp or compat (TCP 443 only)",
+			"PILOT_PROXY":     "daemon proxy policy: auto, off, or http(s)://[user:pass@]host:port",
+			"HTTPS_PROXY":     "proxy used by compat mode (proxy=auto) and pilotctl HTTP calls; forwarded to the daemon",
 		},
 		"config_file": "~/.pilot/config.json",
 	}
@@ -2662,17 +2727,52 @@ func gatewayBinaryPath() string {
 	return path
 }
 
+// daemonLaunchPlan is everything `pilotctl daemon start` hands to
+// pilot-daemon: its argv (without argv[0]) plus the values that travel in
+// the child environment instead of on the command line.
+type daemonLaunchPlan struct {
+	Args       []string
+	SocketPath string
+	// AdminToken is passed as $PILOT_ADMIN_TOKEN, never on argv (PILOT-290).
+	AdminToken string
+	// Transport is the resolved --transport ("" = daemon default, udp).
+	Transport string
+	// Proxy is the resolved --proxy ("" = daemon default, auto).
+	Proxy string
+	// ProxyEnv is non-empty when Proxy carries credentials: it is handed to
+	// the daemon as $PILOT_PROXY instead of -proxy on argv (PILOT-290).
+	ProxyEnv string
+}
+
 // buildDaemonArgs translates pilotctl-style flags into pilot-daemon CLI
 // args, applying defaults from ~/.pilot/config.json when CLI flags are
 // unset. This keeps existing pilotctl invocations working unchanged —
 // the only difference is that the daemon runs in a separate
 // `pilot-daemon` process rather than re-execing pilotctl.
 func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adminToken string) {
+	plan := planDaemonLaunch(args)
+	return plan.Args, plan.SocketPath, plan.AdminToken
+}
+
+// planDaemonLaunch resolves pilotctl flags, environment and config.json into
+// a daemonLaunchPlan. Precedence for every setting is CLI flag, then (where
+// one exists) its environment variable, then config.json, then the daemon's
+// own default.
+func planDaemonLaunch(args []string) daemonLaunchPlan {
 	flags, _ := parseFlags(args)
 
 	cfg := loadConfig()
 
-	socketPath = flagString(flags, "socket", "")
+	transport, err := resolveDaemonTransport(flags, cfg)
+	if err != nil {
+		fatalCode("invalid_argument", "daemon start: %v", err)
+	}
+	proxy, err := resolveDaemonProxy(flags, cfg)
+	if err != nil {
+		fatalCode("invalid_argument", "daemon start: %v", err)
+	}
+
+	socketPath := flagString(flags, "socket", "")
 	if socketPath == "" {
 		socketPath = getSocket()
 	}
@@ -2725,7 +2825,7 @@ func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adm
 			webhookURL = w
 		}
 	}
-	adminToken = flagString(flags, "admin-token", "")
+	adminToken := flagString(flags, "admin-token", "")
 	if adminToken == "" {
 		if a, ok := cfg["admin_token"].(string); ok {
 			adminToken = a
@@ -2745,15 +2845,24 @@ func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adm
 		}
 	}
 
-	daemonArgs = []string{
-		"--registry", registryAddr,
-		"--beacon", beaconAddr,
+	var daemonArgs []string
+	// In compat mode the raw-TCP production registry/beacon defaults are
+	// left off argv so pilot-daemon applies its 443-only compat defaults
+	// (registry.pilotprotocol.network:443 over TLS). Any other address is
+	// an operator choice and is forwarded verbatim.
+	if !compatSkipsDefault(transport, registryAddr, productionRegistryAddr) {
+		daemonArgs = append(daemonArgs, "--registry", registryAddr)
+	}
+	if !compatSkipsDefault(transport, beaconAddr, productionBeaconAddr) {
+		daemonArgs = append(daemonArgs, "--beacon", beaconAddr)
+	}
+	daemonArgs = append(daemonArgs,
 		"--listen", listenAddr,
 		"--socket", socketPath,
 		"--identity", identityPath,
 		"--log-level", logLevel,
 		"--log-format", logFormat,
-	}
+	)
 	// pilot-daemon's encrypt flag defaults to true; pass `=false`
 	// only when --no-encrypt was supplied.
 	if !encrypt {
@@ -2785,7 +2894,36 @@ func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adm
 	if enterpriseControl != "" {
 		daemonArgs = append(daemonArgs, "--enterprise-control", enterpriseControl)
 	}
-	return daemonArgs, socketPath, adminToken
+	// Daemon flags that are forwarded only when given, so a plain
+	// `daemon start` keeps the daemon's own defaults. --endpoint and the
+	// motd pair were documented here for a long time but never forwarded.
+	for _, name := range []string{"endpoint", "compat-beacon", "registry-trust", "registry-fingerprint", "tls-trust", "motd-feed-url", "motd-interval"} {
+		if v, ok := flags[name]; ok {
+			daemonArgs = append(daemonArgs, "--"+name, v)
+		}
+	}
+	// --transport / --proxy are passed only when set, so a new pilotctl
+	// still starts an older daemon that predates them (cmdDaemonStart
+	// additionally drops any the daemon binary does not define).
+	if transport != "" {
+		daemonArgs = append(daemonArgs, "--transport", transport)
+	}
+	proxyEnv := ""
+	if proxy != "" {
+		if proxyHasCredentials(proxy) {
+			proxyEnv = proxy
+		} else {
+			daemonArgs = append(daemonArgs, "--proxy", proxy)
+		}
+	}
+	return daemonLaunchPlan{
+		Args:       daemonArgs,
+		SocketPath: socketPath,
+		AdminToken: adminToken,
+		Transport:  transport,
+		Proxy:      proxy,
+		ProxyEnv:   proxyEnv,
+	}
 }
 
 // launchdAgentLabels enumerates known launchd labels for the daemon.
@@ -2843,11 +2981,24 @@ func launchdAgentLoaded(label string) bool {
 func cmdDaemonStart(args []string) {
 	flags, _ := parseFlags(args)
 
+	// Resolve (and validate) the launch before touching the PID file, so a
+	// bad --transport / --proxy fails fast with nothing to clean up.
+	plan := planDaemonLaunch(args)
+
 	// macOS install.sh installs a launchd plist. When present, route start
 	// through launchctl so the agent is registered and KeepAlive supervises
 	// the process; otherwise `pilotctl daemon stop` would have nothing to
 	// stop (KeepAlive immediately respawns) and the user sees flapping.
 	if plist, label := launchdAgentPlist(); plist != "" {
+		// launchd starts the daemon from the plist's ProgramArguments and
+		// its own environment: neither CLI flags nor this shell's proxy
+		// variables reach it. The daemon does read config.json itself.
+		if _, ok := flags["transport"]; ok && !jsonOutput {
+			fmt.Fprintf(os.Stderr, "warning: --transport is not applied to the launchd-managed daemon; persist it with: pilotctl config --set transport=%s\n", plan.Transport)
+		}
+		if _, ok := flags["proxy"]; ok && !jsonOutput {
+			fmt.Fprintf(os.Stderr, "warning: --proxy is not applied to the launchd-managed daemon; persist it with: pilotctl config --set proxy=<auto|off|URL>\n")
+		}
 		if launchdAgentLoaded(label) {
 			fatalHint("already_exists",
 				"stop it first with: pilotctl daemon stop",
@@ -2906,6 +3057,10 @@ func cmdDaemonStart(args []string) {
 	// Atomically claim the PID file to prevent concurrent daemon starts.
 	// O_CREAT|O_EXCL ensures only one pilotctl daemon start can succeed;
 	// a second concurrent invocation fails here before spawning a daemon.
+	// The config dir must exist first: on a fresh HOME (no `pilotctl init`,
+	// no ~/.pilot/bin) the open failed with ENOENT and was misreported as
+	// "PID file locked" on every attempt.
+	_ = os.MkdirAll(configDir(), 0700)
 	if f, err := os.OpenFile(pidFilePath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600); err != nil {
 		fatalHint("already_exists",
 			"stop it first with: pilotctl daemon stop",
@@ -2915,7 +3070,7 @@ func cmdDaemonStart(args []string) {
 		f.Close()
 	}
 
-	daemonArgs, socketPath, adminToken := buildDaemonArgs(args)
+	socketPath := plan.SocketPath
 
 	// Clean up stale socket
 	if _, err := os.Stat(socketPath); err == nil {
@@ -2932,6 +3087,20 @@ func cmdDaemonStart(args []string) {
 	}
 
 	daemonBin := daemonBinaryPath()
+	// Never hand an older daemon a flag it does not define: Go's flag
+	// package would abort it on startup.
+	daemonArgs := dropUnsupportedDaemonFlags(daemonBin, plan.Args)
+	proxyEnv := plan.ProxyEnv
+	if proxyEnv != "" {
+		if supported := daemonFlags(daemonBin); supported != nil && !supported["proxy"] {
+			if !jsonOutput {
+				fmt.Fprintf(os.Stderr, "warning: %s does not support -proxy (older pilot-daemon); proxy %s will not be used — upgrade pilot-daemon to use it\n",
+					daemonBin, redactProxyURL(proxyEnv))
+			}
+			proxyEnv = ""
+		}
+	}
+	daemonEnv := daemonChildEnv(os.Environ(), plan.AdminToken, proxyEnv, plan.Transport)
 
 	// --foreground: replace the current process so signal/lifetime
 	// handling matches what the user expects from systemd unit files
@@ -2946,14 +3115,10 @@ func cmdDaemonStart(args []string) {
 		// locked"), an unrecoverable restart loop under systemd.
 		_ = os.WriteFile(pidFilePath(), []byte(strconv.Itoa(os.Getpid())+"\n"), 0600)
 		// syscall.Exec needs argv[0] to be the binary name. Pass the
-		// full env. Inject PILOT_ADMIN_TOKEN so the daemon doesn't
-		// need the token on its argv (PILOT-290).
+		// full env (daemonChildEnv) — it carries PILOT_ADMIN_TOKEN so the
+		// daemon doesn't need the token on its argv (PILOT-290).
 		execArgs := append([]string{daemonBin}, daemonArgs...)
-		env := os.Environ()
-		if adminToken != "" {
-			env = append(env, "PILOT_ADMIN_TOKEN="+adminToken)
-		}
-		if err := syscall.Exec(daemonBin, execArgs, env); err != nil {
+		if err := syscall.Exec(daemonBin, execArgs, daemonEnv); err != nil {
 			fatalCode("internal", "exec %s: %v", daemonBin, err)
 		}
 		return
@@ -2978,11 +3143,11 @@ func cmdDaemonStart(args []string) {
 	proc.Stdout = logFile
 	proc.Stderr = logFile
 	proc.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	// Pass admin token via env, not argv, to avoid leaking in
+	// Full environment plus overrides (daemonChildEnv): the proxy
+	// variables in daemonForwardEnv must reach the daemon, and the admin
+	// token travels via env, not argv, to avoid leaking in
 	// /proc/<pid>/cmdline (PILOT-290).
-	if adminToken != "" {
-		proc.Env = append(os.Environ(), "PILOT_ADMIN_TOKEN="+adminToken)
-	}
+	proc.Env = daemonEnv
 
 	if err := proc.Start(); err != nil {
 		fatalCode("internal", "start daemon: %v", err)
@@ -3037,19 +3202,32 @@ func cmdDaemonStart(args []string) {
 		address := info["address"]
 		hn, _ := info["hostname"].(string)
 		if jsonOutput {
-			outputOK(map[string]interface{}{
+			fields := map[string]interface{}{
 				"pid":      pid,
 				"node_id":  nodeID,
 				"address":  address,
 				"hostname": hn,
 				"socket":   socketPath,
 				"log_file": pidLogPath,
-			})
+			}
+			if plan.Transport != "" {
+				fields["transport"] = plan.Transport
+			}
+			if plan.Proxy != "" {
+				fields["proxy"] = redactProxyURL(plan.Proxy)
+			}
+			outputOK(fields)
 		} else {
 			fmt.Printf("Daemon running (pid %d)\n", pid)
 			fmt.Printf("  Address:  %s\n", address)
 			if hn != "" {
 				fmt.Printf("  Hostname: %s\n", hn)
+			}
+			if plan.Transport != "" {
+				fmt.Printf("  Transport: %s\n", plan.Transport)
+			}
+			if plan.Proxy != "" {
+				fmt.Printf("  Proxy:    %s\n", redactProxyURL(plan.Proxy))
 			}
 			fmt.Printf("  Socket:   %s\n", socketPath)
 			fmt.Printf("  Logs:     %s\n", pidLogPath)

@@ -298,9 +298,12 @@ func cmdRecoveryRecover(args []string) {
 	newPub := crypto.EncodePublicKey(id.PublicKey)
 
 	addr := flagString(flags, "registry", getRegistry())
+	// TODO(netproxy): raw-TCP registry dial; bypasses HTTPS_PROXY until
+	// common/netproxy lands in pilotctl (see connectRegistry).
 	rc, err := registry.Dial(addr)
 	if err != nil {
-		fatalCode("connection_failed", "recovery recover: cannot reach registry at %s: %v", addr, err)
+		fatalHint("connection_failed", registryDialHint(addr),
+			"recovery recover: cannot reach registry at %s: %v", addr, err)
 	}
 	defer rc.Close()
 
