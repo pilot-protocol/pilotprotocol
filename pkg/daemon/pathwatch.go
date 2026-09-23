@@ -88,6 +88,7 @@ var pathWatchResetPeer = func(d *Daemon, nodeID uint32) {
 		"peer_node_id", nodeID,
 		"had_tunnel", res.HadTunnel,
 		"was_relay_active", res.WasRelayActive,
+		"session_kept", res.SessionKept,
 		"pila_pushed", res.PilaPushed,
 		"resolve_error", res.ResolveErr)
 }
@@ -209,6 +210,7 @@ type peerPathReset struct {
 	HadTunnel      bool
 	WasRelayActive bool
 	WasRelayPinned bool
+	SessionKept    bool // an established session survived the reset
 	PilaPushed     bool
 	ResolveErr     string
 }
@@ -226,17 +228,25 @@ type peerPathReset struct {
 //     while a future direct receive can promote the path.
 //   - forgetPeerResolution drops the cached resolve/endpoint so
 //     ensureTunnel hits the registry fresh instead of short-circuiting.
-//   - RemovePeer wipes the tunnel + per-peer metadata; it also wipes the
-//     relay flags as a side effect, so the captured relay-active state is
-//     re-applied (without the pin) right after.
+//   - RemovePeerPath wipes the tunnel + per-peer metadata but KEEPS the
+//     session keys (see RemovePeerPath for why dropping them wedged the
+//     peer until a restart). It also wipes the relay flags as a side
+//     effect, so the captured relay-active state is re-applied (without
+//     the pin) right after.
 //   - ClearLastRekeyReq / ClearRekeyGaveUp lift the per-peer rekey
-//     cooldowns that survive RemovePeer — without this the recovery PILA
+//     cooldowns that survive RemovePeerPath — without this the recovery PILA
 //     would be silently skipped by the 3s rate gate.
 //   - ensureTunnel + sendKeyExchangeToNode push a fresh signed PILA
 //     immediately, making recovery deterministic instead of waiting for
 //     the peer's next keepalive. Best-effort: with the registry
 //     unreachable the state reset still happened and the next inbound
 //     packet from the peer triggers the rekey path.
+//   - If a session survived, the peer (which holds the same session)
+//     answers that PILA with nothing, so the rekey it armed would only
+//     clear on the peer's next keepalive — up to ~30s, longer than the
+//     ~24s rekey give-up budget, which would fire a spurious "rekey gave
+//     up" and another reset. A path probe gets a pong back within one RTT
+//     on a live path; that decrypt clears the pending rekey.
 func (d *Daemon) resetPeerPath(nodeID uint32) peerPathReset {
 	res := peerPathReset{
 		HadTunnel:      d.tunnels.HasPeer(nodeID),
@@ -251,8 +261,9 @@ func (d *Daemon) resetPeerPath(nodeID uint32) peerPathReset {
 	d.forgetPeerResolution(nodeID)
 
 	if res.HadTunnel {
-		d.tunnels.RemovePeer(nodeID)
+		d.tunnels.RemovePeerPath(nodeID)
 	}
+	res.SessionKept = d.tunnels.IsEncrypted(nodeID)
 	if res.WasRelayActive {
 		d.tunnels.SetRelayPeer(nodeID, true)
 	}
@@ -271,6 +282,11 @@ func (d *Daemon) resetPeerPath(nodeID uint32) peerPathReset {
 	} else {
 		d.tunnels.sendKeyExchangeToNode(nodeID)
 		res.PilaPushed = true
+		if res.SessionKept {
+			if err := d.tunnels.SendPathProbe(nodeID); err != nil {
+				slog.Debug("path reset: probe send failed", "peer_node_id", nodeID, "err", err)
+			}
+		}
 	}
 	return res
 }
@@ -316,6 +332,7 @@ func (d *Daemon) onRekeyGaveUp(nodeID uint32) {
 			"peer_node_id", nodeID,
 			"had_tunnel", res.HadTunnel,
 			"was_relay_active", res.WasRelayActive,
+			"session_kept", res.SessionKept,
 			"pila_pushed", res.PilaPushed,
 			"resolve_error", res.ResolveErr)
 		d.publishEvent("tunnel.path_suspect", map[string]any{
