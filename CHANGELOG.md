@@ -15,11 +15,22 @@ Detailed per-release notes are on the
   without bound — 22 MB on one laptop. When stderr is a regular file the
   daemon now checks it every minute and, past `-log-max-size` MB (default 50;
   `0` disables), copy-truncates it into gzipped generations
-  `daemon.log.1.gz` … `daemon.log.N.gz` (`-log-max-backups`, default 3).
-  Truncation is safe for every writer — the file is opened append-only and
-  shared by child processes. Both flags can also be set in
+  `daemon.log.pilot.1.gz` … `daemon.log.pilot.N.gz` (`-log-max-backups`,
+  default 3). Truncation is safe for every writer — the file is opened
+  append-only and shared by child processes. Both flags can also be set in
   `~/.pilot/config.json` (`log_max_size`, `log_max_backups`). No-op under
   systemd/journald or on a terminal.
+  - By default only a log inside `~/.pilot` is rotated — where launchd and
+    `pilotctl daemon start` put it (also `$PILOT_HOME/.pilot`). If you send the
+    daemon's output somewhere else, rotation stays off unless you set
+    `-log-max-size` explicitly, on the command line or in `config.json`, so
+    your own rotation (logrotate, newsyslog) keeps working as before.
+  - It never touches files it did not create. The `.pilot` infix keeps its
+    backups apart from logrotate's and newsyslog's names (`daemon.log.1`,
+    `daemon.log.2.gz`, …). It skips a symlink or another user's file at one
+    of its own names, and creates its files with `O_EXCL|O_NOFOLLOW`. If the
+    log's directory is writable by group or others, or owned by another
+    user, it only truncates and keeps no backups.
 - **Opt out of automatic app-store updates with `PILOT_APP_UPDATE_OPT_OUT`.** The
   `pilot-updater` keeps installed apps current by periodically running
   `pilotctl appstore upgrade --all`. Set `PILOT_APP_UPDATE_OPT_OUT=true` in the

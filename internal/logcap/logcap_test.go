@@ -64,6 +64,12 @@ func exists(path string) bool {
 	return err == nil
 }
 
+// anywhere returns Options that rotate the log wherever it lives, as an
+// explicit -log-max-size does.
+func anywhere(maxBytes int64, maxBackups int) Options {
+	return Options{MaxBytes: maxBytes, MaxBackups: maxBackups, Anywhere: true}
+}
+
 func mustRotate(t *testing.T, r *Rotator) {
 	t.Helper()
 	rotated, err := r.Check()
@@ -80,7 +86,7 @@ func TestCheckBelowLimitIsNoop(t *testing.T) {
 	f := openLog(t, path)
 	write(t, f, strings.Repeat("x", 100))
 
-	r := New(f, 100, 3) // exactly at the limit: not over it
+	r := New(f, anywhere(100, 3)) // exactly at the limit: not over it
 	rotated, err := r.Check()
 	if err != nil || rotated {
 		t.Fatalf("Check = (%v, %v), want (false, nil)", rotated, err)
@@ -88,7 +94,7 @@ func TestCheckBelowLimitIsNoop(t *testing.T) {
 	if got := readFile(t, path); len(got) != 100 {
 		t.Fatalf("log size = %d, want 100 (untouched)", len(got))
 	}
-	if exists(path + ".1.gz") {
+	if exists(backupName(path, 1)) {
 		t.Fatal("backup written for a log under the limit")
 	}
 }
@@ -99,19 +105,19 @@ func TestCheckRotatesTruncatesAndGzips(t *testing.T) {
 	first := strings.Repeat("first line\n", 20)
 	write(t, f, first)
 
-	r := New(f, 100, 3)
+	r := New(f, anywhere(100, 3))
 	mustRotate(t, r)
 
 	if got := readFile(t, path); got != "" {
 		t.Fatalf("log after rotation = %d bytes, want empty", len(got))
 	}
-	if got := gunzip(t, path+".1.gz"); got != first {
+	if got := gunzip(t, backupName(path, 1)); got != first {
 		t.Fatalf("backup content mismatch: got %d bytes, want %d", len(got), len(first))
 	}
-	if exists(path + ".1") {
+	if exists(stagingName(path)) {
 		t.Fatal("uncompressed staging copy left behind")
 	}
-	fi, err := os.Stat(path + ".1.gz")
+	fi, err := os.Stat(backupName(path, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +136,7 @@ func TestCheckRotatesTruncatesAndGzips(t *testing.T) {
 func TestCheckShiftsGenerationsAndDropsOldest(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.log")
 	f := openLog(t, path)
-	r := New(f, 10, 3)
+	r := New(f, anywhere(10, 3))
 
 	contents := []string{"generation-A\n", "generation-B\n", "generation-C\n", "generation-D\n"}
 	for _, c := range contents {
@@ -159,7 +165,7 @@ func TestCheckRemovesGenerationsBeyondLoweredLimit(t *testing.T) {
 		}
 	}
 	write(t, f, strings.Repeat("y", 50))
-	mustRotate(t, New(f, 10, 2))
+	mustRotate(t, New(f, anywhere(10, 2)))
 
 	if !exists(backupName(path, 1)) || !exists(backupName(path, 2)) {
 		t.Fatal("expected .1.gz and .2.gz")
@@ -176,7 +182,7 @@ func TestCheckZeroBackupsJustTruncates(t *testing.T) {
 	f := openLog(t, path)
 	write(t, f, strings.Repeat("z", 50))
 
-	mustRotate(t, New(f, 10, 0))
+	mustRotate(t, New(f, anywhere(10, 0)))
 	if got := readFile(t, path); got != "" {
 		t.Fatalf("log not truncated: %d bytes", len(got))
 	}
@@ -191,11 +197,11 @@ func TestCheckFinishesInterruptedRotation(t *testing.T) {
 	f := openLog(t, path)
 	// A previous rotation copied to .1 and died before compressing it;
 	// its shift had already moved the older backup to .2.gz.
-	if err := os.WriteFile(path+".1", []byte("interrupted\n"), 0o600); err != nil {
+	if err := os.WriteFile(stagingName(path), []byte("interrupted\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	write(t, f, strings.Repeat("n", 50))
-	mustRotate(t, New(f, 10, 3))
+	mustRotate(t, New(f, anywhere(10, 3)))
 
 	if got := gunzip(t, backupName(path, 2)); got != "interrupted\n" {
 		t.Fatalf(".2.gz = %q, want the interrupted generation", got)
@@ -203,7 +209,7 @@ func TestCheckFinishesInterruptedRotation(t *testing.T) {
 	if got := gunzip(t, backupName(path, 1)); got != strings.Repeat("n", 50) {
 		t.Fatalf(".1.gz = %q, want the current log", got)
 	}
-	if exists(path + ".1") {
+	if exists(stagingName(path)) {
 		t.Fatal("staging copy left behind")
 	}
 }
@@ -220,7 +226,7 @@ func TestCheckNonAppendWriterRewinds(t *testing.T) {
 	defer f.Close()
 	write(t, f, strings.Repeat("w", 50))
 
-	mustRotate(t, New(f, 10, 1))
+	mustRotate(t, New(f, anywhere(10, 1)))
 	write(t, f, "next\n")
 	if got := readFile(t, path); got != "next\n" {
 		t.Fatalf("log = %q (%d bytes), want %q — offset not rewound", got, len(got), "next\n")
@@ -239,7 +245,7 @@ func TestCheckTruncatesWithoutBackupWhenPathIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rotated, err := New(f, 10, 3).Check()
+	rotated, err := New(f, anywhere(10, 3)).Check()
 	if !rotated {
 		t.Fatalf("Check did not truncate an unlinked over-limit log (err %v)", err)
 	}
@@ -270,8 +276,8 @@ func TestCheckFollowsRenamedLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mustRotate(t, New(f, 10, 1))
-	if !exists(moved + ".1.gz") {
+	mustRotate(t, New(f, anywhere(10, 1)))
+	if !exists(backupName(moved, 1)) {
 		t.Fatal("backup not written next to the renamed log")
 	}
 }
@@ -286,7 +292,7 @@ func TestWatchNoopForNonRegularFiles(t *testing.T) {
 	}
 	defer pr.Close()
 	defer pw.Close()
-	if Watch(ctx, pw, 1, 3, time.Minute) {
+	if Watch(ctx, pw, anywhere(1, 3), time.Minute) {
 		t.Fatal("Watch started on a pipe (journald/systemd case)")
 	}
 
@@ -295,7 +301,7 @@ func TestWatchNoopForNonRegularFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer devnull.Close()
-	if Watch(ctx, devnull, 1, 3, time.Minute) {
+	if Watch(ctx, devnull, anywhere(1, 3), time.Minute) {
 		t.Fatal("Watch started on a character device (terminal case)")
 	}
 }
@@ -303,7 +309,7 @@ func TestWatchNoopForNonRegularFiles(t *testing.T) {
 func TestWatchDisabledByZeroLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "daemon.log")
 	f := openLog(t, path)
-	if Watch(context.Background(), f, 0, 3, time.Minute) {
+	if Watch(context.Background(), f, anywhere(0, 3), time.Minute) {
 		t.Fatal("Watch started with maxBytes=0 (disabled)")
 	}
 }
@@ -316,18 +322,18 @@ func TestWatchRotatesInBackground(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if !Watch(ctx, f, 20, 1, 10*time.Millisecond) {
+	if !Watch(ctx, f, anywhere(20, 1), 10*time.Millisecond) {
 		t.Fatal("Watch did not start on a regular file")
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for !exists(path + ".1.gz") {
+	for !exists(backupName(path, 1)) {
 		if time.Now().After(deadline) {
 			t.Fatal("background watcher never rotated the log")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
-	if got := gunzip(t, path+".1.gz"); got != content {
+	if got := gunzip(t, backupName(path, 1)); got != content {
 		t.Fatalf("backup = %d bytes, want %d", len(got), len(content))
 	}
 }
