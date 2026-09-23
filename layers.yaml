@@ -111,6 +111,7 @@ utilities:
     - github.com/pilot-protocol/pilotprotocol/internal/validate
     - github.com/pilot-protocol/pilotprotocol/internal/nodesapi
     - github.com/pilot-protocol/pilotprotocol/internal/motd
+    - github.com/pilot-protocol/pilotprotocol/internal/logcap
     - github.com/pilot-protocol/pilotprotocol/pkg/secure
     - github.com/pilot-protocol/pilotprotocol/pkg/config
     - github.com/pilot-protocol/pilotprotocol/pkg/logging

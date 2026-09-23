@@ -23,6 +23,7 @@ import (
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/logging"
 	"github.com/pilot-protocol/pilotprotocol/internal/enterprisecontrol"
+	"github.com/pilot-protocol/pilotprotocol/internal/logcap"
 	"github.com/pilot-protocol/pilotprotocol/internal/managedsdk/authority"
 	"github.com/pilot-protocol/pilotprotocol/internal/motd"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
@@ -114,6 +115,8 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
+	logMaxSize := flag.Int("log-max-size", 50, "rotate the daemon log once it exceeds this many MB, when stderr is a regular file (e.g. launchd's daemon.log); copy-truncate with gzipped backups. 0 disables")
+	logMaxBackups := flag.Int("log-max-backups", 3, "gzipped generations kept by -log-max-size rotation (<log>.1.gz ... <log>.N.gz); 0 keeps none")
 	sandbox := flag.Bool("sandbox", false, "restrict all file I/O to the sandbox directory (see -sandbox-dir)")
 	sandboxDir := flag.String("sandbox-dir", "", "confinement root when -sandbox is set (default: ~/.pilot)")
 	motdFeedURL := flag.String("motd-feed-url", motd.DefaultFeedURL, "message-of-the-day feed URL (empty to disable); overridden by $PILOT_MOTD_URL")
@@ -220,6 +223,11 @@ func main() {
 	*motdFeedURL = profileOptions.MOTDFeedURL
 
 	logging.Setup(*logLevel, *logFormat)
+	// launchd never rotates StandardOutPath/StandardErrorPath (daemon.log
+	// reached 22 MB on one laptop), so cap it from the inside. No-op when
+	// stderr isn't a regular file (journald, a terminal, a pipe). Lives for
+	// the daemon's lifetime; process exit stops it.
+	logcap.Watch(context.Background(), os.Stderr, int64(*logMaxSize)<<20, *logMaxBackups, time.Minute)
 
 	// Sandbox: validate all configured file paths are under the confinement
 	// root before the daemon touches the filesystem. Network paths are unaffected.

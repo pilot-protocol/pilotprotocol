@@ -10,6 +10,16 @@ Detailed per-release notes are on the
 ## [Unreleased]
 
 ### Added
+- **The daemon caps its own log file.** launchd never rotates the daemon's
+  `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
+  without bound — 22 MB on one laptop. When stderr is a regular file the
+  daemon now checks it every minute and, past `-log-max-size` MB (default 50;
+  `0` disables), copy-truncates it into gzipped generations
+  `daemon.log.1.gz` … `daemon.log.N.gz` (`-log-max-backups`, default 3).
+  Truncation is safe for every writer — the file is opened append-only and
+  shared by child processes. Both flags can also be set in
+  `~/.pilot/config.json` (`log_max_size`, `log_max_backups`). No-op under
+  systemd/journald or on a terminal.
 - **Opt out of automatic app-store updates with `PILOT_APP_UPDATE_OPT_OUT`.** The
   `pilot-updater` keeps installed apps current by periodically running
   `pilotctl appstore upgrade --all`. Set `PILOT_APP_UPDATE_OPT_OUT=true` in the
