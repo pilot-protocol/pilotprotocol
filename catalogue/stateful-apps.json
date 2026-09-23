@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Release freeze for apps that keep state in their install dir ($APP).",
+    "Until the fleet runs a pilotctl with the app-state fix (install/upgrade carry $APP state forward),",
+    "the hourly `pilotctl appstore upgrade --all` on older nodes DELETES an app's saved state when the",
+    "catalogue publishes an update for it (the wallet's EVM key and data.db, smol's secrets.json,",
+    "per-app identity.json). catalogue/lint (the catalogue-lint CI job) therefore fails any PR that",
+    "updates an app listed here, or any app whose bundle manifest grants fs.write or key.sign.",
+    "To ship one anyway, add {id, version, reason, approved_by} to approved_bumps (reviewed in the PR),",
+    "or apply the PR label catalogue:stateful-bump-approved. See catalogue/README.md."
+  ],
+  "stateful_apps": [
+    "io.pilot.wallet",
+    "io.pilot.smol",
+    "io.pilot.agentphone",
+    "io.pilot.bowmark",
+    "io.pilot.orthogonal"
+  ],
+  "approved_bumps": []
+}

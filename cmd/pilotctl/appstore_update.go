@@ -237,7 +237,10 @@ func cmdAppStoreUpgrade(args []string) {
 	for _, o := range targets {
 		fmt.Printf("==> upgrading %s %s → %s\n", o.ID, o.Installed, o.Available)
 		// --force: install over the existing app dir; the supervisor applies the
-		// version bump (and refuses a downgrade) on its next rescan.
+		// version bump (and refuses a downgrade) on its next rescan. The app's
+		// state (keys, data.db, secrets, cap-state, audit log) is carried into
+		// the new install and the replaced dir is kept as a backup — see
+		// appstore_state.go. This is the path the hourly updater drives.
 		cmdAppStoreInstall([]string{o.ID, "--force"})
 	}
 	fmt.Printf("\nupgraded %s\n", strings.TrimSpace(pluralApps(len(targets))))

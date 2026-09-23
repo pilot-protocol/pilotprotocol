@@ -29,6 +29,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,13 +119,18 @@ Usage:
   pilotctl appstore uninstall <id> --yes     remove an installed app from the install root
   pilotctl appstore verify <bundle-dir>      sha256-check a pre-install bundle against its manifest
   pilotctl appstore catalogue                list apps available for one-command install
-  pilotctl appstore install <app-id> [--force]
-                                             install by catalogue ID (fetches + verifies + extracts)
-  pilotctl appstore install <bundle-dir> --local [--force]
+  pilotctl appstore install <app-id> [--force [--reset-state]]
+                                             install by catalogue ID (fetches + verifies + extracts).
+                                             already installed: a no-op that points at upgrade.
+                                             --force reinstalls in place and KEEPS the app's state
+                                             (keys, data.db, secrets, cap-state, audit log);
+                                             --reset-state (implies --force) starts it empty
+  pilotctl appstore install <bundle-dir> --local [--force [--reset-state]]
                                              sideload a local bundle (sandbox: fs.read/fs.write
                                              under $APP, audit.log; no net, no key.sign, no hooks)
   pilotctl appstore outdated                 list installed apps with a newer version in the catalogue
-  pilotctl appstore upgrade <id> | --all     re-install the catalogue's current version (verified; supervisor restarts)
+  pilotctl appstore upgrade <id> | --all     re-install the catalogue's current version (verified; app
+                                             state is kept; supervisor restarts)
   pilotctl appstore gen-key <key-file>       generate a fresh ed25519 publisher keypair; prints the public side
   pilotctl appstore sign --key <key-file> <manifest>
                                              sign (or re-sign) a manifest's store.signature so the supervisor accepts it
@@ -140,6 +146,9 @@ Usage:
                                               default 120s — raise for slow methods)
 
 Install root is taken from $PILOT_APPSTORE_ROOT or ~/.pilot/apps.
+Every install that replaces an app keeps the replaced dir as a backup under
+$PILOT_APPSTORE_BACKUP_ROOT or app-backups/<id>/ beside the install root
+(~/.pilot/app-backups); the newest 3 per app are kept.
 `
 
 func appStoreHelp() {
@@ -860,6 +869,13 @@ func cmdAppStoreUninstall(args []string) {
 	fmt.Printf("removed %s\n", dir)
 	fmt.Println("note: the daemon's supervisor will cancel its per-app goroutine on its next rescan")
 	fmt.Println("      (≤30s); no daemon restart needed")
+	// Replaced installs are kept as backups (appstore_state.go) and may hold
+	// the app's keys; uninstall leaves them, so say where they are.
+	if backups, err := resolveUnder(appStoreBackupRoot(), appID); err == nil {
+		if entries, err := os.ReadDir(backups); err == nil && len(entries) > 0 {
+			fmt.Printf("note: %d backup(s) of earlier installs (which may hold the app's keys and data) remain in %s\n", len(entries), backups)
+		}
+	}
 }
 
 // ── verify ─────────────────────────────────────────────────────────────
@@ -991,6 +1007,19 @@ type installReport struct {
 	InstalledTo     string `json:"installed_to"`
 	BinarySHA256    string `json:"binary_sha256"`
 	DaemonNotice    string `json:"daemon_notice"`
+
+	// AlreadyInstalled marks the no-op answer to `install` of an app that is
+	// already installed without --force; Hint says what to run instead.
+	AlreadyInstalled bool   `json:"already_installed,omitempty"`
+	Hint             string `json:"hint,omitempty"`
+	// PreservedState lists the app-state paths (relative to the app dir)
+	// carried from the replaced install into the new one.
+	PreservedState []string `json:"preserved_state,omitempty"`
+	// StateReset is true when --reset-state deliberately started the app
+	// without its previous state.
+	StateReset bool `json:"state_reset,omitempty"`
+	// BackupDir is where the replaced install was kept.
+	BackupDir string `json:"backup_dir,omitempty"`
 }
 
 // cmdAppStoreInstall places a verified bundle into the install root.
@@ -999,10 +1028,14 @@ type installReport struct {
 // root never sees a partially-written app dir.
 //
 // Steps:
-//  1. sha256-check the bundle (same logic as `verify`)
-//  2. reject if app already installed unless --force
-//  3. stage into <install_root>/<id>.staging/
-//  4. atomic rename .staging → <id>
+//  1. sha256-check the bundle (same logic as `verify`) and refuse a binary
+//     built for another platform
+//  2. if the app is already installed: without --force, a no-op that points
+//     at `upgrade`; with --force, replace it (state kept, see below)
+//  3. stage into <install_root>/<id>.staging/, carrying the installed app's
+//     state (appstore_state.go) unless --reset-state
+//  4. swap .staging → <id>, keeping the old dir at <id>.previous until the
+//     new one verifies, then retire it to the backups
 //
 // The daemon's supervisor only scans on Start, so an install while the
 // daemon is running is invisible until the next daemon restart — the
@@ -1037,16 +1070,22 @@ func resolveUnder(base, rel string) (string, error) {
 func cmdAppStoreInstall(args []string) {
 	if len(args) < 1 {
 		fatalHint("invalid_argument",
-			"usage: pilotctl appstore install <app-id-or-dir> [--force] [--local] [--version <v>]",
+			"usage: pilotctl appstore install <app-id-or-dir> [--force [--reset-state]] [--local] [--version <v>]",
 			"missing app id or bundle dir")
 	}
 	target := args[0]
 	force := false
+	resetState := false
 	wantVersion := ""
 	allowLocal := false
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--force", "-f":
+			force = true
+		case "--reset-state":
+			// The explicit destructive variant: reinstall WITHOUT carrying the
+			// app's state forward. Implies --force; warns loudly below.
+			resetState = true
 			force = true
 		case "--version":
 			// Read the value before advancing so the bound is checked against
@@ -1066,8 +1105,23 @@ func cmdAppStoreInstall(args []string) {
 			allowLocal = true
 		default:
 			fatalHint("invalid_argument",
-				"available flags: --force, --local, --version",
+				"available flags: --force, --reset-state, --local, --version",
 				"unknown install flag: %s", args[i])
+		}
+	}
+
+	// Already installed and no --force: answer before downloading anything.
+	// (A local bundle path is only known to be installed once its manifest
+	// is read, so that case is answered after validation below.)
+	if !force && !allowLocal && target != "" && !strings.HasPrefix(target, ".") && !strings.ContainsAny(target, `/\`) {
+		if dir, err := resolveUnder(appStoreRoot(), target); err == nil {
+			if notes, rerr := recoverInterruptedInstall(dir, target); rerr == nil {
+				printInstallNotes(notes)
+			}
+			if im, _, err := readInstalledManifest(dir); err == nil && im.ID == target {
+				reportAlreadyInstalled(dir, im, target, false)
+				return
+			}
 		}
 	}
 
@@ -1156,27 +1210,53 @@ func cmdAppStoreInstall(args []string) {
 			"run `pilotctl appstore verify` for a side-by-side; this bundle is tampered or built from a different source than the manifest claims",
 			"binary sha256 mismatch: manifest=%s actual=%s", m.Binary.SHA256, got)
 	}
-	if err := validateHostExecutable(srcBin); err != nil {
-		fatalHint("platform_mismatch",
-			"this catalogue bundle is not executable on the current host; use a release that publishes a matching per-platform bundle",
-			"refusing incompatible app binary: %v", err)
+	if err := checkAppBinaryPlatform(srcBin); err != nil {
+		hint := fmt.Sprintf("nothing was installed and any existing install of %s is untouched. The bundle ships a binary for another platform; the publisher needs to publish a per-platform `bundles` entry for %s/%s (see catalogue/README.md)",
+			m.ID, runtime.GOOS, runtime.GOARCH)
+		if source == installSourceLocal {
+			hint = fmt.Sprintf("nothing was installed and any existing install of %s is untouched. Rebuild the bundle's binary for %s/%s",
+				m.ID, runtime.GOOS, runtime.GOARCH)
+		}
+		fatalHint("platform_mismatch", hint,
+			"refusing to install %s v%s: %s is built for a different platform than this host (%s/%s): %v",
+			m.ID, m.AppVersion, m.Binary.Path, runtime.GOOS, runtime.GOARCH, err)
 	}
 
 	root := appStoreRoot()
 	finalDir := filepath.Join(root, m.ID)
-	stagingDir := finalDir + ".staging"
+	stagingDir := finalDir + appStagingSuffix
 
-	// 2. Reject existing install unless --force.
-	if _, err := os.Stat(finalDir); err == nil {
-		if !force {
-			fatalHint("conflict",
-				"app already installed; uninstall first or pass --force to overwrite",
-				"refusing to overwrite %s without --force", finalDir)
+	// 2. Already installed? First repair anything a crashed install left
+	//    behind (this can only restore or back up, never delete), then:
+	//    without --force this is a no-op pointing at `upgrade`; with --force
+	//    the existing install is replaced and its state carried over.
+	notes, err := recoverInterruptedInstall(finalDir, m.ID)
+	if err != nil {
+		fatalHint("io_error",
+			"a previous install of this app was interrupted and could not be repaired automatically; inspect the install root",
+			"%v", err)
+	}
+	printInstallNotes(notes)
+	replacing := false
+	var oldManifest *manifest.Manifest
+	if _, err := os.Lstat(finalDir); err == nil {
+		replacing = true
+		if im, _, merr := readInstalledManifest(finalDir); merr == nil {
+			oldManifest = im
+			if !force {
+				reportAlreadyInstalled(finalDir, im, target, source == installSourceLocal)
+				return
+			}
+		} else {
+			// A dir without a readable manifest is a broken install (e.g. an
+			// interrupted uninstall). Replace it, keeping whatever state it has.
+			fmt.Fprintf(os.Stderr, "note: %s has no readable manifest (%v); repairing it with this bundle and keeping its app state\n", finalDir, merr)
 		}
 	}
 
-	// 3. Stage atomically. We may have a leftover staging dir from a
-	//    previous crashed install — blow it away unconditionally.
+	// 3. Stage atomically. A leftover staging dir from a crashed install
+	//    holds only a bundle copy plus links to state whose originals are in
+	//    finalDir (recoverInterruptedInstall ran above), so it is safe to drop.
 	if err := os.RemoveAll(stagingDir); err != nil {
 		fatalHint("io_error", "check install root permissions",
 			"clean stale staging dir %s: %v", stagingDir, err)
@@ -1185,11 +1265,10 @@ func cmdAppStoreInstall(args []string) {
 		fatalHint("io_error", "check install root permissions",
 			"mkdir staging %s: %v", stagingDir, err)
 	}
-	// Write manifest.json (0644 — readable by everyone in the user's group; not secret).
-	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), raw, 0o644); err != nil {
-		_ = os.RemoveAll(stagingDir)
-		fatalHint("io_error", "check install root permissions", "write manifest: %v", err)
-	}
+	// manifest.json is written LAST (after the binary and the carried
+	// state): the supervisor adopts any dir under the install root that
+	// holds a manifest, so staging must not carry one while still filling.
+	//
 	// Place the binary at the manifest-declared path inside staging.
 	// Re-apply the containment guard against the staging root: defence
 	// in depth so the write target can't escape even if bundleDir and
@@ -1264,35 +1343,56 @@ func cmdAppStoreInstall(args []string) {
 		}
 	}
 
-	// 4. Atomic swap. Rename of directories is atomic on Linux/macOS
-	//    as long as the destination does not already exist; with
-	//    --force we have to step aside the previous install first.
-	if force {
-		previousDir := finalDir + ".previous"
-		_ = os.RemoveAll(previousDir)
-		if _, err := os.Stat(finalDir); err == nil {
-			if err := os.Rename(finalDir, previousDir); err != nil {
-				_ = os.RemoveAll(stagingDir)
-				fatalHint("io_error", "the previous install could not be moved aside",
-					"rename %s → %s: %v", finalDir, previousDir, err)
-			}
+	// Carry the installed app's state (keys, databases, secrets, spend-cap
+	// ledger, audit log — everything the new bundle does not ship) into
+	// staging, and check it landed, BEFORE the live dir is touched. Any
+	// failure here aborts with the existing install exactly as it was.
+	var carried []string
+	if replacing && !resetState {
+		oldBinary := ""
+		if oldManifest != nil {
+			oldBinary = oldManifest.Binary.Path
 		}
-		if err := os.Rename(stagingDir, finalDir); err != nil {
-			// Best-effort restore so we don't leave the user with no app at all.
-			if err2 := os.Rename(previousDir, finalDir); err2 != nil {
-				fatalHint("io_error", "rollback also failed — inspect the install root manually",
-					"rename staged → final: %v; rollback also failed: %v", err, err2)
-			}
-			_ = os.RemoveAll(stagingDir)
-			fatalHint("io_error", "the swap failed but the previous install was restored",
-				"rename staged → final: %v", err)
+		carried, err = carryAppState(finalDir, stagingDir, oldBinary)
+		if err == nil {
+			err = verifyCarriedState(stagingDir, carried, false)
 		}
-		_ = os.RemoveAll(previousDir)
-	} else {
-		if err := os.Rename(stagingDir, finalDir); err != nil {
-			_ = os.RemoveAll(stagingDir)
-			fatalHint("io_error", "check install root permissions",
-				"rename staged → final: %v", err)
+		if err != nil {
+			_ = os.RemoveAll(stagingDir) // #nosec G703 -- confined install-root staging dir; holds only links/copies
+			fatalHint("io_error",
+				"nothing was changed: the existing install and its state are untouched. Fix the error and re-run; --reset-state installs without the old state (it is still kept as a backup)",
+				"carry app state from %s: %v", finalDir, err)
+		}
+	}
+	if replacing && resetState {
+		fmt.Fprintf(os.Stderr, "WARNING: --reset-state: %s is being reinstalled WITHOUT its saved state.\n", m.ID)
+		fmt.Fprintln(os.Stderr, "WARNING: keys (identity*.json), databases (data.db*), secrets, the spend-cap ledger and the")
+		fmt.Fprintln(os.Stderr, "WARNING: audit log of the current install will NOT be in the new install; the app starts empty.")
+		fmt.Fprintf(os.Stderr, "WARNING: the current install is kept as a backup under %s\n", filepath.Join(appStoreBackupRoot(), m.ID))
+	}
+
+	// Write manifest.json (0644 — readable by everyone in the user's group; not secret).
+	if err := os.WriteFile(filepath.Join(stagingDir, "manifest.json"), raw, 0o644); err != nil {
+		_ = os.RemoveAll(stagingDir) // #nosec G703 -- confined install-root staging dir
+		fatalHint("io_error", "check install root permissions", "write manifest: %v", err)
+	}
+
+	// 4. Swap. The live dir is renamed to <id>.previous and kept there
+	//    until the new dir verifies (exact manifest, pinned binary sha,
+	//    carried state); on any failure the previous install is restored.
+	previousDir, err := swapInAppDir(finalDir, stagingDir, func(dir string) error {
+		return verifyInstalledApp(dir, raw, m, carried)
+	})
+	if err != nil {
+		fatalHint("io_error", "check install root permissions and re-run; see the error for the state of the previous install", "%v", err)
+	}
+	// Retire the replaced install out of the install root, where the
+	// supervisor would otherwise adopt it. Kept as a backup, never deleted.
+	backupDir := ""
+	if previousDir != "" {
+		backupDir, err = retireAppDir(previousDir, m.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: %v\n", err)
 		}
 	}
 
@@ -1327,6 +1427,16 @@ func cmdAppStoreInstall(args []string) {
 	reason := fmt.Sprintf("actor=%s source=%s", currentActor(), bundleDir)
 	if force {
 		reason += " --force"
+	}
+	if replacing {
+		if resetState {
+			reason += " --reset-state"
+		} else {
+			reason += fmt.Sprintf(" state_kept=%d", len(carried))
+		}
+		if backupDir != "" {
+			reason += " backup=" + backupDir
+		}
 	}
 	writePilotctlAudit(root, pilotctlAuditEvent{
 		Event:  "installed",
@@ -1375,6 +1485,9 @@ func cmdAppStoreInstall(args []string) {
 		InstalledTo:     finalDir,
 		BinarySHA256:    m.Binary.SHA256,
 		DaemonNotice:    "supervisor periodically rescans the install root; this app will be picked up within ~30s (no daemon restart needed)",
+		PreservedState:  carried,
+		StateReset:      replacing && resetState,
+		BackupDir:       backupDir,
 	}
 	if jsonOutput {
 		_ = json.NewEncoder(os.Stdout).Encode(report)
@@ -1382,6 +1495,17 @@ func cmdAppStoreInstall(args []string) {
 	}
 	fmt.Printf("installed %s v%s (manifest v%d) → %s\n",
 		report.AppID, report.AppVersion, report.ManifestVersion, report.InstalledTo)
+	switch {
+	case replacing && resetState:
+		fmt.Println("state: RESET — the app starts without its previous state (--reset-state)")
+	case replacing && len(carried) > 0:
+		fmt.Printf("state: kept %d file(s) from the previous install (%s)\n", len(carried), summarizePaths(carried, 6))
+	case replacing:
+		fmt.Println("state: the previous install had no app state to keep")
+	}
+	if backupDir != "" {
+		fmt.Printf("backup: the replaced install is kept at %s\n", backupDir)
+	}
 	if source == installSourceLocal {
 		fmt.Println("mode: SIDELOADED — manifest-level allow-list applied (audit.log, fs.read/$APP, fs.write/$APP).")
 		fmt.Println("      this is NOT an OS sandbox: a malicious binary that ignores its manifest can still")
