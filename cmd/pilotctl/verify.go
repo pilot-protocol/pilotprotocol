@@ -11,7 +11,6 @@ import (
 	"github.com/pilot-protocol/common/badgeverify"
 	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/protocol"
-	registry "github.com/pilot-protocol/common/registry/client"
 )
 
 // loadJSONFile reads a small JSON credential file into v, exiting on error.
@@ -298,13 +297,7 @@ func cmdRecoveryRecover(args []string) {
 	newPub := crypto.EncodePublicKey(id.PublicKey)
 
 	addr := flagString(flags, "registry", getRegistry())
-	// TODO(netproxy): raw-TCP registry dial; bypasses HTTPS_PROXY until
-	// common/netproxy lands in pilotctl (see connectRegistry).
-	rc, err := registry.Dial(addr)
-	if err != nil {
-		fatalHint("connection_failed", registryDialHint(addr),
-			"recovery recover: cannot reach registry at %s: %v", addr, err)
-	}
+	rc := connectRegistryAt(addr, "recovery recover")
 	defer rc.Close()
 
 	resp, err := rc.RecoverIdentity(nodeID, recovery, recoverySig, newPub)

@@ -69,8 +69,6 @@ func TestResolveDaemonTransportPrecedence(t *testing.T) {
 
 func TestResolveDaemonProxyPrecedenceAndValidation(t *testing.T) {
 	withTransportEnvCleared(t)
-	// $PILOT_PROXY is the daemon's to resolve, never pilotctl's.
-	t.Setenv("PILOT_PROXY", "off")
 	if got, err := resolveDaemonProxy(map[string]string{}, map[string]interface{}{}); err != nil || got != "" {
 		t.Fatalf("unset: got %q, %v", got, err)
 	}
@@ -78,15 +76,25 @@ func TestResolveDaemonProxyPrecedenceAndValidation(t *testing.T) {
 	if got, _ := resolveDaemonProxy(map[string]string{}, cfg); got != "auto" {
 		t.Errorf("config: got %q", got)
 	}
-	if got, _ := resolveDaemonProxy(map[string]string{"proxy": "http://p.example:3128"}, cfg); got != "http://p.example:3128" {
-		t.Errorf("flag should beat config: got %q", got)
+	// $PILOT_PROXY beats config.json, as it does in pilot-daemon: an
+	// explicitly passed value always beats a persistent default.
+	t.Setenv("PILOT_PROXY", "http://u:s3cret@env.example:3128")
+	if got, _ := resolveDaemonProxy(map[string]string{}, cfg); got != "http://u:s3cret@env.example:3128" {
+		t.Errorf("env should beat config: got %q", got)
 	}
-	for _, ok := range []string{"auto", "off", "http://p:3128", "https://u:pw@p.example:443", "http://u@p"} {
+	if got, _ := resolveDaemonProxy(map[string]string{"proxy": "http://p.example:3128"}, cfg); got != "http://p.example:3128" {
+		t.Errorf("flag should beat env and config: got %q", got)
+	}
+	t.Setenv("PILOT_PROXY", "")
+	if got, _ := resolveDaemonProxy(map[string]string{"proxy": "None"}, cfg); got != "off" {
+		t.Errorf("none should normalize to off: got %q", got)
+	}
+	for _, ok := range []string{"auto", "AUTO", "off", "none", "direct", "http://p:3128", "https://u:pw@p.example:443", "http://u@p"} {
 		if err := validateProxySetting(ok); err != nil {
 			t.Errorf("validateProxySetting(%q) = %v, want nil", ok, err)
 		}
 	}
-	for _, bad := range []string{"true", "socks5://p:1080", "p.example:3128", "http://", "u:pw@p:3128", "AUTO"} {
+	for _, bad := range []string{"true", "proxy", "socks5://p:1080", "p.example:3128", "http://", "u:pw@p:3128"} {
 		err := validateProxySetting(bad)
 		if err == nil {
 			t.Errorf("validateProxySetting(%q) = nil, want error", bad)
@@ -101,14 +109,15 @@ func TestResolveDaemonProxyPrecedenceAndValidation(t *testing.T) {
 func TestRedactProxyURL(t *testing.T) {
 	t.Parallel()
 	cases := map[string]string{
-		"auto":                            "auto",
-		"off":                             "off",
-		"http://proxy:3128":               "http://proxy:3128",
-		"http://user:s3cret@proxy:3128":   "http://***@proxy:3128",
-		"https://user@proxy.example:8443": "https://***@proxy.example:8443",
-		"http://u:p%40ss@proxy:3128/":     "http://***@proxy:3128/",
-		"user:s3cret@proxy:3128":          "***@proxy:3128",
-		"http://us er:s3cret@proxy:3128":  "http://***@proxy:3128",
+		"auto":                                 "auto",
+		"off":                                  "off",
+		"http://proxy:3128":                    "http://proxy:3128",
+		"http://user:s3cret@proxy:3128":        "http://***@proxy:3128",
+		"https://user@proxy.example:8443":      "https://***@proxy.example:8443",
+		"http://u:p%40ss@proxy:3128/":          "http://***@proxy:3128",
+		"user:s3cret@proxy:3128":               "***@proxy:3128",
+		"http://us er:s3cret@proxy:3128":       "http://***@proxy:3128",
+		"http://agent:1234#s3cret@egress:3128": "http://***@egress:3128",
 	}
 	for in, want := range cases {
 		got := redactProxyURL(in)
@@ -117,6 +126,25 @@ func TestRedactProxyURL(t *testing.T) {
 		}
 		if strings.Contains(got, "s3cret") {
 			t.Errorf("redactProxyURL(%q) leaked the password: %q", in, got)
+		}
+	}
+}
+
+// A password with an unescaped '#', '/' or '?' makes url.Parse see no
+// userinfo; it must still count as credentials and stay off argv.
+func TestProxyCredentialsWithReservedCharactersStayOffArgv(t *testing.T) {
+	withTransportEnvCleared(t)
+	for _, proxy := range []string{
+		"http://agent:1234#Xyz9@egress:3128",
+		"http://agent:12/34@egress:3128",
+		"http://agent:12?34@egress:3128",
+	} {
+		plan := planDaemonLaunch([]string{"--proxy", proxy})
+		if argsHasKey(plan.Args, "--proxy") || strings.Contains(strings.Join(plan.Args, " "), "agent") {
+			t.Errorf("%s: credentials on argv: %v", proxy, plan.Args)
+		}
+		if plan.ProxyEnv != proxy {
+			t.Errorf("%s: ProxyEnv = %q", proxy, plan.ProxyEnv)
 		}
 	}
 }
@@ -146,8 +174,9 @@ func TestBuildDaemonArgsUDPUnchanged(t *testing.T) {
 
 // TestBuildDaemonArgsCompatFromConfig is the Meta Muse shape: config.json from
 // `pilotctl init` carries the raw-TCP registry default plus transport=compat
-// and proxy=auto (install.sh --transport compat). The registry/beacon defaults
-// must stay off argv so the daemon's compat 443/TLS defaults apply.
+// (install.sh --transport compat) and, hand-set, proxy=auto. The
+// registry/beacon defaults must stay off argv so even an older daemon's
+// compat 443/TLS defaults apply.
 func TestBuildDaemonArgsCompatFromConfig(t *testing.T) {
 	withTransportEnvCleared(t)
 	if err := saveConfig(map[string]interface{}{
@@ -332,8 +361,12 @@ func writeFakeDaemon(t *testing.T, flags []string, out string) string {
 	var help strings.Builder
 	var known strings.Builder
 	for _, f := range flags {
-		help.WriteString("  -" + f + " string\n    \tdescription of " + f + "\n")
-		known.WriteString(" -" + f + " --" + f)
+		name, usage, ok := strings.Cut(f, "=")
+		if !ok {
+			usage = "description of " + name
+		}
+		help.WriteString("  -" + name + " string\n    \t" + usage + "\n")
+		known.WriteString(" -" + name + " --" + name)
 	}
 	script := `#!/bin/sh
 if [ "$1" = "-help" ]; then
@@ -381,44 +414,6 @@ func TestDaemonFlagsProbe(t *testing.T) {
 	}
 	if got := daemonFlags(filepath.Join(t.TempDir(), "missing")); got != nil {
 		t.Errorf("missing binary should probe as unknown (nil), got %v", got)
-	}
-}
-
-// TestDropUnsupportedDaemonFlags: an older daemon (no -proxy, or neither
-// -proxy nor -transport) gets those flags stripped instead of crashing on
-// them; a current daemon — or one that cannot be probed — keeps them.
-func TestDropUnsupportedDaemonFlags(t *testing.T) {
-	t.Parallel()
-	args := []string{"--listen", ":0", "--transport", "compat", "--proxy", "auto", "--socket", "/tmp/x.sock"}
-	dir := t.TempDir()
-
-	v1139 := writeFakeDaemon(t, append([]string{"transport"}, baseDaemonFlags...), filepath.Join(dir, "a"))
-	got := dropUnsupportedDaemonFlags(v1139, args)
-	if argsHasKey(got, "--proxy") || argsHasKey(got, "auto") {
-		t.Errorf("v1.13.9-style daemon must not get --proxy: %v", got)
-	}
-	if !argsHasPair(got, "--transport", "compat") || !argsHasPair(got, "--socket", "/tmp/x.sock") {
-		t.Errorf("supported flags must survive: %v", got)
-	}
-
-	ancient := writeFakeDaemon(t, baseDaemonFlags, filepath.Join(dir, "b"))
-	got = dropUnsupportedDaemonFlags(ancient, args)
-	if argsHasKey(got, "--proxy") || argsHasKey(got, "--transport") {
-		t.Errorf("pre-compat daemon must get neither flag: %v", got)
-	}
-	if !argsHasPair(got, "--listen", ":0") {
-		t.Errorf("unrelated flags must survive: %v", got)
-	}
-
-	current := writeFakeDaemon(t, append([]string{"transport", "proxy"}, baseDaemonFlags...), filepath.Join(dir, "c"))
-	got = dropUnsupportedDaemonFlags(current, args)
-	if strings.Join(got, " ") != strings.Join(args, " ") {
-		t.Errorf("current daemon must keep every flag: %v", got)
-	}
-
-	got = dropUnsupportedDaemonFlags(filepath.Join(dir, "missing"), args)
-	if strings.Join(got, " ") != strings.Join(args, " ") {
-		t.Errorf("unprobeable daemon must keep every flag: %v", got)
 	}
 }
 
@@ -584,12 +579,20 @@ func TestCLIConfigSetProxyRedactsAndValidates(t *testing.T) {
 
 func TestRegistryDialHintMentionsProxy(t *testing.T) {
 	withTransportEnvCleared(t)
-	if h := registryDialHint("r:9000"); !strings.Contains(h, "PILOT_REGISTRY") {
+	route, err := planRegistryRoute("r.example:9000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := registryDialHint(route); !strings.Contains(h, "PILOT_REGISTRY") {
 		t.Errorf("no-proxy hint = %q", h)
 	}
 	t.Setenv("HTTPS_PROXY", "http://agent:s3cret@egress:3128")
-	h := registryDialHint("r:9000")
-	if !strings.Contains(h, "does not use the proxy") || strings.Contains(h, "s3cret") {
+	route, err = planRegistryRoute("r.example:9000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := registryDialHint(route)
+	if !strings.Contains(h, "through the proxy http://***@egress:3128") || !strings.Contains(h, "proxy=off") || strings.Contains(h, "s3cret") {
 		t.Errorf("proxy hint = %q", h)
 	}
 }

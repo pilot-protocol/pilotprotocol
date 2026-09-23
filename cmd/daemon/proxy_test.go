@@ -39,45 +39,6 @@ var proxyEnvVars = []string{
 	"HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD",
 }
 
-func TestTransportDefault(t *testing.T) {
-	for _, tc := range []struct{ env, want string }{
-		{"", "udp"},
-		{"udp", "udp"},
-		{"compat", "compat"},
-		{" COMPAT ", "compat"},
-		{"wss", "udp"},
-	} {
-		t.Setenv("PILOT_TRANSPORT", tc.env)
-		if got := transportDefault(); got != tc.want {
-			t.Errorf("PILOT_TRANSPORT=%q: transportDefault() = %q, want %q", tc.env, got, tc.want)
-		}
-	}
-}
-
-// The compiled-in raw-TCP registry never counts as an explicit choice in
-// compat mode — pilotctl passes it on every `daemon start` — while any
-// other address the operator set by flag or environment is kept.
-func TestCompatKeepsRegistry(t *testing.T) {
-	for _, tc := range []struct {
-		addr          string
-		byFlag, byEnv bool
-		want          bool
-	}{
-		{defaultRegistryAddr, false, false, false},
-		{defaultRegistryAddr, true, false, false},
-		{defaultRegistryAddr, false, true, false},
-		{defaultRegistryAddr, true, true, false},
-		{" " + defaultRegistryAddr + " ", true, false, false},
-		{"10.0.0.5:9000", true, false, true},
-		{"registry.corp.example:443", false, true, true},
-		{"10.0.0.5:9000", false, false, false}, // config file / default only
-	} {
-		if got := compatKeepsRegistry(tc.addr, tc.byFlag, tc.byEnv); got != tc.want {
-			t.Errorf("compatKeepsRegistry(%q, flag=%v, env=%v) = %v, want %v", tc.addr, tc.byFlag, tc.byEnv, got, tc.want)
-		}
-	}
-}
-
 func TestResolveProxyPolicy(t *testing.T) {
 	for _, k := range proxyEnvVars {
 		t.Setenv(k, "")
@@ -139,6 +100,18 @@ type refusingProxy struct {
 	mu       sync.Mutex
 	targets  []string
 	badAuths int
+	allowed  map[string]bool // CONNECT targets answered 200 (then closed)
+}
+
+// allow makes the proxy accept CONNECT target (answer 200, then close the
+// tunnel): enough for a reachability check, useless for anything else.
+func (p *refusingProxy) allow(target string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.allowed == nil {
+		p.allowed = map[string]bool{}
+	}
+	p.allowed[target] = true
 }
 
 func newRefusingProxy(t *testing.T, user, pass string) *refusingProxy {
@@ -170,10 +143,16 @@ func newRefusingProxy(t *testing.T, user, pass string) *refusingProxy {
 				}
 				p.mu.Lock()
 				p.targets = append(p.targets, r.Method+" "+r.RequestURI)
-				if r.Header.Get("Proxy-Authorization") != p.wantAuth {
+				authOK := r.Header.Get("Proxy-Authorization") == p.wantAuth
+				if !authOK {
 					p.badAuths++
 				}
+				ok := authOK && r.Method == http.MethodConnect && p.allowed[r.RequestURI]
 				p.mu.Unlock()
+				if ok {
+					fmt.Fprint(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+					return
+				}
 				fmt.Fprint(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 			}()
 		}
@@ -263,38 +242,74 @@ func TestDaemonCompatThroughProxyEndToEnd(t *testing.T) {
 // plus the daemon's output.
 func runDaemonBehindProxy(t *testing.T, proxyEnv string, proxy *refusingProxy) ([]string, string) {
 	t.Helper()
+	return runDaemon(t, proxy, daemonRun{
+		env:   []string{"PILOT_TRANSPORT=compat", proxyEnv},
+		await: "CONNECT registry.pilotprotocol.network:443",
+	})
+}
+
+// daemonRun describes one child daemon: args replaces the default
+// pilotctl-style network flags (registry, beacon, pinned bogus registry
+// trust), env is added to a minimal environment, config (when set) is
+// written to $HOME/.pilot/config.json, and await is the proxy request the
+// run waits for.
+type daemonRun struct {
+	args   []string
+	env    []string
+	config string
+	await  string
+}
+
+// runDaemon starts main() in a child process and returns the proxy's
+// request targets once run.await arrived, plus the daemon's output. The
+// proxy refuses everything it is not told to allow, so nothing reaches the
+// network.
+func runDaemon(t *testing.T, proxy *refusingProxy, run daemonRun) ([]string, string) {
+	t.Helper()
 	home := t.TempDir()
 	sockDir, err := os.MkdirTemp("", "pdm")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(sockDir) })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0],
-		"--registry", defaultRegistryAddr,
-		"--beacon", defaultBeaconAddr,
+	if run.config != "" {
+		if err := os.MkdirAll(filepath.Join(home, ".pilot"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, ".pilot", "config.json"), []byte(run.config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := run.args
+	if args == nil {
+		args = []string{
+			"--registry", defaultRegistryAddr,
+			"--beacon", defaultBeaconAddr,
+			"-registry-trust=pinned",
+			"-registry-fingerprint=" + strings.Repeat("00", 32),
+		}
+	}
+	args = append(append([]string(nil), args...),
 		"--listen", ":0",
 		"--socket", filepath.Join(sockDir, "s"),
 		"--identity", filepath.Join(home, "identity.json"),
 		"--log-level", "info",
 		"--log-format", "text",
-		"-registry-trust=pinned",
-		"-registry-fingerprint="+strings.Repeat("00", 32),
 		"-no-skillinject",
 		"-motd-feed-url=",
 	)
-	cmd.Env = []string{
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], args...)
+	cmd.Env = append([]string{
 		runMainEnv + "=1",
 		"HOME=" + home,
 		"PATH=" + os.Getenv("PATH"),
 		"TMPDIR=" + os.TempDir(),
-		"PILOT_TRANSPORT=compat",
 		"PILOT_NO_SKILLINJECT=1",
 		"PILOT_APPSTORE_ROOT=" + filepath.Join(home, "apps"),
-		proxyEnv,
-	}
+	}, run.env...)
 	var out syncBuffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -306,15 +321,14 @@ func runDaemonBehindProxy(t *testing.T, proxyEnv string, proxy *refusingProxy) (
 		_ = cmd.Wait()
 	}()
 
-	const registryTarget = "CONNECT registry.pilotprotocol.network:443"
 	deadline := time.Now().Add(45 * time.Second)
 	for {
 		targets, _ := proxy.snapshot()
-		if contains(targets, registryTarget) {
+		if contains(targets, run.await) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("proxy never saw %q; saw %q\ndaemon output:\n%s", registryTarget, targets, out.String())
+			t.Fatalf("proxy never saw %q; saw %q\ndaemon output:\n%s", run.await, targets, out.String())
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

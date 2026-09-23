@@ -13,8 +13,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1153,11 +1151,12 @@ func (tm *TunnelManager) Listen(addr string) error {
 type ConnectCompatConfig struct {
 	BeaconURL string
 	TLSConfig *tls.Config
-	// Proxy is the http.Transport.Proxy function for the WSS dial (see
-	// wss.Config.Proxy). nil dials the beacon directly.
-	Proxy    func(*http.Request) (*url.URL, error)
-	Identity *crypto.Identity
-	NodeID   uint32
+	// DialContext opens the TCP connection for the WSS dial (see
+	// wss.Config.DialContext), e.g. through the proxy policy. nil dials
+	// the beacon directly.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	Identity    *crypto.Identity
+	NodeID      uint32
 }
 
 // ConnectCompat opens a compat-mode (WSS) tunnel to the beacon
@@ -1172,11 +1171,11 @@ type ConnectCompatConfig struct {
 // today for symmetric-NAT peers.
 func (tm *TunnelManager) ConnectCompat(ctx context.Context, cfg ConnectCompatConfig) error {
 	wssTr, err := wssTransport.Dial(ctx, wssTransport.Config{
-		URL:       cfg.BeaconURL,
-		TLSConfig: cfg.TLSConfig,
-		Proxy:     cfg.Proxy,
-		Identity:  cfg.Identity,
-		NodeID:    cfg.NodeID,
+		URL:         cfg.BeaconURL,
+		TLSConfig:   cfg.TLSConfig,
+		DialContext: cfg.DialContext,
+		Identity:    cfg.Identity,
+		NodeID:      cfg.NodeID,
 	})
 	if err != nil {
 		return fmt.Errorf("compat dial: %w", err)

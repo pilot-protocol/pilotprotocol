@@ -287,14 +287,19 @@ Set a hostname and email during install:
 curl -fsSL https://pilotprotocol.network/install.sh | PILOT_EMAIL=user@example.com PILOT_HOSTNAME=my-agent sh
 ```
 
-UDP blocked, or the only way out is an HTTPS proxy (hosted agent sandboxes, locked-down VMs)? Install in compat mode:
+**UDP blocked, or the only way out is an HTTPS proxy** (hosted agent sandboxes such as Meta Muse, locked-down VMs)? The plain install works:
 
 ```bash
-curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --transport compat
+curl -fsSL https://pilotprotocol.network/install.sh | sh
 pilotctl daemon start
 ```
 
-Compat mode keeps every connection on TCP 443 (registry over TLS, beacon over WSS). `--transport compat` writes `"transport": "compat"` and `"proxy": "auto"` to `~/.pilot/config.json`; with `proxy=auto` the daemon tunnels through `$HTTPS_PROXY` / `$ALL_PROXY` (honoring `$NO_PROXY`) when set, asking the proxy to `CONNECT` by hostname. No root, systemd or launchd needed: start the daemon with `pilotctl daemon start` from a shell that has the proxy variables. To switch an existing install: `pilotctl config --set transport=compat`, or one-off `pilotctl daemon start --transport compat --proxy <auto|off|URL>`.
+New installs use transport `auto`: the daemon probes the beacon over UDP once at startup (one round trip when UDP works, at most ~1.5s when it does not) and, when there is no answer but TCP 443 is reachable, runs in **compat** mode — registry over TLS on `registry.pilotprotocol.network:443`, beacon over WSS on `beacon.pilotprotocol.network:443`. In compat mode the daemon tunnels through `$HTTPS_PROXY` / `$ALL_PROXY` (honoring `$NO_PROXY`), asking the proxy to `CONNECT` by host name, so poisoned local DNS for the Pilot hosts does not matter. `pilotctl`'s own registry commands (`lookup`, the auto-handshake check, `recovery`) go through the same proxy. To skip the UDP probe, pick compat explicitly: `sh -s -- --transport compat`, `pilotctl config --set transport=compat`, or `pilotctl daemon start --transport compat`.
+
+- **No root, systemd or launchd needed.** Start the daemon with `pilotctl daemon start` from a shell that has the proxy variables. In a container or VM without systemd the installer also runs as root (the agent user in hosted sandboxes); on a regular host it still refuses root unless `PILOT_ALLOW_ROOT=1`.
+- **Proxy with credentials:** keep them out of `ps` — export `HTTPS_PROXY` / `PILOT_PROXY`, or `pilotctl daemon start --proxy http://user:pass@host:port` (pilotctl hands a URL with credentials to the daemon in its environment, never on its command line). For a systemd/launchd service, which does not see your shell's variables, save it: `pilotctl config --set proxy=http://user:pass@host:port` (config.json is 0600).
+- **Precedence** for transport and proxy: command-line flag, then `$PILOT_TRANSPORT` / `$PILOT_PROXY`, then `config.json` (`transport`, `proxy`), then the default (`auto` from pilotctl, `udp` for a bare `pilot-daemon`; proxy `auto`). `-proxy` accepts `auto`, `off` (also `none`, `direct`) or an `http://` / `https://` URL; anything else is an error. Loopback targets (local webhooks, sidecars) are never sent to a proxy.
+- **No CA bundle in the sandbox?** Point Go at one with `SSL_CERT_FILE=/path/to/ca-certificates.crt` (or `SSL_CERT_DIR`) — `pilotctl daemon start` forwards both. The registry can instead be pinned: `PILOT_REGISTRY_FINGERPRINT=<sha256 of its certificate>` (or `pilotctl config --set registry_fingerprint=...`), which selects `registry_trust=pinned`. The WSS beacon has no fingerprint option, so it needs the CA bundle.
 
 <details>
 <summary><strong>What the installer does</strong></summary>
@@ -479,15 +484,14 @@ Most daemon flags have an environment variable equivalent. Useful for containeri
 |----------|----------------|---------|
 | `PILOT_REGISTRY` | `-registry` | Registry server address |
 | `PILOT_BEACON` | `-beacon` | Beacon server address |
-| `PILOT_TRANSPORT` | `-transport` | Tunnel transport: `udp` (default) or `compat` (WSS on 443, for UDP-blocked hosts) |
-| `PILOT_PROXY` | `-proxy` | Outbound proxy for registry, beacon and HTTP traffic: `auto` (default; with `compat`, the `HTTPS_PROXY`/`ALL_PROXY` proxy, honoring `NO_PROXY`), `off`, or `http://[user:pass@]host:port` for every connection |
+| `PILOT_TRANSPORT` | `-transport` | Tunnel transport: `udp` (daemon default), `compat` (TLS registry + WSS beacon on TCP 443 only) or `auto` (udp when the beacon answers over UDP, else compat). Beats `config.json` |
+| `PILOT_PROXY` | `-proxy` | Outbound proxy: `auto` (default; with compat, the `HTTPS_PROXY`/`ALL_PROXY` proxy honoring `NO_PROXY`), `off` (also `none`, `direct`), or `http(s)://[user:pass@]host:port` for every connection except loopback. Beats `config.json` |
+| `PILOT_REGISTRY_TRUST` / `PILOT_REGISTRY_FINGERPRINT` | `-registry-trust` / `-registry-fingerprint` | Pin the TLS registry (hosts without a CA bundle); a fingerprint alone selects pinned trust in compat mode. Beat `config.json` |
+| `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | — | Proxy used with `-proxy=auto` in compat mode and by `pilotctl`'s own registry dials; `pilotctl daemon start` forwards them (and `SSL_CERT_FILE` / `SSL_CERT_DIR`) to the daemon |
 | `PILOT_SOCKET` | `-socket` | Unix socket path |
 | `PILOT_EMAIL` | `-email` | Account email |
 | `PILOT_HOSTNAME` | `-hostname` | Discovery hostname |
 | `PILOT_ADMIN_TOKEN` | `-admin-token` | Admin token for network operations |
-| `PILOT_TRANSPORT` | `-transport` | `udp` (default) or `compat` (TCP 443 only). `pilotctl daemon start` turns it into an explicit `-transport` |
-| `PILOT_PROXY` | `-proxy` | `auto` (default: proxy from the environment in compat mode), `off`, or `http(s)://[user:pass@]host:port` |
-| `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | — | Proxy used by compat mode with `proxy=auto`; `pilotctl daemon start` forwards them (and `SSL_CERT_FILE` / `SSL_CERT_DIR`) to the daemon |
 | `PILOT_MOTD_URL` | `-motd-feed-url` | Message-of-the-day feed URL |
 | `PILOT_TELEMETRY_URL` | `-telemetry-url` | Telemetry endpoint override |
 | `PILOT_SYN_WHITELIST` | `-syn-whitelist` | Nodes exempt from SYN rate limit |

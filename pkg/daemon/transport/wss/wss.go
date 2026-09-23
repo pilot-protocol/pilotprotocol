@@ -39,7 +39,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -110,12 +109,14 @@ type Config struct {
 	// store. Always non-nil — the caller picks the policy.
 	TLSConfig *tls.Config
 
-	// Proxy picks the HTTP proxy for the WSS dial, with the signature of
-	// http.Transport.Proxy (e.g. netproxy.Resolver.ProxyForRequest). A
-	// wss:// URL is tunnelled with CONNECT by host name, so the beacon
-	// name is never resolved locally and TLS (TLSConfig, SNI) stays
-	// end-to-end with the beacon. nil dials directly.
-	Proxy func(*http.Request) (*url.URL, error)
+	// DialContext opens the TCP connection to the beacon, e.g. a
+	// netproxy.Dialer that tunnels through an HTTP CONNECT proxy by host
+	// name, so the beacon name is never resolved locally. TLS (TLSConfig,
+	// SNI) then runs end to end with the beacon over that connection;
+	// TLSConfig never applies to the proxy itself — an https:// proxy's
+	// TLS is the dialer's business, so a pinned beacon trust store cannot
+	// reject the operator's proxy certificate. nil dials directly.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Identity provides the Ed25519 keypair used for the auth challenge.
 	Identity *crypto.Identity
@@ -264,7 +265,7 @@ func Dial(ctx context.Context, cfg Config) (*Transport, error) {
 func (t *Transport) dialAndAuth(ctx context.Context) (*websocket.Conn, error) {
 	httpClient := &http.Client{
 		Transport: &http.Transport{
-			Proxy:           t.cfg.Proxy,
+			DialContext:     t.cfg.DialContext,
 			TLSClientConfig: t.cfg.TLSConfig.Clone(),
 		},
 	}

@@ -5,51 +5,18 @@ package main
 import (
 	"log/slog"
 	"net/http"
-	"os"
-	"strings"
 
 	"github.com/pilot-protocol/common/netproxy"
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
 )
 
-// Compiled-in production endpoints. -registry and -beacon default to these
-// raw TCP / UDP addresses (pilotctl passes the same values explicitly);
-// compat mode swaps the registry for its TLS host name on :443.
-const (
-	defaultRegistryAddr = "34.71.57.205:9000"
-	defaultBeaconAddr   = "34.71.57.205:9001"
-	compatRegistryAddr  = "registry.pilotprotocol.network:443"
-)
-
-// transportDefault is the -transport default: $PILOT_TRANSPORT when it
-// names a transport, otherwise "udp". An unknown value is ignored with a
-// warning, as pkg/daemon has always treated it.
-func transportDefault() string {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("PILOT_TRANSPORT")))
-	switch v {
-	case "udp", "compat":
-		return v
-	case "":
-	default:
-		slog.Warn("ignoring unknown PILOT_TRANSPORT value", "value", v, "valid", "udp, compat")
-	}
-	return "udp"
-}
-
-// compatKeepsRegistry reports whether a -transport=compat daemon keeps its
-// configured registry instead of switching to compatRegistryAddr. Only an
-// explicit choice (the -registry flag or $PILOT_REGISTRY) is kept, and the
-// compiled-in raw-TCP default never counts as one: pilotctl passes it on
-// every `daemon start`, and a UDP-blocked host behind a CONNECT-only egress
-// proxy cannot reach it.
-func compatKeepsRegistry(addr string, setByFlag, setByEnv bool) bool {
-	return (setByFlag || setByEnv) && strings.TrimSpace(addr) != defaultRegistryAddr
-}
-
 // resolveProxyPolicy resolves -proxy for the transport (see
-// daemon.ResolveProxy). A malformed explicit proxy URL is an error; a
-// malformed proxy environment under "auto" only costs the proxy: it is
-// logged and the daemon dials directly, as it did before -proxy existed.
+// daemon.ResolveProxy). A malformed -proxy value is an error. Under "auto"
+// only an unusable HTTPS_PROXY / https_proxy (the variable that names the
+// TLS proxy) can fail; that costs the proxy, not the daemon: it is logged
+// and the daemon dials directly, as it did before -proxy existed. Unusable
+// HTTP_PROXY / ALL_PROXY values are skipped by netproxy and only logged.
 func resolveProxyPolicy(spec, transport string) (*netproxy.Resolver, error) {
 	policy, err := daemon.ResolveProxy(spec, transport)
 	if err != nil {
@@ -58,6 +25,9 @@ func resolveProxyPolicy(spec, transport string) (*netproxy.Resolver, error) {
 		}
 		slog.Warn("proxy environment is malformed; dialing directly", "err", err)
 		return nil, nil
+	}
+	for _, w := range policy.Warnings() {
+		slog.Warn("ignoring unusable proxy environment variable", "err", w)
 	}
 	return policy, nil
 }
@@ -68,7 +38,7 @@ func describeProxy(spec, transport string, policy *netproxy.Resolver) string {
 	if policy != nil {
 		return policy.String()
 	}
-	if isAutoProxy(spec) && transport != "compat" {
+	if isAutoProxy(spec) && transport != daemon.TransportCompat {
 		return "none (-proxy=auto applies to -transport=compat only)"
 	}
 	return "none"
@@ -78,9 +48,10 @@ func describeProxy(spec, transport string, policy *netproxy.Resolver) string {
 // follow the policy. Every HTTP client the daemon wires in without a
 // transport of its own — catalogue pins, skillinject, trustedagents,
 // webhook, enterprise-control clients — uses DefaultTransport, and not all
-// of them accept an injected client. nil leaves DefaultTransport alone
-// (net/http's own proxy environment handling). Call before any goroutine
-// issues a request.
+// of them accept an injected client. Loopback targets (a local webhook or
+// sidecar) always go direct. nil leaves DefaultTransport alone (net/http's
+// own proxy environment handling). Call before any goroutine issues a
+// request.
 func installDefaultTransportProxy(policy *netproxy.Resolver) {
 	if policy == nil {
 		return
@@ -90,10 +61,10 @@ func installDefaultTransportProxy(policy *netproxy.Resolver) {
 		slog.Warn("http.DefaultTransport is not an *http.Transport; plugin HTTP clients do not follow -proxy")
 		return
 	}
-	tr.Proxy = policy.ProxyForRequest
+	tr.Proxy = proxyconf.RequestProxy(policy)
 }
 
 func isAutoProxy(spec string) bool {
-	s := strings.TrimSpace(spec)
-	return s == "" || strings.EqualFold(s, netproxy.ModeAuto)
+	s, err := proxyconf.Normalize(spec)
+	return err == nil && s == proxyconf.Auto
 }

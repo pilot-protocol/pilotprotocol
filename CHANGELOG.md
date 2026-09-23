@@ -18,25 +18,66 @@ Detailed per-release notes are on the
   `false` (the default) to switch app auto-updates back on. Pilot daemon/CLI
   binary updates are never affected. Honors the existing
   `PILOT_UPDATER_NO_APP_UPGRADE` as a back-compat alias.
-- **`pilotctl daemon start --transport <udp|compat> --proxy <auto|off|URL>`.**
-  Also read from config.json (`transport`, `proxy`; set them with
-  `pilotctl config --set`) and, for the transport, `$PILOT_TRANSPORT`. Both are
-  forwarded to pilot-daemon only when set, and dropped with a warning when the
-  paired daemon binary predates them, so a new pilotctl still starts an older
-  daemon. A proxy URL with credentials travels as `$PILOT_PROXY`, never on the
-  daemon's argv, and is shown redacted by `pilotctl config`.
+- **Works behind an HTTPS proxy with UDP blocked (Meta Muse and other hosted
+  agent sandboxes) — no flags needed.** pilot-daemon gets `-proxy
+  <auto|off|URL>` (`$PILOT_PROXY`, config.json `proxy`): with compat mode the
+  registry, the WSS beacon and every plugin HTTP client go through
+  `$HTTPS_PROXY` / `$ALL_PROXY` (honoring `$NO_PROXY`), CONNECTing by host
+  name so poisoned local DNS does not matter, with TLS end to end; an
+  explicit `http(s)://[user:pass@]host:port` proxies every connection except
+  loopback. `off` also accepts `none`, `no`, `false`, `direct`; any other bare
+  word is an error instead of a proxy host name. Proxy credentials never
+  appear in logs, errors or `-help`.
+- **`-transport=auto`.** UDP when the beacon answers a UDP discover (one round
+  trip), otherwise compat when the compat beacon is reachable over TCP 443
+  (through the proxy, if any), otherwise udp as before; the decision is logged
+  once (`transport auto-selected`). It never moves a node with a private
+  registry or beacon onto the public compat beacon. pilot-daemon's own default
+  stays `udp`; `pilotctl daemon start` asks for `auto` whenever no transport is
+  configured and the daemon supports it, and fresh installs save
+  `transport=auto`.
+- **`$PILOT_TRANSPORT` and config.json `transport` are honored by pilot-daemon
+  itself** (both used to be masked by the `-transport` default). Precedence for
+  `-transport`, `-proxy`, `-registry-trust` and `-registry-fingerprint`: flag,
+  then `$PILOT_TRANSPORT` / `$PILOT_PROXY` / `$PILOT_REGISTRY_TRUST` /
+  `$PILOT_REGISTRY_FINGERPRINT`, then config.json, then the default — so a
+  credential-bearing proxy handed over in the environment beats a saved
+  `"proxy": "auto"`.
+- **Pinned registry trust from config/env for sandboxes without a CA bundle.**
+  `registry_trust` / `registry_fingerprint` in config.json (or the env vars
+  above) now survive compat mode, and a fingerprint alone selects pinned
+  trust there. Certificate errors name the fix: `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` (forwarded by pilotctl) or the registry fingerprint.
+- **`pilotctl daemon start --transport <udp|compat|auto> --proxy <auto|off|URL>`**,
+  also from `$PILOT_TRANSPORT` / `$PILOT_PROXY` and config.json. The daemon
+  binary is probed once (`-help`): flags or values it predates are dropped
+  (auto becomes udp) with a warning, so a new pilotctl still starts an older
+  daemon, and an old pilotctl (v1.13.9) starts the new daemon unchanged. A
+  proxy URL with credentials (any `@`) travels as `$PILOT_PROXY`, never on the
+  daemon's argv, and is shown redacted. The ready summary reports the
+  transport the daemon actually chose.
+- **pilotctl's own registry connections follow the proxy.** `lookup`,
+  `register`, `rotate-key`, the auto-handshake visibility check and `recovery
+  recover` dial through `$PILOT_PROXY` / config `proxy` / `$HTTPS_PROXY`
+  (via common/netproxy), using `registry.pilotprotocol.network:443` over TLS
+  when proxied or in compat mode, and fall back to it when the raw-TCP
+  registry is unreachable directly. `proxy=off` restores direct dials.
 - **`daemon start` forwards the proxy/TLS environment** (`HTTPS_PROXY`,
   `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` in both cases, `PILOT_PROXY`,
-  `PILOT_TRANSPORT`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) to the daemon on both the
-  fork and `--foreground` paths, and passes through `--compat-beacon`,
-  `--registry-trust`, `--registry-fingerprint` and `--tls-trust`.
-- **`install.sh --transport compat`** (or `PILOT_TRANSPORT=compat`) for hosts
-  that block UDP or reach the internet only through an authenticating HTTPS
-  proxy: writes `transport=compat` + `proxy=auto` into config.json and
-  generates compat service units. Every installer download goes through
-  `$HTTPS_PROXY` (CONNECT to :443 by hostname only); service setup without
-  root/systemd/launchd degrades to a printed `pilotctl daemon start` hint,
-  download failures name the proxy (redacted) and the hosts it must allow.
+  `PILOT_TRANSPORT`, `PILOT_REGISTRY_TRUST`, `PILOT_REGISTRY_FINGERPRINT`,
+  `SSL_CERT_FILE`, `SSL_CERT_DIR`) on both the fork and `--foreground` paths,
+  and passes through `--compat-beacon`, `--registry-trust`,
+  `--registry-fingerprint` and `--tls-trust`.
+- **`install.sh --transport <auto|udp|compat>`** (or `PILOT_TRANSPORT`). Fresh
+  installs save `auto`; `compat` skips the UDP probe. No `proxy` key is
+  written (the daemon default already uses the environment's proxy). Service
+  units take the transport from config.json, so `pilotctl config --set
+  transport=` applies to them too. Every installer download goes through
+  `$HTTPS_PROXY`; service setup without root/systemd/launchd degrades to a
+  printed `pilotctl daemon start` hint; download failures name the proxy
+  (redacted) and the hosts it must allow. In a Linux container/VM without
+  systemd the installer runs as root without `PILOT_ALLOW_ROOT` (hosted
+  sandboxes run the agent as root); regular hosts still refuse root.
 
 ### Fixed
 - **Compat daemons started by `pilotctl` were pinned to the raw-TCP registry.**
@@ -53,6 +94,17 @@ Detailed per-release notes are on the
   reported as a concurrent start on every attempt.
 - **`daemon start --endpoint` / `--motd-feed-url` / `--motd-interval`** were
   documented but never forwarded to the daemon.
+- **`-transport=compat -registry=34.71.57.205:9000 -registry-tls=false`** (the
+  raw TCP/9000 registry fallback) keeps the raw registry again instead of
+  sending plaintext to the TLS registry on :443; a custom registry in
+  config.json is also kept in compat mode.
+- **Switching back from compat.** A udp daemon given
+  `registry.pilotprotocol.network:443` now uses TLS for it, and `install.sh
+  --transport udp` / `pilotctl config --set transport=udp|auto` restore the
+  raw-TCP registry an older compat install saved.
+- **An https:// proxy was verified with the beacon's pinned roots** under
+  `-tls-trust=pinned`; the proxy's certificate is now checked against the
+  system roots and the beacon's trust store applies to the beacon only.
 - **The `pilotctl skills disable` opt-out now survives updates and explicit
   reconciles.** A forced reconcile — `pilotctl skills check`, `pilotctl update`,
   or an installer re-run — bypassed the disabled flag and re-injected skills a

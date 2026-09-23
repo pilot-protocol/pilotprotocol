@@ -256,7 +256,7 @@ func TestDial_ThroughAuthenticatingConnectProxy(t *testing.T) {
 	tr, err := wss.Dial(context.Background(), wss.Config{
 		URL:         proxiedURL(fb),
 		TLSConfig:   &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-		Proxy:       res.ProxyForRequest,
+		DialContext: netproxy.NewDialer(res).DialContext,
 		Identity:    mustID(t),
 		NodeID:      nodeID,
 		DialTimeout: 5 * time.Second,
@@ -298,7 +298,7 @@ func TestReconnect_ThroughConnectProxy(t *testing.T) {
 	tr, err := wss.Dial(context.Background(), wss.Config{
 		URL:         proxiedURL(fb),
 		TLSConfig:   &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-		Proxy:       res.ProxyForRequest,
+		DialContext: netproxy.NewDialer(res).DialContext,
 		Identity:    mustID(t),
 		NodeID:      nodeID,
 		DialTimeout: 5 * time.Second,
@@ -341,7 +341,7 @@ func TestDial_ProxyFromEnvironmentHonoursNoProxy(t *testing.T) {
 		tr, err := wss.Dial(context.Background(), wss.Config{
 			URL:         proxiedURL(fb),
 			TLSConfig:   &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-			Proxy:       res.ProxyForRequest,
+			DialContext: netproxy.NewDialer(res).DialContext,
 			Identity:    mustID(t),
 			NodeID:      nodeID,
 			DialTimeout: 5 * time.Second,
@@ -381,7 +381,7 @@ func TestDial_ProxyAuthFailureDoesNotLeakCredentials(t *testing.T) {
 	_, err = wss.Dial(context.Background(), wss.Config{
 		URL:         proxiedURL(fb),
 		TLSConfig:   &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-		Proxy:       res.ProxyForRequest,
+		DialContext: netproxy.NewDialer(res).DialContext,
 		Identity:    mustID(t),
 		NodeID:      nodeID,
 		DialTimeout: 5 * time.Second,
@@ -397,5 +397,80 @@ func TestDial_ProxyAuthFailureDoesNotLeakCredentials(t *testing.T) {
 	}
 	if fb.authCount.Load() != 0 {
 		t.Fatal("beacon was reached despite the proxy refusing the CONNECT")
+	}
+}
+
+// newTLSConnectProxy is connectProxy served over TLS (an https:// proxy)
+// with a certificate for "localhost" from its own CA.
+func newTLSConnectProxy(t *testing.T, user, pass string) (*connectProxy, *x509.CertPool) {
+	t.Helper()
+	cert, pool := proxiedCert(t, "localhost")
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	ln := tls.NewListener(raw, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+	req := &http.Request{Header: http.Header{}}
+	req.SetBasicAuth(user, pass)
+	p := &connectProxy{ln: ln, wantAuth: req.Header.Get("Authorization")}
+	p.wg.Add(1)
+	go p.accept()
+	t.Cleanup(func() {
+		ln.Close()
+		p.mu.Lock()
+		for _, c := range p.live {
+			c.Close()
+		}
+		p.mu.Unlock()
+		p.wg.Wait()
+	})
+	return p, pool
+}
+
+// An https:// proxy is verified with its own trust store (the dialer's),
+// never with the beacon's TLSConfig: a beacon pinned to Pilot's roots must
+// not reject the operator's proxy certificate, and the proxy's roots must
+// not be able to vouch for the beacon.
+func TestDial_ThroughHTTPSProxyKeepsBeaconTrustSeparate(t *testing.T) {
+	t.Parallel()
+	const nodeID uint32 = 7005
+	fb, beaconPool, snis := newProxiedFakeBeacon(t, nodeID)
+	proxy, proxyPool := newTLSConnectProxy(t, "muse", "s3cret")
+	_, port, _ := net.SplitHostPort(proxy.ln.Addr().String())
+	res, err := netproxy.Explicit("https://muse:s3cret@" + net.JoinHostPort("localhost", port))
+	if err != nil {
+		t.Fatalf("netproxy.Explicit: %v", err)
+	}
+	dialer := &netproxy.Dialer{Resolver: res, TLSConfig: &tls.Config{RootCAs: proxyPool, MinVersion: tls.VersionTLS12}}
+
+	tr, err := wss.Dial(context.Background(), wss.Config{
+		URL:         proxiedURL(fb),
+		TLSConfig:   &tls.Config{RootCAs: beaconPool, MinVersion: tls.VersionTLS12}, // "pinned": beacon CA only
+		DialContext: dialer.DialContext,
+		Identity:    mustID(t),
+		NodeID:      nodeID,
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Dial through an https:// proxy with a pinned beacon trust store: %v", err)
+	}
+	tr.Close()
+	assertOnlyConnects(t, proxy, proxiedTarget(fb), 1)
+	if got := snis(); len(got) != 1 || got[0] != proxiedBeaconHost {
+		t.Fatalf("beacon saw SNI %q, want [%q]", got, proxiedBeaconHost)
+	}
+
+	// The beacon is still verified with TLSConfig alone: trusting only the
+	// proxy's CA for the beacon fails.
+	_, err = wss.Dial(context.Background(), wss.Config{
+		URL:         proxiedURL(fb),
+		TLSConfig:   &tls.Config{RootCAs: proxyPool, MinVersion: tls.VersionTLS12},
+		DialContext: dialer.DialContext,
+		Identity:    mustID(t),
+		NodeID:      nodeID,
+		DialTimeout: 5 * time.Second,
+	})
+	if err == nil {
+		t.Fatal("beacon accepted with only the proxy's CA trusted")
 	}
 }

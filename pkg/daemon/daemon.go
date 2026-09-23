@@ -843,39 +843,70 @@ func (d *Daemon) Start() error {
 	_ = synthesised // reserved for future log/metric tagging
 
 	// 0b. Auto-detect transport mode. PILOT_TRANSPORT env var lets the
-	// operator force a mode at install time. When nothing is set, probe
-	// UDP reachability to the beacon; on UDP-blocked hosts the daemon
-	// auto-falls back to compat (WSS/443) so it can reach peers without
-	// a manual restart.
+	// operator force a mode at install time. When nothing is set (or
+	// TransportMode is "auto"), probe UDP reachability to the beacon; on
+	// UDP-blocked hosts that can reach the compat beacon over TCP the
+	// daemon auto-falls back to compat (WSS/443) so it can reach peers
+	// without a manual restart. cmd/daemon resolves -transport=auto itself
+	// (it also switches the registry for compat); this path serves
+	// embedders that leave TransportMode empty.
 	if envTransport := os.Getenv("PILOT_TRANSPORT"); envTransport != "" && d.config.TransportMode == "" {
 		switch envTransport {
-		case "udp", "compat":
+		case TransportUDP, TransportCompat:
 			d.config.TransportMode = envTransport
 			slog.Info("transport set from PILOT_TRANSPORT env", "mode", envTransport)
+		case TransportAuto:
 		default:
-			slog.Warn("ignoring unknown PILOT_TRANSPORT value", "value", envTransport, "valid", "udp, compat")
+			slog.Warn("ignoring unknown PILOT_TRANSPORT value", "value", envTransport, "valid", "udp, compat, auto")
 		}
+	}
+	if d.config.TransportMode == TransportAuto {
+		d.config.TransportMode = ""
 	}
 	if d.config.TransportMode == "" {
 		stunBeacon := firstBeacon(d.config.BeaconAddr)
 		switch {
 		case stunBeacon == "":
 			// No beacon to probe — leave transport on the UDP default.
-		case probeUDPReachable(stunBeacon):
-			// Positive evidence UDP works end-to-end; stay on UDP.
 		case d.config.CompatBeaconURL == "":
-			// UDP looks blocked but we have no compat beacon to fall back
-			// to. Switching to compat would strand the daemon, so stay on
-			// UDP and warn the operator to configure compat explicitly.
-			slog.Warn("UDP probe to beacon failed but no compat beacon configured — staying on UDP",
-				"beacon", stunBeacon,
-				"hint", "set -compat-beacon and PILOT_TRANSPORT=compat to use WSS/443")
+			if !probeUDPReachable(stunBeacon) {
+				// UDP looks blocked but we have no compat beacon to fall
+				// back to. Switching to compat would strand the daemon, so
+				// stay on UDP and warn the operator to configure compat.
+				slog.Warn("UDP probe to beacon failed but no compat beacon configured — staying on UDP",
+					"beacon", stunBeacon,
+					"hint", "set -compat-beacon and PILOT_TRANSPORT=compat to use WSS/443")
+			}
 		default:
-			d.config.TransportMode = "compat"
-			slog.Warn("UDP probe to beacon failed — auto-falling back to compat mode (WSS/443)",
-				"beacon", stunBeacon,
-				"compat_beacon", d.config.CompatBeaconURL,
-				"hint", "set PILOT_TRANSPORT=udp to force UDP")
+			// Compat would use the environment's proxy (-proxy=auto)
+			// unless the embedder set a policy; check reachability the
+			// same way.
+			policy := d.config.Proxy
+			if policy == nil {
+				if p, err := ResolveProxy(proxyAutoSpec, TransportCompat); err == nil {
+					policy = p
+				} else {
+					slog.Warn("proxy environment unusable; compat check dials directly", "error", err)
+				}
+			}
+			mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+				BeaconAddr:      stunBeacon,
+				CompatBeaconURL: d.config.CompatBeaconURL,
+				Dial:            d.dialerFor(policy),
+			})
+			if mode == TransportCompat {
+				d.config.TransportMode = TransportCompat
+				if d.config.Proxy == nil {
+					d.config.Proxy = policy
+				}
+				slog.Warn("UDP probe to beacon failed — auto-falling back to compat mode (WSS/443)",
+					"beacon", stunBeacon,
+					"compat_beacon", d.config.CompatBeaconURL,
+					"reason", reason,
+					"hint", "set PILOT_TRANSPORT=udp to force UDP")
+			} else {
+				slog.Info("transport auto-selected", "transport", TransportUDP, "reason", reason)
+			}
 		}
 	}
 
@@ -1078,12 +1109,15 @@ func (d *Daemon) Start() error {
 		ccCtx, ccCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccCancel()
 		if cerr := d.tunnels.ConnectCompat(ccCtx, ConnectCompatConfig{
-			BeaconURL: d.config.CompatBeaconURL,
-			TLSConfig: tlsCfg,
-			Proxy:     d.httpProxyFunc(),
-			Identity:  d.identity,
-			NodeID:    d.nodeID,
+			BeaconURL:   d.config.CompatBeaconURL,
+			TLSConfig:   tlsCfg,
+			DialContext: d.proxyDialer(),
+			Identity:    d.identity,
+			NodeID:      d.nodeID,
 		}); cerr != nil {
+			if hint := tlsTrustHint(cerr, "beacon"); hint != "" && d.config.CompatTLSTrust == "system" {
+				return fmt.Errorf("compat connect: %w; %s", cerr, hint)
+			}
 			return fmt.Errorf("compat connect: %w", cerr)
 		}
 		slog.Info("compat mode tunnel up",
@@ -2273,6 +2307,9 @@ func (d *Daemon) dialRegistryClient() (*registry.Client, error) {
 			break
 		}
 		if attempt == maxRegistryDialAttempts {
+			if hint := tlsTrustHint(err, "registry"); hint != "" {
+				return nil, fmt.Errorf("registry dial (after %d attempts): %w; %s", attempt, err, hint)
+			}
 			return nil, fmt.Errorf("registry dial (after %d attempts): %w", attempt, err)
 		}
 		slog.Warn("registry dial failed, retrying",

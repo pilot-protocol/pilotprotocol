@@ -31,6 +31,7 @@ import (
 	registry "github.com/pilot-protocol/common/registry/client"
 	"github.com/pilot-protocol/dataexchange"
 	"github.com/pilot-protocol/eventstream"
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/policy/policylang"
 	"github.com/pilot-protocol/trustedagents"
 )
@@ -600,20 +601,11 @@ func nodeIDFromDaemon() int64 {
 	return int64(nid)
 }
 
+// connectRegistry dials the configured registry along the same network
+// the daemon uses (see registryRoute: egress proxy, compat TLS registry),
+// or exits with a hint.
 func connectRegistry() *registry.Client {
-	addr := getRegistry()
-	// TODO(netproxy): dial through common/netproxy (HTTPS_PROXY CONNECT by
-	// hostname, TLS for the compat registry) once pilotctl bumps to a common
-	// release with the registry dialer option. Until then this raw-TCP dial
-	// bypasses any egress proxy, so registry commands fail in proxy-only
-	// sandboxes; registryDialHint says so.
-	rc, err := registry.Dial(addr)
-	if err != nil {
-		fatalHint("connection_failed",
-			registryDialHint(addr),
-			"cannot reach registry at %s", addr)
-	}
-	return rc
+	return connectRegistryAt(getRegistry(), "registry")
 }
 
 func resolveHostnameToAddr(d *driver.Driver, hostname string) (protocol.Addr, uint32, error) {
@@ -708,17 +700,17 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 		return
 	}
 
-	// Branch 3 — unknown peer, not trusted. Refuse if private.
-	// TODO(netproxy): same raw-TCP registry dial as connectRegistry — it
-	// bypasses HTTPS_PROXY until common/netproxy lands in pilotctl.
-	rc, err := registry.Dial(getRegistry())
+	// Branch 3 — unknown peer, not trusted. Refuse if private. The
+	// visibility check reaches the registry the way connectRegistry does
+	// (through the egress proxy when there is one).
+	rc, route, err := dialRegistry(getRegistry())
 	if err != nil {
 		// Registry unreachable — be conservative and refuse rather than
 		// silently let an untrusted tunnel attempt go through to a peer
 		// we can't characterise.
 		hint := fmt.Sprintf("run: pilotctl handshake %s", addr)
-		if envProxyURL() != "" {
-			hint += " (or pass --no-auto-handshake); " + registryDialHint(getRegistry())
+		if route.Addr != "" {
+			hint += "; " + registryDialHint(route)
 		}
 		fatalHint("trust_required",
 			hint,
@@ -1063,32 +1055,41 @@ Flags:
   --log-format <fmt>           log format: text, json (default: text)
   --no-encrypt                 disable tunnel encryption
   --foreground                 run in foreground (no fork; for systemd / shell wrappers)
-  --wait <duration>            how long to wait for daemon to become ready (default: 15s)
+  --wait <duration>            how long to wait for daemon to become ready (default:
+                               15s; 30s with --transport compat or auto)
   --motd-feed-url <url>        message-of-the-day feed (empty to disable; env PILOT_MOTD_URL)
   --motd-interval <duration>   message-of-the-day poll interval (default: 15m)
   --enterprise-control <path>  owner-only managed control attachment
-  --transport <udp|compat>     tunnel transport (default: $PILOT_TRANSPORT, config
-                               "transport", else udp). compat = TLS/WSS over TCP 443
-                               only, for UDP-blocked hosts; the raw-TCP default
-                               registry/beacon are then left to the daemon, which
-                               uses registry.pilotprotocol.network:443
-  --proxy <auto|off|URL>       outbound proxy (default: config "proxy", else the
-                               daemon's $PILOT_PROXY or auto). auto = in compat mode
-                               use $HTTPS_PROXY/$ALL_PROXY (honoring $NO_PROXY);
-                               off = never; http(s)://[user:pass@]host:port = always.
-                               A URL with credentials is passed via env, not argv
+  --transport <udp|compat|auto>
+                               tunnel transport. Precedence: this flag,
+                               $PILOT_TRANSPORT, config "transport", else auto when
+                               the daemon supports it (older daemons: udp).
+                               udp = UDP tunnels; compat = registry over TLS and
+                               beacon over WSS, TCP 443 only (UDP-blocked or
+                               proxy-only hosts); auto = udp when the beacon
+                               answers over UDP, else compat when TCP 443 is
+                               reachable (through the proxy, if any)
+  --proxy <auto|off|URL>       outbound proxy. Precedence: this flag, $PILOT_PROXY,
+                               config "proxy", else auto. auto = with compat, use
+                               $HTTPS_PROXY/$ALL_PROXY (honoring $NO_PROXY);
+                               off (or none) = never; http(s)://[user:pass@]host:port
+                               = every connection except loopback. A URL with
+                               credentials is passed via env, never on argv
   --compat-beacon <url>        beacon WSS URL for compat mode
   --registry-trust <mode>      registry TLS trust: pinned or system
-  --registry-fingerprint <hex> registry certificate SHA-256 (with --registry-trust pinned)
+  --registry-fingerprint <hex> registry certificate SHA-256 (pins the compat registry;
+                               for hosts without a CA bundle)
   --tls-trust <mode>           compat beacon TLS trust: system or pinned
 
 Environment passed through to the daemon (never scrubbed):
   HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
-  NO_PROXY no_proxy PILOT_PROXY PILOT_TRANSPORT SSL_CERT_FILE SSL_CERT_DIR
+  NO_PROXY no_proxy PILOT_PROXY PILOT_TRANSPORT PILOT_REGISTRY_TRUST
+  PILOT_REGISTRY_FINGERPRINT SSL_CERT_FILE SSL_CERT_DIR
 
---transport / --proxy are forwarded only when set; if the pilot-daemon binary
-is too old to know one, it is dropped with a warning instead of crashing it.
-Behind an HTTPS proxy with UDP blocked (e.g. hosted agent sandboxes):
+A pilot-daemon too old for --transport, --transport auto or --proxy gets the
+flag dropped (auto becomes udp) with a warning instead of crashing it.
+Behind an HTTPS proxy with UDP blocked (e.g. hosted agent sandboxes), plain
+"pilotctl daemon start" picks compat by itself; to skip the UDP probe:
   pilotctl config --set transport=compat && pilotctl daemon start
 `,
 	"daemon stop": `Usage: pilotctl daemon stop
@@ -1342,9 +1343,11 @@ Common keys:
   beacon       beacon address (overrides $PILOT_BEACON)
   socket       daemon socket path (overrides $PILOT_SOCKET)
   hostname     default hostname passed to daemon start
-  transport    daemon transport: udp or compat ($PILOT_TRANSPORT overrides)
+  transport    daemon transport: udp, compat or auto ($PILOT_TRANSPORT overrides)
   proxy        daemon proxy: auto, off, or http(s)://[user:pass@]host:port
-               (credentials are redacted when shown)
+               ($PILOT_PROXY overrides; credentials are redacted when shown)
+  registry_fingerprint / registry_trust
+               pin the TLS registry (hosts without a CA bundle)
 `,
 	"version": `Usage: pilotctl version
 
@@ -1551,7 +1554,7 @@ Bootstrap:
   pilotctl config [--set key=value]
 
 Daemon lifecycle:
-  pilotctl daemon start [--config <path>] [--registry <addr>] [--beacon <addr>] [--email <addr>] [--webhook <url>] [--trust-auto-approve] [--transport <udp|compat>] [--proxy <auto|off|URL>]
+  pilotctl daemon start [--config <path>] [--registry <addr>] [--beacon <addr>] [--email <addr>] [--webhook <url>] [--trust-auto-approve] [--transport <udp|compat|auto>] [--proxy <auto|off|URL>]
   pilotctl daemon stop
   pilotctl daemon status
 
@@ -1648,9 +1651,9 @@ Diagnostic commands:
 Environment:
   PILOT_REGISTRY     Registry address (default: 34.71.57.205:9000)
   PILOT_SOCKET       Daemon socket path (default: /tmp/pilot.sock)
-  PILOT_TRANSPORT    daemon start transport: udp or compat (TCP 443 only)
-  PILOT_PROXY        daemon proxy policy: auto, off, or http(s)://[user:pass@]host:port
-  HTTPS_PROXY        proxy used by compat mode (proxy=auto) and pilotctl's HTTP calls
+  PILOT_TRANSPORT    daemon start transport: udp, compat (TCP 443 only) or auto
+  PILOT_PROXY        proxy policy: auto, off, or http(s)://[user:pass@]host:port
+  HTTPS_PROXY        proxy for compat mode (proxy=auto) and pilotctl's own connections
 
 Version:
   pilotctl version
@@ -2127,33 +2130,50 @@ func cmdConfig(args []string) {
 		if len(parts) != 2 {
 			fatalCode("invalid_argument", "usage: pilotctl config --set key=value")
 		}
-		// Validate the keys daemon start interprets, so a typo fails here
-		// rather than on the next daemon start. Empty clears the key.
-		if parts[1] != "" {
+		// Validate the keys daemon start (and pilot-daemon, which reads
+		// config.json itself) interprets, so a typo fails here rather than
+		// on the next daemon start. Empty clears the key.
+		value := parts[1]
+		if value != "" {
 			switch parts[0] {
 			case "transport":
-				if err := validateTransport(parts[1]); err != nil {
+				t, err := normalizeTransport(value)
+				if err == nil && t == "" {
+					err = validateTransport(value)
+				}
+				if err != nil {
 					fatalCode("invalid_argument", "config: %v", err)
 				}
+				value = t
 			case "proxy":
-				if err := validateProxySetting(parts[1]); err != nil {
+				p, err := proxyconf.Normalize(value)
+				if err != nil {
 					fatalCode("invalid_argument", "config: %v", err)
 				}
+				value = p
 			}
 		}
 		cfg := loadConfig()
-		cfg[parts[0]] = parts[1]
+		cfg[parts[0]] = value
+		result := map[string]interface{}{"key": parts[0], "value": value}
+		// Leaving compat: an install made with a pilotctl that predated
+		// --transport pointed the registry at the compat TLS host
+		// (install.sh --transport compat). A udp daemon needs the raw-TCP
+		// registry back (current daemons cope either way; older ones
+		// would dial :443 without TLS).
+		if parts[0] == "transport" && value != "compat" {
+			if r, _ := cfg["registry"].(string); strings.EqualFold(strings.TrimSpace(r), compatRegistryAddr) {
+				cfg["registry"] = productionRegistryAddr
+				result["registry"] = productionRegistryAddr
+			}
+		}
 		if err := saveConfig(cfg); err != nil {
 			fatalCode("internal", "save config: %v", err)
 		}
-		shown := parts[1]
 		if parts[0] == "proxy" {
-			shown = redactProxyURL(shown)
+			result["value"] = redactProxyURL(value)
 		}
-		outputOK(map[string]interface{}{
-			"key":   parts[0],
-			"value": shown,
-		})
+		outputOK(result)
 		return
 	}
 
@@ -2263,9 +2283,9 @@ func contextCatalog() map[string]interface{} {
 
 			// Daemon lifecycle
 			"daemon start": map[string]interface{}{
-				"args":        []string{"[--registry <addr>]", "[--beacon <addr>]", "[--listen <addr>]", "[--identity <path>]", "[--email <addr>]", "[--hostname <name>]", "[--log-level <level>]", "[--public]", "[--foreground]", "[--socket <path>]", "[--transport <udp|compat>]", "[--proxy <auto|off|URL>]"},
-				"description": "Start the daemon as a background process. Blocks until registered, then exits. --transport compat (or config transport=compat / $PILOT_TRANSPORT) runs over TCP 443 only for UDP-blocked hosts; --proxy auto (default) then routes through $HTTPS_PROXY",
-				"returns":     "node_id, address, pid, socket, hostname, log_file, transport (when set), proxy (when set, credentials redacted)",
+				"args":        []string{"[--registry <addr>]", "[--beacon <addr>]", "[--listen <addr>]", "[--identity <path>]", "[--email <addr>]", "[--hostname <name>]", "[--log-level <level>]", "[--public]", "[--foreground]", "[--socket <path>]", "[--transport <udp|compat|auto>]", "[--proxy <auto|off|URL>]"},
+				"description": "Start the daemon as a background process. Blocks until registered, then exits. The default transport is auto: UDP when it works, else compat (TLS/WSS over TCP 443 only, through $HTTPS_PROXY when set) — so UDP-blocked and proxy-only hosts work without flags. --transport udp|compat (or config transport / $PILOT_TRANSPORT) forces one",
+				"returns":     "node_id, address, pid, socket, hostname, log_file, transport (as the daemon reported it), transport_auto (when auto chose it), proxy (when set, credentials redacted)",
 			},
 			"daemon stop": map[string]interface{}{
 				"args":        []string{},
@@ -2607,9 +2627,9 @@ func contextCatalog() map[string]interface{} {
 		"environment": map[string]interface{}{
 			"PILOT_REGISTRY":  "Registry address (default: 34.71.57.205:9000)",
 			"PILOT_SOCKET":    "Daemon socket path (default: /tmp/pilot.sock)",
-			"PILOT_TRANSPORT": "daemon start transport: udp or compat (TCP 443 only)",
-			"PILOT_PROXY":     "daemon proxy policy: auto, off, or http(s)://[user:pass@]host:port",
-			"HTTPS_PROXY":     "proxy used by compat mode (proxy=auto) and pilotctl HTTP calls; forwarded to the daemon",
+			"PILOT_TRANSPORT": "daemon start transport: udp, compat (TCP 443 only) or auto",
+			"PILOT_PROXY":     "proxy policy: auto, off, or http(s)://[user:pass@]host:port (beats config.json)",
+			"HTTPS_PROXY":     "proxy for compat mode (proxy=auto) and pilotctl's own connections; forwarded to the daemon",
 		},
 		"config_file": "~/.pilot/config.json",
 	}
@@ -2735,7 +2755,8 @@ type daemonLaunchPlan struct {
 	SocketPath string
 	// AdminToken is passed as $PILOT_ADMIN_TOKEN, never on argv (PILOT-290).
 	AdminToken string
-	// Transport is the resolved --transport ("" = daemon default, udp).
+	// Transport is the resolved --transport ("" = not configured:
+	// cmdDaemonStart asks a daemon that supports it for auto).
 	Transport string
 	// Proxy is the resolved --proxy ("" = daemon default, auto).
 	Proxy string
@@ -3087,20 +3108,12 @@ func cmdDaemonStart(args []string) {
 	}
 
 	daemonBin := daemonBinaryPath()
-	// Never hand an older daemon a flag it does not define: Go's flag
-	// package would abort it on startup.
-	daemonArgs := dropUnsupportedDaemonFlags(daemonBin, plan.Args)
-	proxyEnv := plan.ProxyEnv
-	if proxyEnv != "" {
-		if supported := daemonFlags(daemonBin); supported != nil && !supported["proxy"] {
-			if !jsonOutput {
-				fmt.Fprintf(os.Stderr, "warning: %s does not support -proxy (older pilot-daemon); proxy %s will not be used — upgrade pilot-daemon to use it\n",
-					daemonBin, redactProxyURL(proxyEnv))
-			}
-			proxyEnv = ""
-		}
-	}
-	daemonEnv := daemonChildEnv(os.Environ(), plan.AdminToken, proxyEnv, plan.Transport)
+	// Fit the launch to the daemon binary (probed once): never hand an
+	// older daemon a flag or value it does not define — Go's flag package
+	// would abort it on startup — and ask a current one for
+	// -transport=auto when no transport is configured.
+	daemonArgs, proxyEnv, requestedTransport := adaptDaemonArgs(daemonBin, plan)
+	daemonEnv := daemonChildEnv(os.Environ(), plan.AdminToken, proxyEnv, requestedTransport)
 
 	// --foreground: replace the current process so signal/lifetime
 	// handling matches what the user expects from systemd unit files
@@ -3175,8 +3188,14 @@ func cmdDaemonStart(args []string) {
 		fmt.Fprintf(os.Stderr, "starting daemon (pid %d, socket %s)...", pid, socketPath)
 	}
 
-	// Wait for daemon to become ready (socket appears and responds)
-	waitDur := flagDuration(flags, "wait", 15*time.Second)
+	// Wait for daemon to become ready (socket appears and responds).
+	// compat (and auto, which may pick it) registers over TLS and brings
+	// up the WSS tunnel, possibly through a proxy: allow it more time.
+	defaultWait := 15 * time.Second
+	if requestedTransport == "compat" || requestedTransport == "auto" {
+		defaultWait = 30 * time.Second
+	}
+	waitDur := flagDuration(flags, "wait", defaultWait)
 	deadline := time.Now().Add(waitDur)
 	dots := 0
 	for time.Now().Before(deadline) {
@@ -3210,8 +3229,13 @@ func cmdDaemonStart(args []string) {
 				"socket":   socketPath,
 				"log_file": pidLogPath,
 			}
-			if plan.Transport != "" {
-				fields["transport"] = plan.Transport
+			if t, auto := effectiveTransport(requestedTransport, pidLogPath); t != "" || auto {
+				if t != "" {
+					fields["transport"] = t
+				}
+				if auto {
+					fields["transport_auto"] = true
+				}
 			}
 			if plan.Proxy != "" {
 				fields["proxy"] = redactProxyURL(plan.Proxy)
@@ -3223,8 +3247,11 @@ func cmdDaemonStart(args []string) {
 			if hn != "" {
 				fmt.Printf("  Hostname: %s\n", hn)
 			}
-			if plan.Transport != "" {
-				fmt.Printf("  Transport: %s\n", plan.Transport)
+			if t, auto := effectiveTransport(requestedTransport, pidLogPath); t != "" {
+				if auto {
+					t += " (auto)"
+				}
+				fmt.Printf("  Transport: %s\n", t)
 			}
 			if plan.Proxy != "" {
 				fmt.Printf("  Proxy:    %s\n", redactProxyURL(plan.Proxy))
