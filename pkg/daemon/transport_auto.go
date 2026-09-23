@@ -3,11 +3,14 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -35,9 +38,10 @@ func NormalizeTransport(v string) (string, error) {
 	return "", fmt.Errorf("invalid transport %q: must be udp, compat or auto", v)
 }
 
-// defaultCompatCheckTimeout bounds the TCP reachability check of the
-// compat beacon in SelectTransport.
-const defaultCompatCheckTimeout = 5 * time.Second
+// defaultCompatCheckTimeout bounds the compat beacon check in
+// SelectTransport: TCP connect (through the proxy: its CONNECT), TLS
+// handshake and one HTTP exchange.
+const defaultCompatCheckTimeout = 8 * time.Second
 
 // AutoTransportProbe configures SelectTransport.
 type AutoTransportProbe struct {
@@ -47,14 +51,14 @@ type AutoTransportProbe struct {
 	// CompatBeaconURL is the WSS beacon compat mode would dial. Empty
 	// means compat is not available and auto always picks udp.
 	CompatBeaconURL string
-	// Dial opens the compat reachability check, normally through the
-	// proxy policy compat mode would use. nil dials directly.
+	// Dial opens the connection for the compat beacon check, normally
+	// through the proxy policy compat mode would use. nil dials directly.
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// UDPTimeout bounds the UDP probe (0 = udpProbeTimeout). A reply
 	// returns as soon as it arrives, so on a working UDP path the probe
 	// costs one round trip.
 	UDPTimeout time.Duration
-	// TCPTimeout bounds the compat check (0 = 5s). It only runs when the
+	// TCPTimeout bounds the compat check (0 = 8s). It only runs when the
 	// UDP probe got no answer.
 	TCPTimeout time.Duration
 }
@@ -63,12 +67,17 @@ type AutoTransportProbe struct {
 //
 //   - udp when the beacon answers a UDP discover — the transport a daemon
 //     would have used anyway, found in one round trip;
-//   - otherwise compat, when the compat beacon's host:port accepts a TCP
-//     connection through p.Dial (i.e. through the egress proxy, if there
-//     is one): the host blocks UDP but can reach TCP 443;
+//   - otherwise compat, when the compat beacon itself answers through
+//     p.Dial (i.e. through the egress proxy, if there is one): a TLS
+//     handshake and a plain GET of the compat path return 426 Upgrade
+//     Required, which only a live WebSocket endpoint sends. A bare TCP
+//     connect proves nothing: the production host is an SNI-routing front
+//     that accepts TCP while the beacon behind it is down, and through a
+//     proxy it is only the proxy's CONNECT 200;
 //   - otherwise udp, exactly as before -transport=auto existed: nothing
 //     is reachable yet (no network at boot, beacon outage), and a compat
-//     daemon could not start either.
+//     daemon could not start either, while a udp daemon starts degraded
+//     and registers.
 //
 // reason is a short, log-ready explanation of the choice.
 func SelectTransport(ctx context.Context, p AutoTransportProbe) (mode, reason string) {
@@ -96,17 +105,70 @@ func SelectTransport(ctx context.Context, p AutoTransportProbe) (mode, reason st
 	}
 	cctx, cancel := context.WithTimeout(ctx, tcpTimeout)
 	defer cancel()
-	dial := p.Dial
+	if err := checkCompatBeacon(cctx, p.Dial, p.CompatBeaconURL, target); err != nil {
+		return TransportUDP, fmt.Sprintf("no UDP answer from beacon %s, and compat beacon %s did not answer (%v)", beacon, p.CompatBeaconURL, err)
+	}
+	return TransportCompat, fmt.Sprintf("no UDP answer from beacon %s within %s; compat beacon %s answered", beacon, udpTimeout, p.CompatBeaconURL)
+}
+
+// checkCompatBeacon proves that the WebSocket beacon at rawURL is alive:
+// it opens target through dial (nil: direct), runs TLS for wss:// and
+// sends a plain GET of the beacon path, which a live WebSocket endpoint
+// answers with 426 Upgrade Required. Anything else — a front that accepts
+// TCP but has no backend (502/503), a proxy error, a closed connection —
+// is an error.
+//
+// The TLS session is not verified: nothing is sent but a GET of a public
+// path, and the result only selects the transport. The compat connection
+// itself verifies the beacon with the configured trust (and reports a
+// missing CA bundle far more clearly than a failed probe could).
+func checkCompatBeacon(ctx context.Context, dial func(ctx context.Context, network, addr string) (net.Conn, error), rawURL, target string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return err
+	}
 	if dial == nil {
 		var d net.Dialer
 		dial = d.DialContext
 	}
-	conn, err := dial(cctx, "tcp", target)
+	conn, err := dial(ctx, "tcp", target)
 	if err != nil {
-		return TransportUDP, fmt.Sprintf("no UDP answer from beacon %s, and compat beacon %s unreachable (%v)", beacon, target, err)
+		return err
 	}
-	conn.Close()
-	return TransportCompat, fmt.Sprintf("no UDP answer from beacon %s within %s; compat beacon %s reachable over TCP", beacon, udpTimeout, target)
+	defer conn.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "wss", "https":
+		tc := tls.Client(conn, &tls.Config{
+			ServerName: u.Hostname(),
+			MinVersion: tls.VersionTLS12,
+			// #nosec G402 -- liveness probe only; see the doc comment.
+			InsecureSkipVerify: true, // lgtm[go/disabled-certificate-check]
+		})
+		if err := tc.HandshakeContext(ctx); err != nil {
+			return fmt.Errorf("tls: %w", err)
+		}
+		conn = tc
+	}
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	req := "GET " + path + " HTTP/1.1\r\nHost: " + u.Host + "\r\nUser-Agent: pilot-daemon/transport-auto\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUpgradeRequired {
+		return fmt.Errorf("HTTP %d, want 426 from a live beacon", resp.StatusCode)
+	}
+	return nil
 }
 
 // probeUDPReachableWithin is probeUDPReachable with a caller-chosen bound,

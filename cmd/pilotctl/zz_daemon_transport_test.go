@@ -20,7 +20,26 @@ func withTransportEnvCleared(t *testing.T) string {
 	for _, k := range daemonForwardEnv {
 		t.Setenv(k, "")
 	}
+	// Never ask a real daemon on this machine which transport it runs.
+	stubDaemonTransport(t, "")
 	return tmp
+}
+
+// stubDaemonTransport makes runningDaemonTransport report transport.
+func stubDaemonTransport(t *testing.T, transport string) {
+	t.Helper()
+	prev := runningDaemonTransport
+	runningDaemonTransport = func() string { return transport }
+	t.Cleanup(func() { runningDaemonTransport = prev })
+}
+
+// planRegistryRoute is the first route planRegistryRoutes would try.
+func planRegistryRoute(addr string) (registryRoute, error) {
+	routes, err := planRegistryRoutes(addr)
+	if err != nil {
+		return registryRoute{}, err
+	}
+	return routes[0], nil
 }
 
 func argsHasPair(args []string, key, value string) bool {
@@ -587,6 +606,7 @@ func TestRegistryDialHintMentionsProxy(t *testing.T) {
 		t.Errorf("no-proxy hint = %q", h)
 	}
 	t.Setenv("HTTPS_PROXY", "http://agent:s3cret@egress:3128")
+	t.Setenv("PILOT_TRANSPORT", "compat") // the environment's proxy applies to compat
 	route, err = planRegistryRoute("r.example:9000")
 	if err != nil {
 		t.Fatal(err)

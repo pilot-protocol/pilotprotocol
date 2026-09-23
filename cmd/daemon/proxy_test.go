@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -45,7 +46,7 @@ func TestResolveProxyPolicy(t *testing.T) {
 	}
 	t.Setenv("HTTPS_PROXY", "http://muse:s3cret@egress.test:3128")
 
-	p, err := resolveProxyPolicy("auto", "udp")
+	p, err := resolveProxyPolicy("auto", "", "udp")
 	if err != nil || p != nil {
 		t.Fatalf("auto/udp = (%v, %v), want (nil, nil)", p, err)
 	}
@@ -53,7 +54,7 @@ func TestResolveProxyPolicy(t *testing.T) {
 		t.Errorf("describeProxy(auto/udp) = %q", got)
 	}
 
-	p, err = resolveProxyPolicy("auto", "compat")
+	p, err = resolveProxyPolicy("auto", "", "compat")
 	if err != nil || p == nil || p.Mode() != netproxy.ModeAuto || !p.Enabled() {
 		t.Fatalf("auto/compat = (%v, %v), want an enabled auto policy", p, err)
 	}
@@ -61,7 +62,7 @@ func TestResolveProxyPolicy(t *testing.T) {
 		t.Errorf("describeProxy(auto/compat) = %q", got)
 	}
 
-	p, err = resolveProxyPolicy("http://ops:hunter2@flag.test:8080", "udp")
+	p, err = resolveProxyPolicy("http://ops:hunter2@flag.test:8080", "", "udp")
 	if err != nil || p == nil || p.Mode() != netproxy.ModeExplicit {
 		t.Fatalf("explicit/udp = (%v, %v), want an explicit policy", p, err)
 	}
@@ -69,20 +70,20 @@ func TestResolveProxyPolicy(t *testing.T) {
 		t.Errorf("describeProxy(explicit) = %q", got)
 	}
 
-	p, err = resolveProxyPolicy("off", "compat")
+	p, err = resolveProxyPolicy("off", "", "compat")
 	if err != nil || p == nil || p.Mode() != netproxy.ModeOff {
 		t.Fatalf("off/compat = (%v, %v), want an off policy", p, err)
 	}
 
 	// A malformed -proxy URL is fatal (operator typo) ...
-	if _, err := resolveProxyPolicy("ftp://ops:hunter2@flag.test", "compat"); err == nil {
+	if _, err := resolveProxyPolicy("ftp://ops:hunter2@flag.test", "", "compat"); err == nil {
 		t.Fatal("malformed -proxy URL accepted")
 	} else if strings.Contains(err.Error(), "hunter2") {
 		t.Fatalf("error leaks credentials: %v", err)
 	}
 	// ... but a malformed environment under auto only costs the proxy.
 	t.Setenv("HTTPS_PROXY", "ftp://muse:s3cret@egress.test")
-	p, err = resolveProxyPolicy("auto", "compat")
+	p, err = resolveProxyPolicy("auto", "", "compat")
 	if err != nil || p != nil {
 		t.Fatalf("auto/compat with malformed env = (%v, %v), want (nil, nil)", p, err)
 	}
@@ -94,24 +95,48 @@ func TestResolveProxyPolicy(t *testing.T) {
 // refusingProxy records every request it gets and refuses all of them, so
 // nothing a daemon under test sends ever leaves the machine.
 type refusingProxy struct {
-	ln       net.Listener
-	wantAuth string
+	ln net.Listener
 
-	mu       sync.Mutex
-	targets  []string
-	badAuths int
-	allowed  map[string]bool // CONNECT targets answered 200 (then closed)
+	mu        sync.Mutex
+	wantAuth  string
+	targets   []string
+	badAuths  int
+	goodAuths map[string]int    // Proxy-Authorization value -> accepted requests
+	forwards  map[string]string // CONNECT target -> local address tunnelled to
+	reply407  bool              // answer bad credentials with 407 (rotation)
 }
 
-// allow makes the proxy accept CONNECT target (answer 200, then close the
-// tunnel): enough for a reachability check, useless for anything else.
-func (p *refusingProxy) allow(target string) {
+// forward makes the proxy tunnel CONNECT target to the local address to.
+func (p *refusingProxy) forward(target, to string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.allowed == nil {
-		p.allowed = map[string]bool{}
+	if p.forwards == nil {
+		p.forwards = map[string]string{}
 	}
-	p.allowed[target] = true
+	p.forwards[target] = to
+}
+
+// rotate makes the proxy accept only user:pass from now on, answering
+// anything else with 407 Proxy Authentication Required — the way a
+// sandbox egress proxy rotates its credentials.
+func (p *refusingProxy) rotate(user, pass string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.wantAuth = basicAuth(user, pass)
+	p.reply407 = true
+}
+
+// accepted reports how many requests carried user:pass and were accepted.
+func (p *refusingProxy) accepted(user, pass string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.goodAuths[basicAuth(user, pass)]
+}
+
+func basicAuth(user, pass string) string {
+	req := &http.Request{Header: http.Header{}}
+	req.SetBasicAuth(user, pass)
+	return req.Header.Get("Authorization")
 }
 
 func newRefusingProxy(t *testing.T, user, pass string) *refusingProxy {
@@ -120,9 +145,7 @@ func newRefusingProxy(t *testing.T, user, pass string) *refusingProxy {
 	if err != nil {
 		t.Fatalf("proxy listen: %v", err)
 	}
-	req := &http.Request{Header: http.Header{}}
-	req.SetBasicAuth(user, pass)
-	p := &refusingProxy{ln: ln, wantAuth: req.Header.Get("Authorization")}
+	p := &refusingProxy{ln: ln, wantAuth: basicAuth(user, pass), goodAuths: map[string]int{}}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -143,17 +166,39 @@ func newRefusingProxy(t *testing.T, user, pass string) *refusingProxy {
 				}
 				p.mu.Lock()
 				p.targets = append(p.targets, r.Method+" "+r.RequestURI)
-				authOK := r.Header.Get("Proxy-Authorization") == p.wantAuth
-				if !authOK {
+				auth := r.Header.Get("Proxy-Authorization")
+				authOK := auth == p.wantAuth
+				if authOK {
+					p.goodAuths[auth]++
+				} else {
 					p.badAuths++
 				}
-				ok := authOK && r.Method == http.MethodConnect && p.allowed[r.RequestURI]
-				p.mu.Unlock()
-				if ok {
-					fmt.Fprint(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
-					return
+				reply407 := !authOK && p.reply407
+				connect := authOK && r.Method == http.MethodConnect
+				to := ""
+				if connect {
+					to = p.forwards[r.RequestURI]
 				}
-				fmt.Fprint(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+				p.mu.Unlock()
+				switch {
+				case reply407:
+					fmt.Fprint(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"muse\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+				case to != "":
+					up, err := net.Dial("tcp", to)
+					if err != nil {
+						fmt.Fprint(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+						return
+					}
+					defer up.Close()
+					conn.SetDeadline(time.Time{})
+					fmt.Fprint(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+					done := make(chan struct{}, 2)
+					go func() { _, _ = io.Copy(up, conn); done <- struct{}{} }()
+					go func() { _, _ = io.Copy(conn, up); done <- struct{}{} }()
+					<-done
+				default:
+					fmt.Fprint(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+				}
 			}()
 		}
 	}()
@@ -266,6 +311,51 @@ type daemonRun struct {
 // network.
 func runDaemon(t *testing.T, proxy *refusingProxy, run daemonRun) ([]string, string) {
 	t.Helper()
+	d := startDaemon(t, run)
+	defer d.stop()
+	d.waitFor(t, proxy, 45*time.Second, "proxy never saw "+strconv.Quote(run.await), func(targets []string) bool {
+		return contains(targets, run.await)
+	})
+	d.stop()
+	targets, _ := proxy.snapshot()
+	return targets, d.out.String()
+}
+
+// runningDaemon is a child process running main().
+type runningDaemon struct {
+	cmd    *exec.Cmd
+	cancel context.CancelFunc
+	out    *syncBuffer
+	once   sync.Once
+}
+
+func (d *runningDaemon) stop() {
+	d.once.Do(func() {
+		d.cancel()
+		_ = d.cmd.Wait()
+	})
+}
+
+// waitFor polls cond with the proxy's targets until it holds, failing the
+// test with what after timeout.
+func (d *runningDaemon) waitFor(t *testing.T, proxy *refusingProxy, timeout time.Duration, what string, cond func(targets []string) bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		targets, _ := proxy.snapshot()
+		if cond(targets) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s; proxy saw %q\ndaemon output:\n%s", what, targets, d.out.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// startDaemon starts main() in a child process (see daemonRun).
+func startDaemon(t *testing.T, run daemonRun) *runningDaemon {
+	t.Helper()
 	home := t.TempDir()
 	sockDir, err := os.MkdirTemp("", "pdm")
 	if err != nil {
@@ -299,8 +389,7 @@ func runDaemon(t *testing.T, proxy *refusingProxy, run daemonRun) ([]string, str
 		"-motd-feed-url=",
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	cmd := exec.CommandContext(ctx, os.Args[0], args...)
 	cmd.Env = append([]string{
 		runMainEnv + "=1",
@@ -310,32 +399,16 @@ func runDaemon(t *testing.T, proxy *refusingProxy, run daemonRun) ([]string, str
 		"PILOT_NO_SKILLINJECT=1",
 		"PILOT_APPSTORE_ROOT=" + filepath.Join(home, "apps"),
 	}, run.env...)
-	var out syncBuffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out := &syncBuffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
 	if err := cmd.Start(); err != nil {
+		cancel()
 		t.Fatalf("start daemon: %v", err)
 	}
-	defer func() {
-		cancel()
-		_ = cmd.Wait()
-	}()
-
-	deadline := time.Now().Add(45 * time.Second)
-	for {
-		targets, _ := proxy.snapshot()
-		if contains(targets, run.await) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("proxy never saw %q; saw %q\ndaemon output:\n%s", run.await, targets, out.String())
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	cancel()
-	_ = cmd.Wait()
-	targets, _ := proxy.snapshot()
-	return targets, out.String()
+	d := &runningDaemon{cmd: cmd, cancel: cancel, out: out}
+	t.Cleanup(d.stop)
+	return d
 }
 
 func contains(list []string, s string) bool {

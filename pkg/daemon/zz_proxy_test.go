@@ -183,13 +183,31 @@ func TestResolveProxyRejectsMalformedSettings(t *testing.T) {
 // *.pilot.invalid (names that never resolve locally) to loopback and
 // records every request target.
 type proxyTestConnect struct {
-	ln       net.Listener
-	wantAuth string
+	ln net.Listener
 
-	mu      sync.Mutex
-	targets []string
-	live    []net.Conn
-	wg      sync.WaitGroup
+	mu       sync.Mutex
+	wantAuth string
+	targets  []string
+	denied   map[int]int // status -> count of refused requests
+	live     []net.Conn
+	wg       sync.WaitGroup
+}
+
+// setAuth makes the proxy accept only user:pass from now on (a credential
+// rotation); anything else gets 407.
+func (p *proxyTestConnect) setAuth(user, pass string) {
+	req := &http.Request{Header: http.Header{}}
+	req.SetBasicAuth(user, pass)
+	p.mu.Lock()
+	p.wantAuth = req.Header.Get("Authorization")
+	p.mu.Unlock()
+}
+
+// deniedWith returns how many requests the proxy refused with status.
+func (p *proxyTestConnect) deniedWith(status int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.denied[status]
 }
 
 func newProxyTestConnect(t *testing.T, user, pass string) *proxyTestConnect {
@@ -259,15 +277,22 @@ func (p *proxyTestConnect) serve(conn net.Conn) {
 	}
 	p.mu.Lock()
 	p.targets = append(p.targets, req.RequestURI)
+	wantAuth := p.wantAuth
 	p.mu.Unlock()
 	deny := func(code int) {
+		p.mu.Lock()
+		if p.denied == nil {
+			p.denied = map[int]int{}
+		}
+		p.denied[code]++
+		p.mu.Unlock()
 		fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", code, http.StatusText(code))
 	}
 	if req.Method != http.MethodConnect {
 		deny(http.StatusMethodNotAllowed)
 		return
 	}
-	if req.Header.Get("Proxy-Authorization") != p.wantAuth {
+	if req.Header.Get("Proxy-Authorization") != wantAuth {
 		deny(http.StatusProxyAuthRequired)
 		return
 	}
@@ -367,6 +392,20 @@ type proxiedBeacon struct {
 	srv    *httptest.Server
 	authed atomic.Uint32 // node ID of the last authenticated daemon
 	snis   chan string
+
+	mu    sync.Mutex
+	conns []*websocket.Conn
+}
+
+// dropAll closes every authenticated WSS connection (a beacon restart).
+func (b *proxiedBeacon) dropAll() {
+	b.mu.Lock()
+	conns := b.conns
+	b.conns = nil
+	b.mu.Unlock()
+	for _, c := range conns {
+		_ = c.CloseNow()
+	}
 }
 
 func startProxiedBeacon(t *testing.T, pool *x509.CertPool, lookup func(uint32) ([]byte, bool)) (*proxiedBeacon, string) {
@@ -429,6 +468,9 @@ func (b *proxiedBeacon) handle(w http.ResponseWriter, r *http.Request, lookup fu
 		return
 	}
 	b.authed.Store(reply.NodeID)
+	b.mu.Lock()
+	b.conns = append(b.conns, conn)
+	b.mu.Unlock()
 	for {
 		if _, _, err := conn.Read(r.Context()); err != nil {
 			return

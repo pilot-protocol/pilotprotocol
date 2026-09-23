@@ -9,29 +9,37 @@ import (
 	"os"
 	"strings"
 
+	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/netproxy"
 	registry "github.com/pilot-protocol/common/registry/client"
 	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 )
 
-// registryRoute is how pilotctl reaches the registry for its own commands
-// (lookup, register, rotate-key, the auto-handshake visibility check,
-// recovery, ...). It follows the same network the daemon uses, so nothing
-// pilotctl does bypasses an egress proxy:
+// registryRoute is one way pilotctl reaches the registry for its own
+// commands (lookup, register, rotate-key, the auto-handshake visibility
+// check, recovery, ...). planRegistryRoutes lists the routes to try, in
+// order, following the rules pilot-daemon applies, so pilotctl dials the
+// way the daemon on this host does:
 //
-//   - the proxy comes from $PILOT_PROXY, else config.json "proxy", else
-//     "auto" — the environment's HTTPS_PROXY / ALL_PROXY (honouring
-//     NO_PROXY). pilotctl is a short-lived client whose HTTP calls already
-//     follow HTTPS_PROXY, so auto applies whatever the daemon's transport;
-//     set proxy=off to dial directly. Loopback registries are never
-//     proxied.
-//   - the compiled-in raw-TCP registry (34.71.57.205:9000) is replaced by
-//     registry.pilotprotocol.network:443 over TLS when the registry would
-//     be proxied (proxies allow CONNECT to :443 only) or the transport is
-//     compat (UDP-blocked hosts are usually TCP-443-only too). That
-//     address always uses TLS, verified against the system roots, or
-//     pinned to registry_fingerprint / $PILOT_REGISTRY_FINGERPRINT when
-//     one is configured (sandboxes without a CA bundle).
+//   - proxy: $PILOT_PROXY, else config.json "proxy", else "auto". An
+//     explicit http(s):// URL proxies every registry dial (except
+//     loopback), whatever the transport; "off" never proxies. "auto" uses
+//     the environment's HTTPS_PROXY / ALL_PROXY (honoring NO_PROXY) only
+//     where the daemon would: when the transport is compat — the running
+//     daemon's (asked over IPC), else $PILOT_TRANSPORT / config.json. On a
+//     udp host that merely exports a proxy (corporate hosts, where private
+//     registries live) the registry is dialed directly, as the daemon
+//     does; with the transport unknown (no daemon, nothing configured) the
+//     direct dial comes first and the proxy is only the fallback for the
+//     production registry. A private raw-TCP registry is never sent to the
+//     environment's proxy unless the transport is compat.
+//   - address: the compiled-in raw-TCP registry (34.71.57.205:9000) is
+//     replaced by registry.pilotprotocol.network:443 over TLS whenever it
+//     would be proxied (proxies allow CONNECT to :443 only) or the
+//     transport is compat; a direct raw-TCP attempt falls back to that TLS
+//     registry. That address always uses TLS, verified against the system
+//     roots, or pinned to registry_fingerprint / $PILOT_REGISTRY_FINGERPRINT
+//     when one is configured (sandboxes without a CA bundle).
 type registryRoute struct {
 	Addr        string
 	TLS         bool
@@ -39,10 +47,6 @@ type registryRoute struct {
 	Proxy       *netproxy.Resolver
 	// Switched: Addr replaced the raw-TCP default.
 	Switched bool
-	// FallbackTLS: Addr is the raw-TCP default dialed directly; on failure
-	// dialRegistry retries the compat TLS registry (UDP- and TCP/9000-
-	// blocked hosts with direct TCP 443).
-	FallbackTLS bool
 }
 
 // proxied reports whether dialing r.Addr goes through a proxy.
@@ -52,13 +56,17 @@ func (r registryRoute) proxied() bool {
 
 // proxyFor returns the redacted proxy for target, "" for a direct dial.
 func (r registryRoute) proxyFor(target string) string {
-	if !r.Proxy.Enabled() {
+	return proxyFor(r.Proxy, target)
+}
+
+func proxyFor(p *netproxy.Resolver, target string) string {
+	if !p.Enabled() {
 		return ""
 	}
 	if host, _, err := net.SplitHostPort(target); err == nil && proxyconf.IsLoopbackHost(host) {
 		return ""
 	}
-	u, err := r.Proxy.ProxyForAddr(target)
+	u, err := p.ProxyForAddr(target)
 	if err != nil || u == nil {
 		return ""
 	}
@@ -91,6 +99,41 @@ func configuredTransport(cfg map[string]interface{}) string {
 	return t
 }
 
+// runningDaemonTransport asks the daemon on this host which transport it
+// runs ("udp" or "compat"); "" when no daemon answers or it predates the
+// info field. A test seam.
+var runningDaemonTransport = func() string {
+	d, err := driver.Connect(getSocket())
+	if err != nil {
+		return ""
+	}
+	defer d.Close()
+	info, err := d.Info()
+	if err != nil {
+		return ""
+	}
+	t, _ := info["transport"].(string)
+	switch t {
+	case "udp", "compat":
+		return t
+	}
+	return ""
+}
+
+// effectiveTransportFor is the transport the daemon on this host uses:
+// the running daemon's, else an explicitly configured udp or compat, else
+// "" (unknown: auto, or nothing configured and no daemon).
+func effectiveTransportFor(cfg map[string]interface{}) string {
+	if t := runningDaemonTransport(); t != "" {
+		return t
+	}
+	switch t := configuredTransport(cfg); t {
+	case "udp", "compat":
+		return t
+	}
+	return ""
+}
+
 // registryFingerprintSetting is $PILOT_REGISTRY_FINGERPRINT, else
 // config.json "registry_fingerprint" — used only when trust is pinned
 // ($PILOT_REGISTRY_TRUST / config.json "registry_trust", defaulting to
@@ -110,28 +153,87 @@ func registryFingerprintSetting(cfg map[string]interface{}) string {
 	return strings.TrimSpace(fp)
 }
 
-// planRegistryRoute resolves how to reach addr. The error is an invalid
-// proxy setting.
-func planRegistryRoute(addr string) (registryRoute, error) {
+// planRegistryRoutes returns the routes to reach addr, in the order to try
+// them (see registryRoute). The error is an invalid proxy setting.
+func planRegistryRoutes(addr string) ([]registryRoute, error) {
 	cfg := loadConfig()
-	policy, err := proxyconf.Resolve(pilotctlProxySpec(cfg))
+	spec, err := proxyconf.Normalize(pilotctlProxySpec(cfg))
 	if err != nil {
-		return registryRoute{}, err
+		return nil, err
 	}
-	r := registryRoute{Addr: strings.TrimSpace(addr), Proxy: policy}
-	if r.Addr == productionRegistryAddr {
-		if configuredTransport(cfg) == "compat" || r.proxyFor(compatRegistryAddr) != "" {
-			r.Addr = compatRegistryAddr
-			r.Switched = true
-		} else {
-			r.FallbackTLS = true
+	addr = strings.TrimSpace(addr)
+	fp := registryFingerprintSetting(cfg)
+	route := func(a string, p *netproxy.Resolver) registryRoute {
+		r := registryRoute{Addr: a, Proxy: p}
+		if strings.EqualFold(a, compatRegistryAddr) {
+			r.TLS, r.Fingerprint = true, fp
 		}
+		if a == compatRegistryAddr && addr == productionRegistryAddr {
+			r.Switched = true
+		}
+		return r
 	}
-	if strings.EqualFold(r.Addr, compatRegistryAddr) {
-		r.TLS = true
-		r.Fingerprint = registryFingerprintSetting(cfg)
+	isDefault := addr == productionRegistryAddr
+
+	var policy *netproxy.Resolver // the proxy that applies, nil = direct
+	var transport string
+	switch spec {
+	case proxyconf.Off:
+		transport = configuredTransport(cfg)
+	case proxyconf.Auto:
+		env, envErr := netproxy.FromEnvironment()
+		if envErr == nil && !env.Enabled() {
+			// No proxy in the environment: nothing to decide.
+			transport = configuredTransport(cfg)
+			break
+		}
+		transport = effectiveTransportFor(cfg)
+		if transport != "compat" && !(transport == "" && isDefault) {
+			// udp, or unknown with a private registry: direct only,
+			// exactly as the daemon dials. The environment's proxy is
+			// not even parsed, so a malformed one cannot matter.
+			break
+		}
+		if envErr != nil {
+			return nil, envErr
+		}
+		if transport == "compat" {
+			policy = env
+			break
+		}
+		// Unknown transport, production registry: direct raw TCP first,
+		// then the TLS registry through the environment's proxy.
+		tlsRoute := route(compatRegistryAddr, nil)
+		if proxyFor(env, compatRegistryAddr) != "" {
+			tlsRoute.Proxy = env
+		}
+		return []registryRoute{route(addr, nil), tlsRoute}, nil
+	default:
+		explicit, err := proxyconf.Resolve(spec)
+		if err != nil {
+			return nil, err
+		}
+		policy = explicit
+		transport = configuredTransport(cfg)
 	}
-	return r, nil
+
+	if isDefault {
+		if transport == "compat" || proxyFor(policy, compatRegistryAddr) != "" {
+			routes := []registryRoute{route(compatRegistryAddr, policy)}
+			if spec == proxyconf.Auto && proxyFor(policy, compatRegistryAddr) != "" {
+				routes = append(routes, route(compatRegistryAddr, nil))
+			}
+			return routes, nil
+		}
+		return []registryRoute{route(addr, policy), route(compatRegistryAddr, policy)}, nil
+	}
+	routes := []registryRoute{route(addr, policy)}
+	if spec == proxyconf.Auto && proxyFor(policy, addr) != "" {
+		// compat through the environment's proxy failed: the host may
+		// still reach the registry directly.
+		routes = append(routes, route(addr, nil))
+	}
+	return routes, nil
 }
 
 // dial opens the registry connection the route describes.
@@ -149,25 +251,27 @@ func (r registryRoute) dial() (*registry.Client, error) {
 	return registry.DialTLS(r.Addr, &tls.Config{MinVersion: tls.VersionTLS12}, opts...)
 }
 
-// dialRegistry connects to the registry at addr along its registryRoute,
-// retrying the compat TLS registry once when a direct dial of the raw-TCP
-// default fails. The returned route is the one that was tried last.
+// dialRegistry connects to the registry at addr along the first working
+// route of planRegistryRoutes. On failure the route and error reported are
+// the first proxied attempt's (a proxy refusing the CONNECT is the likely
+// cause), else the first attempt's.
 func dialRegistry(addr string) (*registry.Client, registryRoute, error) {
-	route, err := planRegistryRoute(addr)
+	routes, err := planRegistryRoutes(addr)
 	if err != nil {
-		return nil, route, err
+		return nil, registryRoute{}, err
 	}
-	rc, err := route.dial()
-	if err == nil || !route.FallbackTLS {
-		return rc, route, err
+	var failed registryRoute
+	var firstErr error
+	for i, route := range routes {
+		rc, err := route.dial()
+		if err == nil {
+			return rc, route, nil
+		}
+		if i == 0 || (route.proxied() && !failed.proxied()) {
+			failed, firstErr = route, err
+		}
 	}
-	fallback := route
-	fallback.Addr, fallback.TLS, fallback.Switched, fallback.FallbackTLS = compatRegistryAddr, true, true, false
-	fallback.Fingerprint = registryFingerprintSetting(loadConfig())
-	if rc, ferr := fallback.dial(); ferr == nil {
-		return rc, fallback, nil
-	}
-	return nil, route, err
+	return nil, failed, firstErr
 }
 
 // registryDialHint says what to check after a failed registry dial.

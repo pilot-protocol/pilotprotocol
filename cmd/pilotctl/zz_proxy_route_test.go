@@ -163,59 +163,106 @@ func TestCLIDaemonStartCredProxyBeatsConfigAuto(t *testing.T) {
 	}
 }
 
-func TestPlanRegistryRoute(t *testing.T) {
+// routeSpec renders a route for comparison: "addr[/tls][/pin][ via proxy]".
+func routeSpec(r registryRoute) string {
+	s := r.Addr
+	if r.TLS {
+		s += "/tls"
+	}
+	if r.Fingerprint != "" {
+		s += "/pin"
+	}
+	if p := r.proxyFor(r.Addr); p != "" {
+		s += " via proxy"
+	}
+	return s
+}
+
+func TestPlanRegistryRoutes(t *testing.T) {
 	const fp = "c1f958f6bcff667cf6a08d5066cc031a9086115a7667835877ca62a3019b3da9"
+	const (
+		raw      = productionRegistryAddr
+		tlsReg   = compatRegistryAddr + "/tls"
+		tlsProxy = compatRegistryAddr + "/tls via proxy"
+	)
 	for _, tc := range []struct {
-		name     string
-		addr     string
-		env      map[string]string
-		cfg      map[string]interface{}
-		wantAddr string
-		wantTLS  bool
-		proxied  bool
-		wantFP   string
+		name   string
+		addr   string
+		env    map[string]string
+		cfg    map[string]interface{}
+		daemon string // transport the running daemon reports
+		want   []string
 	}{
-		{name: "plain host: raw default, direct", addr: productionRegistryAddr,
-			wantAddr: productionRegistryAddr},
-		{name: "HTTPS_PROXY: compat TLS registry through the proxy", addr: productionRegistryAddr,
-			env:      map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
-			wantAddr: compatRegistryAddr, wantTLS: true, proxied: true},
-		{name: "config transport=compat, no proxy: compat TLS registry direct", addr: productionRegistryAddr,
-			cfg:      map[string]interface{}{"transport": "compat"},
-			wantAddr: compatRegistryAddr, wantTLS: true},
-		{name: "PILOT_PROXY=off beats HTTPS_PROXY", addr: productionRegistryAddr,
-			env:      map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "PILOT_PROXY": "off"},
-			wantAddr: productionRegistryAddr},
-		{name: "config proxy=none", addr: productionRegistryAddr,
-			env:      map[string]string{"HTTPS_PROXY": "http://egress.test:3128"},
-			cfg:      map[string]interface{}{"proxy": "none"},
-			wantAddr: productionRegistryAddr},
-		// NO_PROXY exempts the TLS registry's name, so the raw default is
-		// kept; the raw IP itself is not exempt and still goes via the proxy.
-		{name: "NO_PROXY exempts the TLS registry name", addr: productionRegistryAddr,
-			env:      map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "NO_PROXY": ".pilotprotocol.network"},
-			wantAddr: productionRegistryAddr, proxied: true},
-		{name: "NO_PROXY exempting both", addr: productionRegistryAddr,
-			env:      map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "NO_PROXY": ".pilotprotocol.network,34.71.57.205"},
-			wantAddr: productionRegistryAddr},
+		{name: "plain host: raw default, then the TLS registry", addr: raw,
+			want: []string{raw, tlsReg}},
+		{name: "HTTPS_PROXY, transport unknown: direct first, proxied TLS fallback", addr: raw,
+			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
+			want: []string{raw, tlsProxy}},
+		{name: "HTTPS_PROXY + config compat: proxied TLS, then direct TLS", addr: raw,
+			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
+			cfg:  map[string]interface{}{"transport": "compat"},
+			want: []string{tlsProxy, tlsReg}},
+		{name: "HTTPS_PROXY + running compat daemon (Muse)", addr: raw,
+			env:    map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
+			cfg:    map[string]interface{}{"transport": "auto"},
+			daemon: "compat",
+			want:   []string{tlsProxy, tlsReg}},
+		{name: "HTTPS_PROXY + running udp daemon: direct like the daemon", addr: raw,
+			env:    map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
+			daemon: "udp",
+			want:   []string{raw, tlsReg}},
+		{name: "running daemon beats config", addr: raw,
+			env:    map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
+			cfg:    map[string]interface{}{"transport": "compat"},
+			daemon: "udp",
+			want:   []string{raw, tlsReg}},
+		// pilotctl-auto-proxy-regardless-of-transport: a private raw-TCP
+		// registry on a udp (or unknown) host is dialed directly, as the
+		// daemon does, even with HTTPS_PROXY exported.
+		{name: "private registry + HTTPS_PROXY, transport unknown: direct", addr: "10.0.5.120:39000",
+			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
+			want: []string{"10.0.5.120:39000"}},
+		{name: "private registry + HTTPS_PROXY + udp: direct", addr: "10.0.5.120:39000",
+			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128", "PILOT_TRANSPORT": "udp"},
+			want: []string{"10.0.5.120:39000"}},
+		{name: "private registry + compat: proxied, then direct", addr: "registry.corp.test:9000",
+			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128", "PILOT_TRANSPORT": "compat"},
+			want: []string{"registry.corp.test:9000 via proxy", "registry.corp.test:9000"}},
+		{name: "config transport=compat, no proxy: TLS direct", addr: raw,
+			cfg:  map[string]interface{}{"transport": "compat"},
+			want: []string{tlsReg}},
+		{name: "explicit PILOT_PROXY URL: proxied TLS in any transport", addr: raw,
+			env:  map[string]string{"PILOT_PROXY": "http://u:p@corp.test:3128", "PILOT_TRANSPORT": "udp"},
+			want: []string{tlsProxy}},
+		{name: "explicit config proxy URL + private registry: proxied", addr: "registry.corp.test:9000",
+			cfg:  map[string]interface{}{"proxy": "http://corp.test:3128"},
+			want: []string{"registry.corp.test:9000 via proxy"}},
+		{name: "PILOT_PROXY=off beats HTTPS_PROXY", addr: raw,
+			env:  map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "PILOT_PROXY": "off", "PILOT_TRANSPORT": "compat"},
+			want: []string{tlsReg}},
+		{name: "config proxy=none", addr: raw,
+			env:  map[string]string{"HTTPS_PROXY": "http://egress.test:3128"},
+			cfg:  map[string]interface{}{"proxy": "none"},
+			want: []string{raw, tlsReg}},
+		{name: "NO_PROXY exempts the TLS registry name (compat)", addr: raw,
+			env:  map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "NO_PROXY": ".pilotprotocol.network", "PILOT_TRANSPORT": "compat"},
+			want: []string{tlsReg}},
 		{name: "loopback registry never proxied", addr: "127.0.0.1:9000",
-			env:      map[string]string{"HTTPS_PROXY": "http://egress.test:3128"},
-			wantAddr: "127.0.0.1:9000"},
-		{name: "custom registry proxied as is", addr: "registry.corp.test:9000",
-			env:      map[string]string{"HTTPS_PROXY": "http://egress.test:3128"},
-			wantAddr: "registry.corp.test:9000", proxied: true},
-		{name: "fingerprint from env pins", addr: productionRegistryAddr,
-			env:      map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "PILOT_REGISTRY_FINGERPRINT": fp},
-			wantAddr: compatRegistryAddr, wantTLS: true, proxied: true, wantFP: fp},
+			env:  map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "PILOT_TRANSPORT": "compat"},
+			want: []string{"127.0.0.1:9000"}},
+		{name: "fingerprint from env pins", addr: raw,
+			env:  map[string]string{"HTTPS_PROXY": "http://egress.test:3128", "PILOT_REGISTRY_FINGERPRINT": fp, "PILOT_TRANSPORT": "compat"},
+			want: []string{compatRegistryAddr + "/tls/pin via proxy", compatRegistryAddr + "/tls/pin"}},
 		{name: "fingerprint from config, trust=system wins", addr: compatRegistryAddr,
-			cfg:      map[string]interface{}{"registry_fingerprint": fp, "registry_trust": "system"},
-			wantAddr: compatRegistryAddr, wantTLS: true},
+			cfg:  map[string]interface{}{"registry_fingerprint": fp, "registry_trust": "system"},
+			want: []string{tlsReg}},
 		{name: "fingerprint from config pins", addr: compatRegistryAddr,
-			cfg:      map[string]interface{}{"registry_fingerprint": fp},
-			wantAddr: compatRegistryAddr, wantTLS: true, wantFP: fp},
+			cfg:  map[string]interface{}{"registry_fingerprint": fp},
+			want: []string{compatRegistryAddr + "/tls/pin"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			withTransportEnvCleared(t)
+			stubDaemonTransport(t, tc.daemon)
 			for _, k := range []string{"HTTPS_PROXY", "NO_PROXY", "PILOT_PROXY", "PILOT_REGISTRY_FINGERPRINT", "PILOT_REGISTRY_TRUST", "PILOT_TRANSPORT"} {
 				t.Setenv(k, tc.env[k])
 			}
@@ -224,23 +271,55 @@ func TestPlanRegistryRoute(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			r, err := planRegistryRoute(tc.addr)
+			routes, err := planRegistryRoutes(tc.addr)
 			if err != nil {
-				t.Fatalf("planRegistryRoute: %v", err)
+				t.Fatalf("planRegistryRoutes: %v", err)
 			}
-			if r.Addr != tc.wantAddr || r.TLS != tc.wantTLS || r.proxied() != tc.proxied || r.Fingerprint != tc.wantFP {
-				t.Errorf("route = {Addr:%s TLS:%v proxied:%v FP:%q}, want {%s %v %v %q}",
-					r.Addr, r.TLS, r.proxied(), r.Fingerprint, tc.wantAddr, tc.wantTLS, tc.proxied, tc.wantFP)
+			var got []string
+			for _, r := range routes {
+				got = append(got, routeSpec(r))
+			}
+			if strings.Join(got, " | ") != strings.Join(tc.want, " | ") {
+				t.Errorf("routes = %q, want %q", got, tc.want)
 			}
 		})
 	}
 	t.Run("invalid proxy setting", func(t *testing.T) {
 		withTransportEnvCleared(t)
 		t.Setenv("PILOT_PROXY", "proxy.test:3128")
-		if _, err := planRegistryRoute(productionRegistryAddr); err == nil {
+		if _, err := planRegistryRoutes(productionRegistryAddr); err == nil {
 			t.Error("bare host:port proxy accepted")
 		}
 	})
+	t.Run("malformed HTTPS_PROXY does not matter on udp", func(t *testing.T) {
+		withTransportEnvCleared(t)
+		t.Setenv("HTTPS_PROXY", "ftp://u:p@egress.test")
+		t.Setenv("PILOT_TRANSPORT", "udp")
+		if _, err := planRegistryRoutes("10.0.5.120:39000"); err != nil {
+			t.Errorf("udp + malformed HTTPS_PROXY: %v", err)
+		}
+	})
+}
+
+// pilotctl-auto-proxy-regardless-of-transport, end to end: a LAN registry
+// that worked directly on v1.13.9 still works with HTTPS_PROXY exported on a
+// udp host, and the proxy sees nothing.
+func TestPrivateRegistryDialedDirectlyWithProxyExported(t *testing.T) {
+	r := newFakeRegistry(t)
+	r.onOK("lookup", map[string]interface{}{"node_id": float64(1), "address": "0:0000.0000.0001", "public": true})
+	proxyURL, targets := connectProxyToLoopback(t, "muse", "s3cret")
+	env := cliEnvCleared(map[string]string{
+		"PILOT_REGISTRY": r.addr(),
+		"HTTPS_PROXY":    proxyURL,
+		"PILOT_SOCKET":   filepath.Join(t.TempDir(), "none.sock"),
+	})
+	stdout, stderr, code := runCLI(t, []string{"--json", "lookup", "1"}, env)
+	if code != 0 || !strings.Contains(stdout, "0:0000.0000.0001") {
+		t.Fatalf("pilotctl lookup: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if got := targets(); len(got) != 0 {
+		t.Fatalf("the proxy was used for a direct-reachable private registry: %q", got)
+	}
 }
 
 // connectProxyToLoopback is an authenticating CONNECT proxy that routes
@@ -309,6 +388,7 @@ func TestRegistryCommandsUseTheProxy(t *testing.T) {
 
 	withTransportEnvCleared(t)
 	t.Setenv("HTTPS_PROXY", proxyURL)
+	stubDaemonTransport(t, "compat") // a compat daemon runs: the proxy applies
 	rc, route, err := dialRegistry(regAddr)
 	if err != nil {
 		t.Fatalf("dialRegistry through the proxy: %v", err)
@@ -326,8 +406,10 @@ func TestRegistryCommandsUseTheProxy(t *testing.T) {
 
 	// The CLI path too: `pilotctl lookup` in a child process.
 	stdout, stderr, code := runCLI(t, []string{"--json", "lookup", "99"}, cliEnvCleared(map[string]string{
-		"PILOT_REGISTRY": regAddr,
-		"HTTPS_PROXY":    proxyURL,
+		"PILOT_REGISTRY":  regAddr,
+		"HTTPS_PROXY":     proxyURL,
+		"PILOT_TRANSPORT": "compat",
+		"PILOT_SOCKET":    filepath.Join(t.TempDir(), "none.sock"),
 	}))
 	if code != 0 || !strings.Contains(stdout, "0:0000.0000.0063") {
 		t.Fatalf("pilotctl lookup via proxy: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
@@ -381,5 +463,58 @@ time=x level=INFO msg="outbound network" transport=compat proxy="auto: http://**
 	}
 	if got, auto := effectiveTransport("compat", filepath.Join(dir, "missing")); got != "compat" || auto {
 		t.Errorf("no log: (%q, %v)", got, auto)
+	}
+}
+
+// version-skew-config-transport-auto-bricks-older-daemon: after
+// `pilotctl update --pin <older tag>`, a config.json "transport":"auto"
+// that the installed (older) daemon would refuse is rewritten to udp; a
+// daemon that knows auto, or any other value, is left alone.
+func TestFitTransportToDaemon(t *testing.T) {
+	withTransportEnvCleared(t)
+	dir := t.TempDir()
+	v1139 := writeFakeDaemon(t, append([]string{v1139TransportUsage}, baseDaemonFlags...), filepath.Join(dir, "v1139"))
+	current := writeFakeDaemon(t, append([]string{autoUsage, "proxy"}, baseDaemonFlags...), filepath.Join(dir, "cur"))
+
+	if err := saveConfig(map[string]interface{}{"transport": "auto", "email": "a@b.c"}); err != nil {
+		t.Fatal(err)
+	}
+	if note := fitTransportToDaemon(current); note != "" {
+		t.Errorf("current daemon: note %q, want none", note)
+	}
+	if got := loadConfig()["transport"]; got != "auto" {
+		t.Errorf("current daemon: transport = %v, want auto kept", got)
+	}
+	if note := fitTransportToDaemon(v1139); !strings.Contains(note, "transport set to udp") {
+		t.Errorf("v1.13.9 daemon: note %q", note)
+	}
+	cfg := loadConfig()
+	if cfg["transport"] != "udp" || cfg["email"] != "a@b.c" {
+		t.Errorf("v1.13.9 daemon: config = %v, want transport=udp and the rest kept", cfg)
+	}
+	if err := saveConfig(map[string]interface{}{"transport": "compat"}); err != nil {
+		t.Fatal(err)
+	}
+	if note := fitTransportToDaemon(v1139); note != "" || loadConfig()["transport"] != "compat" {
+		t.Errorf("compat config changed for v1.13.9: note %q", note)
+	}
+}
+
+// `config --set transport=` removes the key (the default, auto from
+// pilotctl, applies again) instead of storing "" for a daemon to read.
+func TestConfigSetEmptyClearsTransportKeys(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	env := cliEnvCleared(map[string]string{"PILOT_HOME": home})
+	for _, kv := range []string{"transport=compat", "proxy=off", "proxy_cmd=cat /run/proxy-url", "transport=", "proxy=", "proxy_cmd="} {
+		if _, stderr, code := runCLI(t, []string{"config", "--set", kv}, env); code != 0 {
+			t.Fatalf("config --set %s: exit=%d stderr=%s", kv, code, stderr)
+		}
+	}
+	raw, _ := os.ReadFile(filepath.Join(home, ".pilot", "config.json"))
+	for _, key := range []string{`"transport"`, `"proxy"`, `"proxy_cmd"`} {
+		if strings.Contains(string(raw), key) {
+			t.Errorf("config.json still has %s: %s", key, raw)
+		}
 	}
 }

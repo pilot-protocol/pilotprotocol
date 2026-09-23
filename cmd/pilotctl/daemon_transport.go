@@ -39,9 +39,34 @@ var daemonForwardEnv = []string{
 	"HTTP_PROXY", "http_proxy",
 	"ALL_PROXY", "all_proxy",
 	"NO_PROXY", "no_proxy",
-	"PILOT_PROXY", "PILOT_TRANSPORT",
+	"PILOT_PROXY", "PILOT_PROXY_CMD", "PILOT_TRANSPORT",
 	"PILOT_REGISTRY_TRUST", "PILOT_REGISTRY_FINGERPRINT",
 	"SSL_CERT_FILE", "SSL_CERT_DIR",
+}
+
+// clearableConfigKeys are the config.json keys `config --set key=` removes
+// instead of storing an empty string.
+var clearableConfigKeys = map[string]bool{"transport": true, "proxy": true, "proxy_cmd": true}
+
+// fitTransportToDaemon keeps config.json usable by the pilot-daemon at bin
+// after a downgrade (`pilotctl update --pin <older tag>`): a daemon that
+// predates -transport=auto refuses to start with "transport":"auto" in
+// config.json, and the pilotctl installed with it never overrides the
+// value. Such a config gets transport=udp, the older daemon's default. It
+// returns a note for the user, "" when nothing changed.
+func fitTransportToDaemon(bin string) string {
+	cfg := loadConfig()
+	if t, _ := cfg["transport"].(string); !strings.EqualFold(strings.TrimSpace(t), "auto") {
+		return ""
+	}
+	if ok, known := daemonSupportsAutoTransport(bin); ok || !known {
+		return ""
+	}
+	cfg["transport"] = "udp"
+	if err := saveConfig(cfg); err != nil {
+		return fmt.Sprintf("the installed pilot-daemon does not support transport=auto (config.json); set it with: pilotctl config --set transport=udp (%v)", err)
+	}
+	return "the installed pilot-daemon predates transport=auto: config.json transport set to udp (after upgrading: pilotctl config --set transport=)"
 }
 
 // normalizeTransport lower-cases and validates a transport: udp, compat or

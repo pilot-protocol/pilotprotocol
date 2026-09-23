@@ -123,37 +123,51 @@ func compatKeepsRegistry(r registrySettings) bool {
 	return r.AddrExplicit && strings.TrimSpace(r.Addr) != defaultRegistryAddr
 }
 
-// applyRegistryDefaults adapts the registry to the final transport:
+// applyRegistryDefaults adapts the registry to the final transport and
+// proxy policy (proxied reports whether a TCP dial of an address goes
+// through the proxy; nil: never):
 //
-//   - compat: the registry moves to its TLS host name on :443 unless
-//     compatKeepsRegistry, and TLS is on unless -registry-tls was chosen;
-//   - either transport: the compat registry address (registry.
-//     pilotprotocol.network:443) is TLS-only, so TLS is on for it unless
+//   - the compiled-in raw-TCP registry moves to its TLS host name on :443
+//     (compatRegistryAddr) unless compatKeepsRegistry, in compat mode and
+//     also in udp mode when the registry dial would go through a proxy —
+//     egress proxies CONNECT to :443 only (pilotctl's registry route
+//     applies the same rule);
+//   - TLS is then on unless -registry-tls was chosen; compatRegistryAddr
+//     is TLS-only, so TLS is on for it in either transport unless
 //     -registry-tls was chosen — an install switched back from compat to
 //     udp keeps working;
-//   - whenever TLS was turned on here and -registry-trust was not chosen,
-//     trust is "pinned" when a -registry-fingerprint is configured (the
-//     fallback for sandboxes without a CA bundle) and "system" otherwise
-//     (the production registry has a Let's Encrypt certificate).
+//   - whenever the registry uses TLS in compat mode or on
+//     compatRegistryAddr and -registry-trust was not chosen, trust is
+//     "pinned" when a -registry-fingerprint is configured (the fallback
+//     for sandboxes without a CA bundle) and "system" otherwise (the
+//     production registry has a Let's Encrypt certificate) — also when
+//     -registry-tls itself was explicit, as before -proxy existed.
 //
 // Choices made in config.json or the environment count as explicit, so a
 // pinned registry configured there is never overridden.
-func applyRegistryDefaults(transport string, r registrySettings) registrySettings {
-	tlsDefaulted := false
-	if transport == daemon.TransportCompat {
-		if !compatKeepsRegistry(r) {
-			r.Addr = compatRegistryAddr
-		}
+func applyRegistryDefaults(transport string, r registrySettings, proxied func(addr string) bool) registrySettings {
+	moveRegistry := false
+	switch {
+	case compatKeepsRegistry(r):
+	case transport == daemon.TransportCompat:
+		moveRegistry = true
+	case proxied != nil && proxied(r.Addr):
+		moveRegistry = true
+	}
+	if moveRegistry {
+		r.Addr = compatRegistryAddr
 		if !r.TLSExplicit {
 			r.TLS = true
-			tlsDefaulted = true
 		}
 	}
-	if strings.EqualFold(strings.TrimSpace(r.Addr), compatRegistryAddr) && !r.TLSExplicit && !r.TLS {
+	onCompatAddr := strings.EqualFold(strings.TrimSpace(r.Addr), compatRegistryAddr)
+	if transport == daemon.TransportCompat && !r.TLSExplicit {
 		r.TLS = true
-		tlsDefaulted = true
 	}
-	if tlsDefaulted && !r.TrustExplicit {
+	if onCompatAddr && !r.TLSExplicit {
+		r.TLS = true
+	}
+	if r.TLS && !r.TrustExplicit && (transport == daemon.TransportCompat || onCompatAddr) {
 		if strings.TrimSpace(r.Fingerprint) != "" {
 			r.Trust = "pinned"
 		} else {
@@ -183,24 +197,20 @@ var autoProbe = daemon.SelectTransport
 
 // resolveAutoTransport decides -transport=auto (see daemon.SelectTransport)
 // for this configuration: compat is only considered when it would reach
-// the same network (autoCompatBlocker), and its TCP check runs through the
-// proxy compat mode would use (-proxy, auto = the environment's). The error
-// is a malformed -proxy.
-func resolveAutoTransport(reg registrySettings, beacon string, beaconExplicit bool, compatBeacon string, compatBeaconExplicit bool, proxySpec string) (mode, reason string, err error) {
+// the same network (autoCompatBlocker), and its beacon check runs through
+// the proxy compat mode would use (policyFor(compat): -proxy / -proxy-cmd,
+// auto = the environment's). The error is a malformed -proxy.
+func resolveAutoTransport(reg registrySettings, beacon string, beaconExplicit bool, compatBeacon string, compatBeaconExplicit bool, policyFor func(transport string) (*proxyconf.Policy, error)) (mode, reason string, err error) {
 	if why := autoCompatBlocker(reg, beacon, beaconExplicit, compatBeaconExplicit); why != "" {
 		return daemon.TransportUDP, why + "; auto stays on udp (pass -transport=compat to force compat)", nil
 	}
-	policy, err := daemon.ResolveProxy(proxySpec, daemon.TransportCompat)
+	policy, err := policyFor(daemon.TransportCompat)
 	if err != nil {
-		if !isAutoProxy(proxySpec) {
-			return "", "", err
-		}
-		slog.Warn("proxy environment is malformed; the compat check dials directly", "err", err)
-		policy = nil
+		return "", "", err
 	}
 	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	if policy.Enabled() {
-		dial = proxyconf.DialContext(policy, nil)
+		dial = policy.DialContext(nil)
 	}
 	mode, reason = autoProbe(context.Background(), daemon.AutoTransportProbe{
 		BeaconAddr:      beacon,
@@ -208,4 +218,26 @@ func resolveAutoTransport(reg registrySettings, beacon string, beaconExplicit bo
 		Dial:            dial,
 	})
 	return mode, reason, nil
+}
+
+// transportDefaultEnv names the transport a daemon uses when neither
+// -transport, $PILOT_TRANSPORT nor config.json chooses one. install.sh sets
+// it to auto in the service units it writes: unlike -transport=auto on the
+// command line or "transport":"auto" in config.json, a daemon that predates
+// auto (after a downgrade) ignores it instead of refusing to start.
+const transportDefaultEnv = "PILOT_TRANSPORT_DEFAULT"
+
+// defaultTransport is $PILOT_TRANSPORT_DEFAULT when it names a transport,
+// else udp.
+func defaultTransport() string {
+	v := strings.TrimSpace(getenv(transportDefaultEnv))
+	if v == "" {
+		return daemon.TransportUDP
+	}
+	t, err := daemon.NormalizeTransport(v)
+	if err != nil || t == "" {
+		slog.Warn("ignoring unknown "+transportDefaultEnv+" value", "value", v, "valid", "udp, compat, auto")
+		return daemon.TransportUDP
+	}
+	return t
 }

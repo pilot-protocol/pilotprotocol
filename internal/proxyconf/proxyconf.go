@@ -139,17 +139,9 @@ func IsLoopbackHost(host string) bool {
 // RequestProxy returns an http.Transport.Proxy function that follows r but
 // never proxies loopback targets. nil for a nil resolver (net/http's own
 // environment handling then applies wherever the caller leaves Proxy
-// unset).
+// unset). It is Static(r).RequestProxy().
 func RequestProxy(r *netproxy.Resolver) func(*http.Request) (*url.URL, error) {
-	if r == nil {
-		return nil
-	}
-	return func(req *http.Request) (*url.URL, error) {
-		if req != nil && req.URL != nil && IsLoopbackHost(req.URL.Hostname()) {
-			return nil, nil
-		}
-		return r.ProxyForRequest(req)
-	}
+	return Static(r).RequestProxy()
 }
 
 // DialContext returns a dial function that tunnels through the proxy r
@@ -157,16 +149,10 @@ func RequestProxy(r *netproxy.Resolver) func(*http.Request) (*url.URL, error) {
 // dials loopback targets, and targets r does not proxy, directly.
 // proxyTLS configures the TLS session with an https:// proxy — never the
 // target's TLS, which the caller runs end to end over the returned conn;
-// nil verifies the proxy against the system roots.
+// nil verifies the proxy against the system roots. It is
+// Static(r).DialContext(proxyTLS).
 func DialContext(r *netproxy.Resolver, proxyTLS *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	d := &netproxy.Dialer{Resolver: r, TLSConfig: proxyTLS}
-	var direct net.Dialer
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if host, _, err := net.SplitHostPort(addr); err == nil && IsLoopbackHost(host) {
-			return direct.DialContext(ctx, network, addr)
-		}
-		return d.DialContext(ctx, network, addr)
-	}
+	return Static(r).DialContext(proxyTLS)
 }
 
 // unwrapNetproxy drops netproxy's "netproxy: " prefix for messages that

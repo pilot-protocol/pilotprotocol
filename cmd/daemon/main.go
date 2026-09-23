@@ -115,6 +115,7 @@ func main() {
 	// credentials.
 	transportMode := flag.String("transport", "", "tunnel transport: 'udp' (the default), 'compat' (registry over TLS and beacon over WSS, TCP 443 only, for UDP-blocked or proxy-only hosts) or 'auto' (udp when the beacon answers over UDP, otherwise compat when TCP 443 is reachable, through the proxy if there is one). Precedence: this flag, $PILOT_TRANSPORT, config.json \"transport\", udp.")
 	proxySpec := flag.String("proxy", "", "outbound proxy for registry, beacon and HTTP connections: 'auto' (the default: with compat, HTTPS_PROXY/ALL_PROXY from the environment, honoring NO_PROXY; nothing with udp), 'off' (also none, no, false, direct), or an http:// or https:// proxy URL, http://[user:pass@]host:port, used for every connection except loopback. Precedence: this flag, $PILOT_PROXY, config.json \"proxy\", auto.")
+	proxyCmd := flag.String("proxy-cmd", "", "command (run with /bin/sh -c) whose output is the current proxy URL, for egress proxies that rotate their credentials: it supplies the URL -proxy would use (the explicit URL, or with auto the environment's proxy) and is re-run every 60s and whenever the proxy answers 407, so new connections always carry fresh credentials. Example: bash -c 'printf %s \"$https_proxy\"'. Precedence: this flag, $PILOT_PROXY_CMD, config.json \"proxy_cmd\".")
 	compatBeacon := flag.String("compat-beacon", defaultCompatBeacon, "beacon WSS URL for -transport=compat")
 	tlsTrust := flag.String("tls-trust", "system", "TLS trust store for -transport=compat: 'system' (OS trust store; current default while compat mode uses Let's Encrypt certs on beacon.pilotprotocol.network — on a host without a CA bundle set SSL_CERT_FILE or SSL_CERT_DIR) or 'pinned' (Pilot CA root embedded in the daemon binary; will become the default in a future release once production root ships)")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -187,6 +188,7 @@ func main() {
 	var transportSrc string
 	*transportMode, transportSrc = sources.envOverConfig("transport", *transportMode, "PILOT_TRANSPORT")
 	*proxySpec, _ = sources.envOverConfig("proxy", *proxySpec, "PILOT_PROXY")
+	*proxyCmd, _ = sources.envOverConfig("proxy-cmd", *proxyCmd, "PILOT_PROXY_CMD")
 	var trustSrc string
 	*registryTrust, trustSrc = sources.envOverConfig("registry-trust", *registryTrust, "PILOT_REGISTRY_TRUST")
 	*registryFingerprint, _ = sources.envOverConfig("registry-fingerprint", *registryFingerprint, "PILOT_REGISTRY_FINGERPRINT")
@@ -205,10 +207,29 @@ func main() {
 		log.Fatalf("-transport: %v", err)
 	}
 	if transport == "" {
-		transport = daemon.TransportUDP
+		// Nothing chosen: $PILOT_TRANSPORT_DEFAULT (auto in the service
+		// units install.sh writes), else udp.
+		transport = defaultTransport()
+		if strings.TrimSpace(getenv(transportDefaultEnv)) != "" {
+			transportSrc = transportDefaultEnv
+		}
 	}
 	if _, err := proxyconf.Normalize(*proxySpec); err != nil {
 		log.Fatalf("-proxy: %v", err)
+	}
+	// The proxy policy depends on the transport only; each is resolved
+	// once (running -proxy-cmd once) and shared by the auto probe and the
+	// daemon.
+	proxyPolicies := map[string]*proxyconf.Policy{}
+	policyFor := func(transport string) (*proxyconf.Policy, error) {
+		if p, ok := proxyPolicies[transport]; ok {
+			return p, nil
+		}
+		p, err := resolveProxyPolicy(*proxySpec, *proxyCmd, transport)
+		if err == nil {
+			proxyPolicies[transport] = p
+		}
+		return p, err
 	}
 
 	reg := registrySettings{
@@ -224,7 +245,7 @@ func main() {
 	// -transport=auto: probe once, before anything depends on the mode.
 	if transport == daemon.TransportAuto {
 		mode, reason, err := resolveAutoTransport(reg, *beaconAddr, sources.explicit("beacon") || beaconFromEnv,
-			*compatBeacon, sources.explicit("compat-beacon"), *proxySpec)
+			*compatBeacon, sources.explicit("compat-beacon"), policyFor)
 		if err != nil {
 			log.Fatalf("-proxy: %v", err)
 		}
@@ -233,14 +254,24 @@ func main() {
 	}
 	*transportMode = transport
 
-	// Registry defaults for the transport (see applyRegistryDefaults):
-	// compat moves the compiled-in raw-TCP registry to
-	// registry.pilotprotocol.network:443 over TLS, so the daemon really
-	// uses a single port; an explicit non-default -registry, or an
-	// explicit -registry-tls=false (the TCP/9000 fallback), is kept.
-	// -beacon needs no such rule: in compat mode the UDP beacon address is
-	// only the relay-wrap destination on the WSS pipe and is never dialed.
-	final := applyRegistryDefaults(transport, reg)
+	// Outbound proxy: resolved once, after -transport is final, and shared
+	// by everything that dials out — the registry client, the compat WSS
+	// beacon, pkg/daemon's own HTTP fetches (via daemon.Config.ProxyPolicy)
+	// and every plugin HTTP client (via http.DefaultTransport).
+	proxyPolicy, err := policyFor(transport)
+	if err != nil {
+		log.Fatalf("-proxy: %v", err)
+	}
+
+	// Registry defaults for the transport and proxy (see
+	// applyRegistryDefaults): compat, or a proxied registry dial, moves
+	// the compiled-in raw-TCP registry to registry.pilotprotocol.network:443
+	// over TLS, so the daemon really uses a single port that a CONNECT
+	// proxy carries; an explicit non-default -registry, or an explicit
+	// -registry-tls=false (the TCP/9000 fallback), is kept. -beacon needs
+	// no such rule: in compat mode the UDP beacon address is only the
+	// relay-wrap destination on the WSS pipe and is never dialed.
+	final := applyRegistryDefaults(transport, reg, proxyPolicy.Proxies)
 	if final.Addr != reg.Addr {
 		registryFromEnv = false
 	}
@@ -276,14 +307,6 @@ func main() {
 	*noSkillinject = profileOptions.DisableSkillinject
 	*motdFeedURL = profileOptions.MOTDFeedURL
 
-	// Outbound proxy: resolved once, after -transport is final, and shared
-	// by everything that dials out — the registry client, the compat WSS
-	// beacon, pkg/daemon's own HTTP fetches (via daemon.Config.Proxy) and
-	// every plugin HTTP client (via http.DefaultTransport).
-	proxyPolicy, err := resolveProxyPolicy(*proxySpec, *transportMode)
-	if err != nil {
-		log.Fatalf("-proxy: %v", err)
-	}
 	installDefaultTransportProxy(proxyPolicy)
 	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyPolicy),
 		"transport_from", transportSrc, "registry", *registryAddr, "registry_tls", *registryTLS)
@@ -381,7 +404,7 @@ func main() {
 		TransportMode:         *transportMode,
 		CompatBeaconURL:       *compatBeacon,
 		CompatTLSTrust:        *tlsTrust,
-		Proxy:                 proxyPolicy,
+		ProxyPolicy:           proxyPolicy,
 		MOTDFeedURL:           *motdFeedURL,
 		MOTDInterval:          *motdInterval,
 		TelemetryURL:          *telemetryURL,

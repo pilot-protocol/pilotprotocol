@@ -12,7 +12,8 @@ set -e
 #   UDP blocked /   curl -fsSL https://pilotprotocol.network/install.sh | sh
 #   HTTPS proxy:    (nothing extra: transport "auto" picks TLS/WSS over TCP 443
 #                   through $HTTPS_PROXY when UDP does not work; add
-#                   `-s -- --transport compat` to skip the UDP probe)
+#                   `-s -- --transport compat` to skip the UDP probe; proxy
+#                   credentials that rotate: see PILOT_PROXY_CMD below)
 #   Uninstall:      curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall
 #
 # Flags:
@@ -23,12 +24,16 @@ set -e
 #                      never silently falls back to an unverified source build.
 #   --yes / -y         Skip the older-version confirmation prompt.
 #   --no-warn          Suppress the older-version warning entirely.
-#   --transport <mode> auto (default for new installs), udp or compat, saved
-#                      as "transport" in ~/.pilot/config.json. auto: UDP when
-#                      the beacon answers over UDP, else compat. compat: TLS/WSS
-#                      over TCP 443 only, through $HTTPS_PROXY/$ALL_PROXY when set
-#                      (CONNECT by hostname) — for UDP-blocked hosts and agent
-#                      sandboxes whose only way out is an HTTPS proxy.
+#   --transport <mode> auto (the default), udp or compat. udp and compat are
+#                      saved as "transport" in ~/.pilot/config.json; auto is
+#                      never saved (it is what `pilotctl daemon start` and the
+#                      service units use when nothing is saved, and a daemon
+#                      that predates auto would refuse it after a downgrade).
+#                      auto: UDP when the beacon answers over UDP, else compat.
+#                      compat: TLS/WSS over TCP 443 only, through
+#                      $HTTPS_PROXY/$ALL_PROXY when set (CONNECT by hostname) —
+#                      for UDP-blocked hosts and agent sandboxes whose only way
+#                      out is an HTTPS proxy.
 #
 # Legacy env vars (still honored, lower precedence than flags):
 #   PILOT_RELEASE_TAG=vX.Y.Z   Same as --version.
@@ -38,6 +43,13 @@ set -e
 #                              If omitted headless, the daemon auto-synthesizes a
 #                              <fingerprint>@nodes.pilotprotocol.network identity.
 #   PILOT_TRANSPORT=compat     Same as --transport compat.
+#   PILOT_PROXY_CMD=<command>  Saved as "proxy_cmd": a command printing the
+#                              current proxy URL, for proxies that rotate their
+#                              credentials. In a Linux container/VM without
+#                              systemd whose HTTPS_PROXY carries credentials
+#                              (hosted agent sandboxes such as Meta Muse), the
+#                              installer saves one that reads a fresh shell's
+#                              $https_proxy when none is set.
 #   PILOT_ALLOW_ROOT=1         Install as root on a host with systemd/launchd
 #                              (not needed in containers/VMs without systemd).
 #
@@ -998,7 +1010,6 @@ fi
 # further below. Guarding on the file itself makes the documented opt-outs
 # reachable at install time instead of only after the fact. Defaults are
 # unchanged — a host with no config still gets the standard one.
-CONFIG_WRITTEN=false
 if [ "$UPDATING" != true ] && [ ! -f "$PILOT_DIR/config.json" ]; then
     cat > "$PILOT_DIR/config.json" <<CONF
 {
@@ -1011,7 +1022,6 @@ if [ "$UPDATING" != true ] && [ ! -f "$PILOT_DIR/config.json" ]; then
 }
 CONF
     echo "Config written to ${PILOT_DIR}/config.json"
-    CONFIG_WRITTEN=true
 fi
 
 # --- Transport: auto, udp or compat ---
@@ -1039,25 +1049,34 @@ fi
 if printf '%s\n' "$_daemon_help" | grep -qE '^[[:space:]]+-proxy([[:space:]]|$)'; then
     DAEMON_HAS_PROXY=true
 fi
+DAEMON_HAS_PROXY_CMD=false
+if printf '%s\n' "$_daemon_help" | grep -qE '^[[:space:]]+-proxy-cmd([[:space:]]|$)'; then
+    DAEMON_HAS_PROXY_CMD=true
+fi
 
-# auto needs a daemon that knows it: an older one would fail on
-# "transport":"auto" in config.json. Fall back to its default (udp).
-if [ "$EFFECTIVE_TRANSPORT" = "auto" ] && [ "$DAEMON_HAS_AUTO" != true ]; then
-    if [ "$TRANSPORT" = "auto" ]; then
-        echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto; keeping its default (udp)."
-    fi
-    TRANSPORT_TO_SAVE=""
-    EFFECTIVE_TRANSPORT="udp"
-elif [ -n "$TRANSPORT" ]; then
-    TRANSPORT_TO_SAVE="$TRANSPORT"
-elif [ -z "$CONFIG_TRANSPORT" ] && [ "$CONFIG_WRITTEN" = true ]; then
-    # Fresh install with nothing chosen: save auto, so the service units
-    # and a directly started pilot-daemon auto-detect too (pilotctl daemon
-    # start asks for auto whenever nothing is configured). Existing installs
-    # keep whatever they run today.
-    TRANSPORT_TO_SAVE="auto"
-else
-    TRANSPORT_TO_SAVE=""
+# auto is never saved in config.json. It is already the default wherever
+# this install starts the daemon — `pilotctl daemon start` asks a daemon
+# that supports it for auto, and the service units below set
+# PILOT_TRANSPORT_DEFAULT=auto — while a pilot-daemon that predates auto
+# (reinstalled with --version, or `pilotctl update --pin`) refuses to start
+# with "transport":"auto" in config.json. udp and compat are saved.
+TRANSPORT_TO_SAVE=""
+TRANSPORT_CLEAR=false
+case "$TRANSPORT" in
+    udp|compat)
+        TRANSPORT_TO_SAVE="$TRANSPORT" ;;
+    auto)
+        if [ "$DAEMON_HAS_AUTO" = true ]; then
+            if [ -n "$CONFIG_TRANSPORT" ]; then TRANSPORT_CLEAR=true; fi
+        else
+            echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto; it keeps its default (udp)."
+        fi ;;
+esac
+if [ "$CONFIG_TRANSPORT" = "auto" ] && [ "$DAEMON_HAS_AUTO" != true ] && [ -z "$TRANSPORT_TO_SAVE" ]; then
+    # Downgrade: this daemon would exit with "invalid -transport auto".
+    TRANSPORT_TO_SAVE="udp"
+    echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto, which config.json"
+    echo "        selects; switching it to udp (the daemon's default) so the daemon still starts."
 fi
 
 if [ -n "$TRANSPORT_TO_SAVE" ]; then
@@ -1066,6 +1085,52 @@ if [ -n "$TRANSPORT_TO_SAVE" ]; then
     else
         echo "  Note: could not save transport=${TRANSPORT_TO_SAVE} — run: pilotctl config --set transport=${TRANSPORT_TO_SAVE}"
     fi
+elif [ "$TRANSPORT_CLEAR" = true ]; then
+    if pilot_config_set "transport="; then
+        echo "Transport: auto (the default; removed \"transport\" from ${PILOT_DIR}/config.json)"
+    fi
+fi
+
+# What the daemon will run: the saved transport, else auto where the
+# daemon supports it, else its default (udp).
+if [ -n "$TRANSPORT_TO_SAVE" ]; then
+    EFFECTIVE_TRANSPORT="$TRANSPORT_TO_SAVE"
+elif [ "$TRANSPORT_CLEAR" != true ] && [ -n "$CONFIG_TRANSPORT" ] && [ "$CONFIG_TRANSPORT" != "auto" ]; then
+    EFFECTIVE_TRANSPORT="$CONFIG_TRANSPORT"
+elif [ "$DAEMON_HAS_AUTO" = true ]; then
+    EFFECTIVE_TRANSPORT="auto"
+else
+    EFFECTIVE_TRANSPORT="udp"
+fi
+
+# Rotating proxy credentials. Hosted agent sandboxes (Meta Muse) put the
+# proxy credentials in HTTPS_PROXY and rotate them every few minutes; a
+# long-running daemon keeps the launch-time ones and new connections start
+# failing with 407. proxy_cmd makes the daemon re-read the URL (every 60s
+# and on a 407) from a command — here a fresh shell, which sees the current
+# value. PILOT_PROXY_CMD sets it explicitly; otherwise it is saved only in a
+# Linux container/VM without systemd whose proxy carries credentials, and
+# never over an existing proxy_cmd.
+SANDBOX_PROXY_CMD='bash -c '\''printf %s "${https_proxy:-$HTTPS_PROXY}"'\'''
+PROXY_CMD_TO_SAVE="${PILOT_PROXY_CMD:-}"
+if [ -z "$PROXY_CMD_TO_SAVE" ] && [ "$OS" = "linux" ] && [ ! -d /run/systemd/system ] \
+   && command -v bash >/dev/null 2>&1 \
+   && ! grep -q '"proxy_cmd"' "$PILOT_DIR/config.json" 2>/dev/null; then
+    case "$PILOT_PROXY_URL" in
+        *@*) PROXY_CMD_TO_SAVE="$SANDBOX_PROXY_CMD" ;;
+    esac
+fi
+if [ -n "$PROXY_CMD_TO_SAVE" ]; then
+    if [ "$DAEMON_HAS_PROXY_CMD" != true ]; then
+        echo "  Note: this pilot-daemon (${TAG:-source}) predates -proxy-cmd; if the proxy rotates its"
+        echo "        credentials, restart the daemon from a fresh shell when it starts failing."
+    elif pilot_config_set "proxy_cmd=$PROXY_CMD_TO_SAVE"; then
+        echo "Proxy credentials: re-read by the daemon via proxy_cmd (${PILOT_DIR}/config.json)"
+    fi
+fi
+PROXY_CMD_SAVED=false
+if grep -q '"proxy_cmd"' "$PILOT_DIR/config.json" 2>/dev/null; then
+    PROXY_CMD_SAVED=true
 fi
 
 if [ "$EFFECTIVE_TRANSPORT" = "compat" ]; then
@@ -1118,6 +1183,23 @@ if [ "$EFFECTIVE_TRANSPORT" = "compat" ] && [ "$DAEMON_HAS_TRANSPORT" = true ]; 
     NET_FLAGS="${NET_FLAGS# }"
 else
     NET_FLAGS="-registry $REGISTRY -beacon $BEACON"
+fi
+
+# The service units ask for transport auto through PILOT_TRANSPORT_DEFAULT:
+# it applies only when neither -transport, $PILOT_TRANSPORT nor config.json
+# chooses, and a daemon that predates auto ignores it (a -transport auto
+# flag would stop it from starting after a downgrade).
+UNIT_ENV=""
+PLIST_ENV=""
+if [ "$DAEMON_HAS_AUTO" = true ]; then
+    UNIT_ENV="
+Environment=PILOT_TRANSPORT_DEFAULT=auto"
+    PLIST_ENV="    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PILOT_TRANSPORT_DEFAULT</key>
+        <string>auto</string>
+    </dict>
+"
 fi
 
 # service_proxy_note UNIT — a service manager starts the daemon with its own
@@ -1198,7 +1280,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$(whoami)
+User=$(whoami)${UNIT_ENV}
 ExecStart=${BIN_DIR}/pilot-daemon \\
   ${NET_FLAGS} \\
   -listen :4000 \\
@@ -1362,7 +1444,7 @@ ${PLIST_NET_ARGS}        <string>-listen</string>
         <string>${PILOT_DIR}/identity.json</string>
         <string>-encrypt</string>
 ${EXTRA_ARGS}    </array>
-    <key>RunAtLoad</key>
+${PLIST_ENV}    <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <dict>
@@ -1563,6 +1645,9 @@ case "$EFFECTIVE_TRANSPORT" in
 esac
 if [ "$EFFECTIVE_TRANSPORT" != "udp" ] && [ -n "$PILOT_PROXY_URL" ]; then
     echo "  Proxy:    auto -> $(redact_proxy "$PILOT_PROXY_URL") (from environment)"
+    if [ "$PROXY_CMD_SAVED" = true ]; then
+        echo "            credentials re-read by the daemon (proxy_cmd): rotation needs no restart"
+    fi
 fi
 echo "  Socket:   /tmp/pilot.sock"
 echo "  Identity: ${PILOT_DIR}/identity.json"

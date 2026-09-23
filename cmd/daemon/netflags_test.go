@@ -7,12 +7,15 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
 )
 
@@ -113,8 +116,57 @@ func TestApplyRegistryDefaults(t *testing.T) {
 		{"udp with the compat registry and explicit -registry-tls=false is left alone", daemon.TransportUDP,
 			registrySettings{Addr: compatRegistryAddr, AddrExplicit: true, TLSExplicit: true, Trust: "pinned"},
 			registrySettings{Addr: compatRegistryAddr, AddrExplicit: true, TLSExplicit: true, Trust: "pinned"}},
+		// compat-explicit-registry-tls-now-pinned-fatal: an explicit
+		// -registry-tls (flag or config registry_tls) without a trust
+		// setting defaults trust like main did, instead of falling to the
+		// flag default "pinned" with no fingerprint (fatal).
+		{"compat + explicit -registry-tls, no trust: system", daemon.TransportCompat,
+			registrySettings{Addr: "127.0.0.1:1", AddrExplicit: true, TLS: true, TLSExplicit: true, Trust: "pinned"},
+			registrySettings{Addr: "127.0.0.1:1", AddrExplicit: true, TLS: true, TLSExplicit: true, Trust: "system"}},
+		{"compat + bare explicit -registry-tls moves the default registry, system trust", daemon.TransportCompat,
+			registrySettings{Addr: defaultRegistryAddr, TLS: true, TLSExplicit: true, Trust: "pinned"},
+			registrySettings{Addr: compatRegistryAddr, TLS: true, TLSExplicit: true, Trust: "system"}},
+		{"compat + explicit -registry-tls with a fingerprint pins", daemon.TransportCompat,
+			registrySettings{Addr: defaultRegistryAddr, TLS: true, TLSExplicit: true, Trust: "pinned", Fingerprint: fp},
+			registrySettings{Addr: compatRegistryAddr, TLS: true, TLSExplicit: true, Trust: "pinned", Fingerprint: fp}},
+		{"udp + explicit TLS on the compat registry, no trust: system", daemon.TransportUDP,
+			registrySettings{Addr: compatRegistryAddr, AddrExplicit: true, TLS: true, TLSExplicit: true, Trust: "pinned"},
+			registrySettings{Addr: compatRegistryAddr, AddrExplicit: true, TLS: true, TLSExplicit: true, Trust: "system"}},
+		{"udp + explicit TLS on a custom registry keeps the pinned default", daemon.TransportUDP,
+			registrySettings{Addr: "reg.corp:443", AddrExplicit: true, TLS: true, TLSExplicit: true, Trust: "pinned"},
+			registrySettings{Addr: "reg.corp:443", AddrExplicit: true, TLS: true, TLSExplicit: true, Trust: "pinned"}},
 	} {
-		if got := applyRegistryDefaults(tc.transport, tc.in); got != tc.want {
+		if got := applyRegistryDefaults(tc.transport, tc.in, nil); got != tc.want {
+			t.Errorf("%s:\n got %+v\nwant %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// daemon-proxied-udp-registry-stays-raw-9000: when the registry dial goes
+// through a proxy, the compiled-in raw-TCP registry moves to the TLS
+// registry on :443 in udp mode too (a CONNECT proxy carries :443 only);
+// a custom registry, an explicit -registry-tls=false and an unproxied
+// dial are left alone.
+func TestApplyRegistryDefaultsProxiedUDP(t *testing.T) {
+	proxied := func(addr string) bool { return addr != "10.0.0.5:9000" }
+	never := func(string) bool { return false }
+	pilotctl := registrySettings{Addr: defaultRegistryAddr, AddrExplicit: true, Trust: "pinned"}
+	for _, tc := range []struct {
+		name     string
+		proxied  func(string) bool
+		in, want registrySettings
+	}{
+		{"proxied default registry moves to TLS/443", proxied, pilotctl,
+			registrySettings{Addr: compatRegistryAddr, AddrExplicit: true, TLS: true, Trust: "system"}},
+		{"unproxied default registry stays raw", never, pilotctl, pilotctl},
+		{"custom registry is kept", proxied,
+			registrySettings{Addr: "reg.corp:9000", AddrExplicit: true, Trust: "pinned"},
+			registrySettings{Addr: "reg.corp:9000", AddrExplicit: true, Trust: "pinned"}},
+		{"explicit -registry-tls=false keeps the raw registry", proxied,
+			registrySettings{Addr: defaultRegistryAddr, AddrExplicit: true, TLSExplicit: true, Trust: "pinned"},
+			registrySettings{Addr: defaultRegistryAddr, AddrExplicit: true, TLSExplicit: true, Trust: "pinned"}},
+	} {
+		if got := applyRegistryDefaults(daemon.TransportUDP, tc.in, tc.proxied); got != tc.want {
 			t.Errorf("%s:\n got %+v\nwant %+v", tc.name, got, tc.want)
 		}
 	}
@@ -155,8 +207,11 @@ func TestResolveAutoTransport(t *testing.T) {
 	}
 	t.Cleanup(func() { autoProbe = daemon.SelectTransport })
 	std := registrySettings{Addr: defaultRegistryAddr, AddrExplicit: true}
+	spec := func(s string) func(string) (*proxyconf.Policy, error) {
+		return func(transport string) (*proxyconf.Policy, error) { return resolveProxyPolicy(s, "", transport) }
+	}
 
-	mode, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, "auto")
+	mode, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto"))
 	if err != nil || mode != daemon.TransportCompat || len(got) != 1 {
 		t.Fatalf("auto = (%q, %v), probes %d", mode, err, len(got))
 	}
@@ -165,17 +220,17 @@ func TestResolveAutoTransport(t *testing.T) {
 	}
 
 	t.Setenv("HTTPS_PROXY", "http://muse:s3cret@egress.test:3128")
-	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, "auto"); err != nil || got[1].Dial == nil {
+	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto")); err != nil || got[1].Dial == nil {
 		t.Errorf("with HTTPS_PROXY the compat check does not use the proxy (err %v)", err)
 	}
-	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, "off"); err != nil || got[2].Dial != nil {
+	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("off")); err != nil || got[2].Dial != nil {
 		t.Errorf("-proxy=off still proxies the compat check (err %v)", err)
 	}
-	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, "ftp://x"); err == nil {
+	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("ftp://x")); err == nil {
 		t.Error("malformed -proxy accepted")
 	}
 
-	mode, reason, err := resolveAutoTransport(registrySettings{Addr: "10.0.0.5:9000", AddrExplicit: true}, defaultBeaconAddr, true, defaultCompatBeacon, false, "auto")
+	mode, reason, err := resolveAutoTransport(registrySettings{Addr: "10.0.0.5:9000", AddrExplicit: true}, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto"))
 	if err != nil || mode != daemon.TransportUDP || len(got) != 3 {
 		t.Errorf("private registry: (%q, %q, %v), probes %d — want udp without probing", mode, reason, err, len(got))
 	}
@@ -191,6 +246,7 @@ func TestHelpNeverPrintsProxyCredentials(t *testing.T) {
 			"HOME=" + t.TempDir(),
 			"PATH=" + os.Getenv("PATH"),
 			"PILOT_PROXY=http://muse:s3cret@egress.test:3128",
+			"PILOT_PROXY_CMD=echo http://muse:s3cret@egress.test:3128",
 			"PILOT_REGISTRY_FINGERPRINT=" + strings.Repeat("ab", 32),
 		}
 		out, _ := cmd.CombinedOutput()
@@ -289,12 +345,27 @@ func TestCompatRegistryTLSFalseKeepsRawRegistry(t *testing.T) {
 	}
 }
 
+// fakeCompatBeacon is a TLS server that answers a plain GET of the compat
+// path the way a live WebSocket beacon does: 426 Upgrade Required.
+func fakeCompatBeacon(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/compat" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String()
+}
+
 // -transport=auto on a UDP-blocked host whose only way out is the proxy:
-// the UDP probe gets no answer, the compat beacon is reachable through the
+// the UDP probe gets no answer, the compat beacon answers through the
 // proxy, so the daemon runs compat and registers through the proxy.
 func TestAutoTransportFallsBackToCompatThroughProxy(t *testing.T) {
 	proxy := newRefusingProxy(t, "muse", "s3cret")
-	proxy.allow("beacon.pilotprotocol.network:443")
+	proxy.forward("beacon.pilotprotocol.network:443", fakeCompatBeacon(t))
 	start := time.Now()
 	targets, logs := runDaemon(t, proxy, daemonRun{
 		args: []string{

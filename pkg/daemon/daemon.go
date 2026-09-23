@@ -224,6 +224,14 @@ type Config struct {
 	// directly and HTTP fetches follow net/http's proxy environment.
 	Proxy *netproxy.Resolver
 
+	// ProxyPolicy, when non-nil, replaces Proxy with a policy that can
+	// change while the daemon runs — NewCommandProxyPolicy re-reads the
+	// proxy URL from a command, for egress proxies that rotate their
+	// credentials. Start keeps it refreshed every ProxyRefreshInterval
+	// (0 = 60s) until Stop.
+	ProxyPolicy          *ProxyPolicy
+	ProxyRefreshInterval time.Duration
+
 	// systemRoots replaces the OS trust store behind the "system" trust
 	// settings (RegistryTrust, CompatTLSTrust). Test seam only: it is
 	// always nil outside this package's tests.
@@ -881,10 +889,10 @@ func (d *Daemon) Start() error {
 			// Compat would use the environment's proxy (-proxy=auto)
 			// unless the embedder set a policy; check reachability the
 			// same way.
-			policy := d.config.Proxy
+			policy := d.proxyPolicy()
 			if policy == nil {
 				if p, err := ResolveProxy(proxyAutoSpec, TransportCompat); err == nil {
-					policy = p
+					policy = StaticProxyPolicy(p)
 				} else {
 					slog.Warn("proxy environment unusable; compat check dials directly", "error", err)
 				}
@@ -896,8 +904,8 @@ func (d *Daemon) Start() error {
 			})
 			if mode == TransportCompat {
 				d.config.TransportMode = TransportCompat
-				if d.config.Proxy == nil {
-					d.config.Proxy = policy
+				if d.config.ProxyPolicy == nil && d.config.Proxy == nil {
+					d.config.ProxyPolicy = policy
 				}
 				slog.Warn("UDP probe to beacon failed — auto-falling back to compat mode (WSS/443)",
 					"beacon", stunBeacon,
@@ -925,6 +933,11 @@ func (d *Daemon) Start() error {
 	default:
 		return fmt.Errorf("invalid -transport %q: must be 'udp' or 'compat'", d.config.TransportMode)
 	}
+
+	// A command-backed proxy policy (rotating proxy credentials) stays
+	// current for the daemon's lifetime: registry redials, WSS reconnects
+	// and HTTP fetches always see the latest proxy URL.
+	d.startProxyRefresh()
 
 	var registrationAddr string
 	if d.config.TransportMode == "compat" {
@@ -2860,6 +2873,19 @@ type DaemonInfo struct {
 	BeaconAddr     string // active beacon address
 
 	MOTD string // message-of-the-day active for the current UTC day ("" = none)
+
+	// Transport is the tunnel transport the daemon runs: "udp" or "compat"
+	// (after -transport=auto was resolved).
+	Transport string
+}
+
+// transportName is the resolved tunnel transport, "udp" or "compat". Only
+// meaningful after Start has resolved it.
+func (d *Daemon) transportName() string {
+	if d.config.TransportMode == TransportCompat {
+		return TransportCompat
+	}
+	return TransportUDP
 }
 
 // Info returns current daemon status.
@@ -2952,6 +2978,7 @@ func (d *Daemon) Info() *DaemonInfo {
 		RelayPeerCount:        len(d.tunnels.RelayPeerIDs()),
 		BeaconAddr:            d.config.BeaconAddr,
 		MOTD:                  d.currentMOTD(),
+		Transport:             d.transportName(),
 	}
 }
 

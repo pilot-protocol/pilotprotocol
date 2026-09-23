@@ -326,15 +326,30 @@ func cmdUpdate(args []string) {
 
 	u.RunOnce()
 
+	// A pinned older release may predate settings config.json holds.
+	note := ""
+	if bin := filepath.Join(installDir, "pilot-daemon"); pin != "" {
+		if _, err := os.Stat(bin); err == nil {
+			note = fitTransportToDaemon(bin)
+		}
+	}
+
 	if jsonOutput {
-		outputOK(map[string]interface{}{
+		fields := map[string]interface{}{
 			"install_dir": installDir,
 			"repo":        repo,
 			"pinned":      pin != "",
-		})
+		}
+		if note != "" {
+			fields["note"] = note
+		}
+		outputOK(fields)
 		return
 	}
 	fmt.Printf("Update check complete. Install dir: %s\n", installDir)
+	if note != "" {
+		fmt.Printf("Note: %s\n", note)
+	}
 
 	// In manual mode (no daemon running), re-run skill install so skills
 	// match the (possibly updated) binaries.

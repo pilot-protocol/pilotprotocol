@@ -15,8 +15,27 @@ import (
 	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 )
 
+// ProxyPolicy is an outbound proxy policy that can change while the daemon
+// runs: a fixed resolver (StaticProxyPolicy) or one refreshed from a
+// command (NewCommandProxyPolicy) for egress proxies that rotate their
+// credentials. Config.ProxyPolicy takes precedence over Config.Proxy.
+type ProxyPolicy = proxyconf.Policy
+
+// StaticProxyPolicy wraps a fixed resolver. nil gives nil (no policy).
+func StaticProxyPolicy(r *netproxy.Resolver) *ProxyPolicy { return proxyconf.Static(r) }
+
+// NewCommandProxyPolicy returns a policy whose proxy URL is the stdout of
+// command (run with /bin/sh -c), re-run every refresh interval and when the
+// proxy answers 407 (see proxyconf.NewCommand). fallback serves until the
+// command first succeeds; the error reports a failed first run and is not
+// fatal: the policy is usable either way. honorNoProxy applies the
+// environment's NO_PROXY (the -proxy=auto semantics).
+func NewCommandProxyPolicy(ctx context.Context, command string, fallback *netproxy.Resolver, honorNoProxy bool) (*ProxyPolicy, error) {
+	return proxyconf.NewCommand(ctx, command, fallback, honorNoProxy)
+}
+
 // ResolveProxy turns a -proxy setting into the daemon's outbound proxy
-// policy (Config.Proxy) for the given transport mode:
+// resolver (Config.Proxy) for the given transport mode:
 //
 //   - "auto" or "": with transportMode "compat", the proxy from the
 //     environment — HTTPS_PROXY / https_proxy, falling back to ALL_PROXY /
@@ -54,19 +73,28 @@ func (d *Daemon) proxyTLSConfig() *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: d.config.systemRoots}
 }
 
+// proxyPolicy is the daemon's outbound proxy policy: Config.ProxyPolicy,
+// else Config.Proxy, else nil (no policy).
+func (d *Daemon) proxyPolicy() *ProxyPolicy {
+	if d.config.ProxyPolicy != nil {
+		return d.config.ProxyPolicy
+	}
+	return proxyconf.Static(d.config.Proxy)
+}
+
 // proxyDialer returns the dial function for raw TCP connections the daemon
 // opens itself (the registry, the compat WSS beacon), or nil when there is
 // no policy or it proxies nothing. Loopback targets are dialed directly.
 func (d *Daemon) proxyDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
-	return d.dialerFor(d.config.Proxy)
+	return d.dialerFor(d.proxyPolicy())
 }
 
 // dialerFor is proxyDialer for an arbitrary policy.
-func (d *Daemon) dialerFor(policy *netproxy.Resolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func (d *Daemon) dialerFor(policy *ProxyPolicy) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	if !policy.Enabled() {
 		return nil
 	}
-	return proxyconf.DialContext(policy, d.proxyTLSConfig())
+	return policy.DialContext(d.proxyTLSConfig())
 }
 
 // registryDialOptions routes every registry connection — the primary, each
@@ -84,23 +112,33 @@ func (d *Daemon) registryDialOptions() []registry.DialOption {
 // the daemon makes itself, or nil when there is no policy. Loopback targets
 // always go direct.
 func (d *Daemon) httpProxyFunc() func(*http.Request) (*url.URL, error) {
-	return proxyconf.RequestProxy(d.config.Proxy)
+	return d.proxyPolicy().RequestProxy()
 }
 
 // newHTTPClient returns a client for daemon-owned HTTP fetches. Without a
 // proxy policy it is a plain client on http.DefaultTransport, as before;
-// with one, its transport routes through the policy.
+// with one, its transport routes through the policy (and, for a refreshed
+// policy, retries a request whose CONNECT got 407 once with the new
+// credentials).
 func (d *Daemon) newHTTPClient(timeout time.Duration) *http.Client {
 	client := &http.Client{Timeout: timeout}
-	if proxy := d.httpProxyFunc(); proxy != nil {
+	if policy := d.proxyPolicy(); policy != nil {
 		var tr *http.Transport
 		if base, ok := http.DefaultTransport.(*http.Transport); ok {
 			tr = base.Clone()
 		} else {
 			tr = &http.Transport{}
 		}
-		tr.Proxy = proxy
-		client.Transport = tr
+		policy.ConfigureTransport(tr)
+		client.Transport = policy.RoundTripper(tr)
 	}
 	return client
+}
+
+// startProxyRefresh keeps a command-backed proxy policy current for the
+// daemon's lifetime (no-op otherwise).
+func (d *Daemon) startProxyRefresh() {
+	if p := d.proxyPolicy(); p.Refreshable() {
+		go p.Run(d.ctx, d.config.ProxyRefreshInterval)
+	}
 }

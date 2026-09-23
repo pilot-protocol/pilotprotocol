@@ -1083,14 +1083,18 @@ Flags:
 
 Environment passed through to the daemon (never scrubbed):
   HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
-  NO_PROXY no_proxy PILOT_PROXY PILOT_TRANSPORT PILOT_REGISTRY_TRUST
-  PILOT_REGISTRY_FINGERPRINT SSL_CERT_FILE SSL_CERT_DIR
+  NO_PROXY no_proxy PILOT_PROXY PILOT_PROXY_CMD PILOT_TRANSPORT
+  PILOT_REGISTRY_TRUST PILOT_REGISTRY_FINGERPRINT SSL_CERT_FILE SSL_CERT_DIR
 
 A pilot-daemon too old for --transport, --transport auto or --proxy gets the
 flag dropped (auto becomes udp) with a warning instead of crashing it.
 Behind an HTTPS proxy with UDP blocked (e.g. hosted agent sandboxes), plain
 "pilotctl daemon start" picks compat by itself; to skip the UDP probe:
   pilotctl config --set transport=compat && pilotctl daemon start
+If the proxy rotates its credentials, give the daemon a command that prints
+the current proxy URL (install.sh does this in hosted agent sandboxes); the
+daemon re-runs it every 60s and whenever the proxy answers 407:
+  pilotctl config --set proxy_cmd="bash -c 'printf %s \"\$https_proxy\"'"
 `,
 	"daemon stop": `Usage: pilotctl daemon stop
 
@@ -2155,6 +2159,12 @@ func cmdConfig(args []string) {
 		}
 		cfg := loadConfig()
 		cfg[parts[0]] = value
+		if value == "" && clearableConfigKeys[parts[0]] {
+			// Empty clears the key: the default applies again (for
+			// transport, pilotctl's auto), and nothing is left for an
+			// older pilot-daemon to trip over.
+			delete(cfg, parts[0])
+		}
 		result := map[string]interface{}{"key": parts[0], "value": value}
 		// Leaving compat: an install made with a pilotctl that predated
 		// --transport pointed the registry at the compat TLS host

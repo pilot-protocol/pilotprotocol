@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -64,6 +65,22 @@ func tcpListener(t *testing.T) string {
 	return ln.Addr().String()
 }
 
+// compatBeaconStub is a TLS server that answers a plain GET of the compat
+// path with status — 426 Upgrade Required is what a live WebSocket beacon
+// sends; a front whose beacon is down answers 502.
+func compatBeaconStub(t *testing.T, status int) string {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/compat" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String()
+}
+
 // When UDP works, auto is udp — the transport the daemon always used —
 // found in one round trip, and the compat side is never touched.
 func TestSelectTransportUDPWorks(t *testing.T) {
@@ -90,12 +107,12 @@ func TestSelectTransportUDPWorks(t *testing.T) {
 	}
 }
 
-// UDP blocked, compat beacon reachable over TCP: compat, within the probe
-// bound plus the TCP connect.
+// UDP blocked, compat beacon answering (426 to a plain GET): compat,
+// within the probe bound plus the local check.
 func TestSelectTransportUDPBlockedFallsBackToCompat(t *testing.T) {
 	t.Parallel()
 	beacon := udpBeacon(t, false)
-	compat := tcpListener(t)
+	compat := compatBeaconStub(t, http.StatusUpgradeRequired)
 	start := time.Now()
 	mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
 		BeaconAddr:      beacon,
@@ -147,13 +164,37 @@ func TestSelectTransportNothingReachableStaysUDP(t *testing.T) {
 	}
 }
 
+// auto-compat-check-tcp-only-fatal-on-beacon-outage: a front that accepts
+// TCP (or TLS) while the beacon behind it is down is not a working compat
+// path. auto stays on udp, which starts degraded and registers, instead of
+// picking compat and exiting on the failed WSS connect.
+func TestSelectTransportFrontUpBeaconDownStaysUDP(t *testing.T) {
+	t.Parallel()
+	beacon := udpBeacon(t, false)
+	for name, compat := range map[string]string{
+		"TCP accept-and-close": tcpListener(t),
+		"TLS front, 502":       compatBeaconStub(t, http.StatusBadGateway),
+		"TLS front, 503":       compatBeaconStub(t, http.StatusServiceUnavailable),
+	} {
+		mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+			BeaconAddr:      beacon,
+			CompatBeaconURL: "wss://" + compat + "/v1/compat",
+			UDPTimeout:      100 * time.Millisecond,
+			TCPTimeout:      2 * time.Second,
+		})
+		if mode != TransportUDP {
+			t.Errorf("%s: mode = %q (%s), want udp", name, mode, reason)
+		}
+	}
+}
+
 // Behind an egress proxy the compat check goes through the proxy, by host
 // name — the Muse case: UDP silently dropped, direct TCP killed.
 func TestSelectTransportCompatCheckUsesProxy(t *testing.T) {
 	clearProxyEnv(t)
 	beacon := udpBeacon(t, false)
 	proxy := newProxyTestConnect(t, "muse", "s3cret")
-	target := tcpListener(t)
+	target := compatBeaconStub(t, http.StatusUpgradeRequired)
 	_, port, _ := net.SplitHostPort(target)
 	policy, err := ResolveProxy(proxy.url("muse", "s3cret"), TransportCompat)
 	if err != nil {
