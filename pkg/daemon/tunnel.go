@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1151,8 +1153,11 @@ func (tm *TunnelManager) Listen(addr string) error {
 type ConnectCompatConfig struct {
 	BeaconURL string
 	TLSConfig *tls.Config
-	Identity  *crypto.Identity
-	NodeID    uint32
+	// Proxy is the http.Transport.Proxy function for the WSS dial (see
+	// wss.Config.Proxy). nil dials the beacon directly.
+	Proxy    func(*http.Request) (*url.URL, error)
+	Identity *crypto.Identity
+	NodeID   uint32
 }
 
 // ConnectCompat opens a compat-mode (WSS) tunnel to the beacon
@@ -1169,6 +1174,7 @@ func (tm *TunnelManager) ConnectCompat(ctx context.Context, cfg ConnectCompatCon
 	wssTr, err := wssTransport.Dial(ctx, wssTransport.Config{
 		URL:       cfg.BeaconURL,
 		TLSConfig: cfg.TLSConfig,
+		Proxy:     cfg.Proxy,
 		Identity:  cfg.Identity,
 		NodeID:    cfg.NodeID,
 	})

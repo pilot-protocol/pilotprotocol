@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +30,7 @@ import (
 	"github.com/pilot-protocol/common/crypto"
 	"github.com/pilot-protocol/common/daemonapi"
 	"github.com/pilot-protocol/common/fsutil"
+	"github.com/pilot-protocol/common/netproxy"
 	"github.com/pilot-protocol/common/protocol"
 	registry "github.com/pilot-protocol/common/registry/client"
 	registrywire "github.com/pilot-protocol/common/registry/wire"
@@ -211,6 +213,21 @@ type Config struct {
 	// binary) or "system" (OS trust store; escape hatch for daemons
 	// behind TLS-intercepting corp proxies).
 	CompatTLSTrust string
+
+	// Proxy is the outbound proxy policy, normally built by ResolveProxy
+	// from -proxy and the transport mode. When non-nil it governs every
+	// TCP/HTTP connection the daemon opens itself: the registry (primary,
+	// pool and every reconnect), the compat-mode WSS beacon and the MOTD
+	// fetch. Targets stay host names end to end — the proxy is asked to
+	// CONNECT by name and TLS runs through the tunnel to the real server.
+	// nil keeps the historical behaviour: registry and beacon are dialed
+	// directly and HTTP fetches follow net/http's proxy environment.
+	Proxy *netproxy.Resolver
+
+	// systemRoots replaces the OS trust store behind the "system" trust
+	// settings (RegistryTrust, CompatTLSTrust). Test seam only: it is
+	// always nil outside this package's tests.
+	systemRoots *x509.CertPool
 
 	// Tuning (zero = use defaults)
 	KeepaliveInterval     time.Duration // default 60s
@@ -885,6 +902,9 @@ func (d *Daemon) Start() error {
 		slog.Info("compat mode enabled — skipping STUN; will dial WSS beacon after register",
 			"compat_beacon", d.config.CompatBeaconURL,
 			"tls_trust", d.config.CompatTLSTrust)
+		if d.config.BeaconRTTProbe {
+			slog.Info("compat mode: -beacon-rtt-probe disabled (its raw UDP probes cannot leave a UDP-blocked host)")
+		}
 	} else if d.config.Endpoint != "" {
 		registrationAddr = d.config.Endpoint
 		slog.Info("using fixed endpoint", "endpoint", registrationAddr)
@@ -1052,11 +1072,15 @@ func (d *Daemon) Start() error {
 		if terr != nil {
 			return fmt.Errorf("compat tls config: %w", terr)
 		}
+		if tlsCfg.RootCAs == nil {
+			tlsCfg.RootCAs = d.config.systemRoots // "system" trust; nil = OS store
+		}
 		ccCtx, ccCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccCancel()
 		if cerr := d.tunnels.ConnectCompat(ccCtx, ConnectCompatConfig{
 			BeaconURL: d.config.CompatBeaconURL,
 			TLSConfig: tlsCfg,
+			Proxy:     d.httpProxyFunc(),
 			Identity:  d.identity,
 			NodeID:    d.nodeID,
 		}); cerr != nil {
@@ -2224,6 +2248,7 @@ func (d *Daemon) dialRegistryClient() (*registry.Client, error) {
 	const maxRegistryDialAttempts = 10
 	const regConnPoolSize = 4
 	registryDialBackoff := 500 * time.Millisecond
+	dialOpts := d.registryDialOptions()
 	for attempt := 1; attempt <= maxRegistryDialAttempts; attempt++ {
 		if d.config.RegistryTLS {
 			trust := d.config.RegistryTrust
@@ -2235,14 +2260,14 @@ func (d *Daemon) dialRegistryClient() (*registry.Client, error) {
 				if d.config.RegistryFingerprint == "" {
 					return nil, fmt.Errorf("registry TLS with -registry-trust=pinned requires RegistryFingerprint")
 				}
-				rc, err = registry.DialTLSPinned(d.config.RegistryAddr, d.config.RegistryFingerprint)
+				rc, err = registry.DialTLSPinned(d.config.RegistryAddr, d.config.RegistryFingerprint, dialOpts...)
 			case "system":
-				rc, err = registry.DialTLSPool(d.config.RegistryAddr, &tls.Config{MinVersion: tls.VersionTLS12}, regConnPoolSize)
+				rc, err = registry.DialTLSPool(d.config.RegistryAddr, &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: d.config.systemRoots}, regConnPoolSize, dialOpts...)
 			default:
 				return nil, fmt.Errorf("invalid -registry-trust %q: must be 'pinned' or 'system'", trust)
 			}
 		} else {
-			rc, err = registry.DialPool(d.config.RegistryAddr, regConnPoolSize)
+			rc, err = registry.DialPool(d.config.RegistryAddr, regConnPoolSize, dialOpts...)
 		}
 		if err == nil {
 			break
@@ -4852,7 +4877,7 @@ func (d *Daemon) motdPollLoop() {
 	if interval <= 0 {
 		interval = motd.DefaultInterval
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := d.newHTTPClient(10 * time.Second)
 
 	// Fire once on startup so the banner is warm shortly after boot,
 	// then settle into the interval.

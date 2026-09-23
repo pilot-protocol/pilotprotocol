@@ -39,6 +39,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,8 +67,8 @@ const DefaultIdlePingInterval = 30 * time.Second
 const DefaultIdlePingTimeout = 10 * time.Second
 
 // DefaultDialTimeout caps the time we spend on a single dial attempt
-// (DNS + TCP + TLS + WS upgrade + auth challenge). Beyond this we
-// fail fast and let the reconnect loop try again.
+// (DNS + TCP + proxy CONNECT + TLS + WS upgrade + auth challenge).
+// Beyond this we fail fast and let the reconnect loop try again.
 const DefaultDialTimeout = 20 * time.Second
 
 // DefaultRecvBuffer is the buffered channel size for inbound frames.
@@ -108,6 +109,13 @@ type Config struct {
 	// a config with RootCAs=nil so Go falls back to the OS trust
 	// store. Always non-nil — the caller picks the policy.
 	TLSConfig *tls.Config
+
+	// Proxy picks the HTTP proxy for the WSS dial, with the signature of
+	// http.Transport.Proxy (e.g. netproxy.Resolver.ProxyForRequest). A
+	// wss:// URL is tunnelled with CONNECT by host name, so the beacon
+	// name is never resolved locally and TLS (TLSConfig, SNI) stays
+	// end-to-end with the beacon. nil dials directly.
+	Proxy func(*http.Request) (*url.URL, error)
 
 	// Identity provides the Ed25519 keypair used for the auth challenge.
 	Identity *crypto.Identity
@@ -256,6 +264,7 @@ func Dial(ctx context.Context, cfg Config) (*Transport, error) {
 func (t *Transport) dialAndAuth(ctx context.Context) (*websocket.Conn, error) {
 	httpClient := &http.Client{
 		Transport: &http.Transport{
+			Proxy:           t.cfg.Proxy,
 			TLSClientConfig: t.cfg.TLSConfig.Clone(),
 		},
 	}

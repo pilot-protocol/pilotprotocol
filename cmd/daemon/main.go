@@ -22,6 +22,7 @@ import (
 	"github.com/pilot-protocol/common/config"
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/logging"
+	"github.com/pilot-protocol/common/netproxy"
 	"github.com/pilot-protocol/pilotprotocol/internal/enterprisecontrol"
 	"github.com/pilot-protocol/pilotprotocol/internal/managedsdk/authority"
 	"github.com/pilot-protocol/pilotprotocol/internal/motd"
@@ -52,13 +53,13 @@ var remoteLifecycleRequests = make(chan string, 1)
 func main() {
 	configPath := flag.String("config", "", "path to config file (JSON)")
 	securityProfile := flag.String("security-profile", envString("PILOT_SECURITY_PROFILE", securityProfileCompatible), "locked security profile: compatible or enterprise")
-	registryDefault := "34.71.57.205:9000"
+	registryDefault := defaultRegistryAddr
 	registryFromEnv := false
 	if v := os.Getenv("PILOT_REGISTRY"); v != "" {
 		registryDefault = v
 		registryFromEnv = true
 	}
-	beaconDefault := "34.71.57.205:9001"
+	beaconDefault := defaultBeaconAddr
 	beaconFromEnv := false
 	if v := os.Getenv("PILOT_BEACON"); v != "" {
 		beaconDefault = v
@@ -108,7 +109,8 @@ func main() {
 	beaconRTTProbe := flag.Bool("beacon-rtt-probe", false, "probe beacon RTT before selection; override hash pick when >2× slower than best (ablation test, default off)")
 	noRxWatchdog := flag.Bool("no-rx-watchdog", false, "disable the inbound-path watchdog that soft-recovers (beacon+registry re-registration) and, on a persistent wedge, exits non-zero for supervisor respawn")
 	noPathWatch := flag.Bool("no-path-watch", false, "disable the per-peer path watchdog that probes inbound-silent peers and resets a dead peer path in place (prefer-direct sequence) without a daemon restart")
-	transportMode := flag.String("transport", "udp", "tunnel transport: 'udp' (default) or 'compat' (WSS to beacon, opt-in, for UDP-blocked environments)")
+	transportMode := flag.String("transport", transportDefault(), "tunnel transport: 'udp' (default) or 'compat' (WSS to beacon, opt-in, for UDP-blocked environments). Env: PILOT_TRANSPORT.")
+	proxySpec := flag.String("proxy", envString("PILOT_PROXY", netproxy.ModeAuto), "outbound proxy for registry, beacon and HTTP connections: 'auto' (with -transport=compat, HTTPS_PROXY/ALL_PROXY from the environment, honoring NO_PROXY; nothing with -transport=udp), 'off', or a proxy URL 'http://[user:pass@]host:port' used for every connection. Env: PILOT_PROXY.")
 	compatBeacon := flag.String("compat-beacon", "wss://beacon.pilotprotocol.network/v1/compat", "beacon WSS URL for -transport=compat")
 	tlsTrust := flag.String("tls-trust", "system", "TLS trust store for -transport=compat: 'system' (OS trust store; current default while compat mode uses Let's Encrypt certs on beacon.pilotprotocol.network) or 'pinned' (Pilot CA root embedded in the daemon binary; will become the default in a future release once production root ships)")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -174,13 +176,18 @@ func main() {
 	// -registry-trust, route the registry to its TLS hostname (TCP/443
 	// via nginx SNI routing on the production rendezvous box) so the
 	// daemon really does use a single port. The TCP/9000 fallback is
-	// still available to anyone who passes -registry explicitly.
+	// still available to anyone who passes a non-default -registry
+	// explicitly; the compiled-in default counts as not explicit (see
+	// compatKeepsRegistry). -beacon needs no such rule: in compat mode the
+	// UDP beacon address is only the relay-wrap destination on the WSS
+	// pipe and is never dialed.
 	if *transportMode == "compat" {
 		explicit := map[string]bool{}
 		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-		if !explicit["registry"] && os.Getenv("PILOT_REGISTRY") == "" {
-			v := "registry.pilotprotocol.network:443"
+		if !compatKeepsRegistry(*registryAddr, explicit["registry"], os.Getenv("PILOT_REGISTRY") != "") {
+			v := compatRegistryAddr
 			registryAddr = &v
+			registryFromEnv = false
 		}
 		if !explicit["registry-tls"] {
 			v := true
@@ -220,6 +227,17 @@ func main() {
 	*motdFeedURL = profileOptions.MOTDFeedURL
 
 	logging.Setup(*logLevel, *logFormat)
+
+	// Outbound proxy: resolved once, after -transport is final, and shared
+	// by everything that dials out — the registry client, the compat WSS
+	// beacon, pkg/daemon's own HTTP fetches (via daemon.Config.Proxy) and
+	// every plugin HTTP client (via http.DefaultTransport).
+	proxyPolicy, err := resolveProxyPolicy(*proxySpec, *transportMode)
+	if err != nil {
+		log.Fatalf("-proxy: %v", err)
+	}
+	installDefaultTransportProxy(proxyPolicy)
+	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyPolicy))
 
 	// Sandbox: validate all configured file paths are under the confinement
 	// root before the daemon touches the filesystem. Network paths are unaffected.
@@ -314,6 +332,7 @@ func main() {
 		TransportMode:         *transportMode,
 		CompatBeaconURL:       *compatBeacon,
 		CompatTLSTrust:        *tlsTrust,
+		Proxy:                 proxyPolicy,
 		MOTDFeedURL:           *motdFeedURL,
 		MOTDInterval:          *motdInterval,
 		TelemetryURL:          *telemetryURL,

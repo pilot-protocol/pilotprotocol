@@ -470,6 +470,8 @@ Most daemon flags have an environment variable equivalent. Useful for containeri
 |----------|----------------|---------|
 | `PILOT_REGISTRY` | `-registry` | Registry server address |
 | `PILOT_BEACON` | `-beacon` | Beacon server address |
+| `PILOT_TRANSPORT` | `-transport` | Tunnel transport: `udp` (default) or `compat` (WSS on 443, for UDP-blocked hosts) |
+| `PILOT_PROXY` | `-proxy` | Outbound proxy for registry, beacon and HTTP traffic: `auto` (default; with `compat`, the `HTTPS_PROXY`/`ALL_PROXY` proxy, honoring `NO_PROXY`), `off`, or `http://[user:pass@]host:port` for every connection |
 | `PILOT_SOCKET` | `-socket` | Unix socket path |
 | `PILOT_EMAIL` | `-email` | Account email |
 | `PILOT_HOSTNAME` | `-hostname` | Discovery hostname |
