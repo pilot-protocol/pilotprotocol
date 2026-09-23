@@ -184,10 +184,14 @@ func TestCarryAppStateCarriesOnlyAppState(t *testing.T) {
 	mustWrite(t, filepath.Join(newDir, "bin", "newapp"), "new binary", 0o755)
 	mustWrite(t, filepath.Join(newDir, "shipped.txt"), "bundle copy", 0o644)
 
-	carried, err := carryAppState(oldDir, newDir, "bin/oldapp")
+	c, err := carryAppState(oldDir, newDir, "bin/oldapp")
 	if err != nil {
 		t.Fatalf("carryAppState: %v", err)
 	}
+	if len(c.Unreadable) != 0 {
+		t.Fatalf("nothing here is unreadable, got %q", c.Unreadable)
+	}
+	carried := c.Carried
 	want := []string{
 		filepath.Join("bin", "helper"),
 		"current.db",
@@ -288,6 +292,7 @@ func TestSwapInAppDirSuccessAndPreviousGuard(t *testing.T) {
 	if mustRead(t, filepath.Join(prev, "v")) != "old" {
 		t.Fatal("previous dir changed")
 	}
+	assertAbsent(t, staging) // a refused swap does not leave staging for the supervisor
 	// Fresh install (nothing to replace) returns no previous dir.
 	fresh := filepath.Join(base, "io.test.fresh")
 	mustWrite(t, filepath.Join(fresh+appStagingSuffix, "v"), "x", 0o600)
@@ -327,6 +332,20 @@ func TestRecoverInterruptedInstall(t *testing.T) {
 	}
 	if got := mustRead(t, filepath.Join(appStoreBackupRoot(), id, backups[0].Name(), "identity-evm.json")); got != "older key" {
 		t.Fatalf("backup = %q", got)
+	}
+	if meta, ok := readBackupMeta(filepath.Join(appStoreBackupRoot(), id, backups[0].Name())); !ok || meta.Kind != backupKindRecovered || !meta.Pinned {
+		t.Fatalf("a crash leftover must be kept as a pinned backup, meta = %+v (ok=%v)", meta, ok)
+	}
+	// Died before its swap: a manifest-bearing staging dir the supervisor
+	// would adopt as a second copy of the app. Discarded.
+	mustWrite(t, filepath.Join(final+appStagingSuffix, "manifest.json"), "{}", 0o644)
+	mustWrite(t, filepath.Join(final+appStagingSuffix, "bin", "app"), "new", 0o755)
+	if notes, err := recoverInterruptedInstall(final, id); err != nil || len(notes) != 1 {
+		t.Fatalf("recover staging = (%v, %v)", notes, err)
+	}
+	assertAbsent(t, final+appStagingSuffix)
+	if mustRead(t, filepath.Join(final, "identity-evm.json")) != "key" {
+		t.Fatal("recovery touched the live install")
 	}
 	// Nothing to do on a clean layout.
 	if notes, err := recoverInterruptedInstall(final, id); err != nil || notes != nil {
@@ -377,7 +396,7 @@ func TestRetireAppDirKeepsNewestBackupsDetached(t *testing.T) {
 		if err := os.Link(filepath.Join(live, "identity-evm.json"), filepath.Join(prev, "identity-evm.json")); err != nil {
 			t.Fatal(err)
 		}
-		dst, err := retireAppDir(prev, id)
+		dst, err := retireAppDir(prev, id, appBackupMeta{Kind: backupKindReinstall})
 		if err != nil {
 			t.Fatalf("retire %d: %v", i, err)
 		}
@@ -403,31 +422,6 @@ func TestRetireAppDirKeepsNewestBackupsDetached(t *testing.T) {
 	if bakFi.Mode().Perm() != 0o600 || mustRead(t, filepath.Join(last, "identity-evm.json")) != "key" {
 		t.Errorf("backup key mode/content wrong: %v", bakFi.Mode())
 	}
-}
-
-func TestRetireAppDirFallsBackToDisabledInRootCopy(t *testing.T) {
-	root := isolateAppStoreTest(t)
-	blocker := filepath.Join(t.TempDir(), "not-a-dir")
-	mustWrite(t, blocker, "x", 0o600)
-	t.Setenv("PILOT_APPSTORE_BACKUP_ROOT", filepath.Join(blocker, "backups"))
-	const id = "io.test.nobackuproot"
-	prev := filepath.Join(root, id) + appPreviousSuffix
-	mustWrite(t, filepath.Join(prev, "manifest.json"), "{}", 0o644)
-	mustWrite(t, filepath.Join(prev, "identity-evm.json"), "key", 0o600)
-
-	parked, err := retireAppDir(prev, id)
-	if err == nil {
-		t.Fatal("want an error explaining the fallback")
-	}
-	if !strings.HasPrefix(filepath.Base(parked), id+appPreviousSuffix+"-") {
-		t.Fatalf("parked at %s", parked)
-	}
-	// Never deleted, and the supervisor can no longer adopt it.
-	if mustRead(t, filepath.Join(parked, "identity-evm.json")) != "key" {
-		t.Fatal("state lost in fallback")
-	}
-	assertAbsent(t, filepath.Join(parked, "manifest.json"))
-	assertAbsent(t, prev) // a later install is not blocked by it
 }
 
 // ── end to end through a signed catalogue: install, no-op, upgrade ─────────
@@ -463,17 +457,29 @@ func tarGzBundle(t *testing.T, dir string) (path, sha string) {
 	return path, hex.EncodeToString(sum[:])
 }
 
+// catalogueTestApp is one entry of a test catalogue.
+type catalogueTestApp struct {
+	id, version, bundlePath, bundleSHA string
+}
+
 // publishSignedCatalogue writes a one-app catalogue signed with an ephemeral
 // catalogue key (restored at test end) where loadCatalogue will fetch it.
 func publishSignedCatalogue(t *testing.T, catPath, id, version, bundlePath, bundleSHA string) {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{
-		"version": 2,
-		"apps": []map[string]any{{
-			"id": id, "version": version, "description": "stateful test app",
-			"bundle_url": "file://" + bundlePath, "bundle_sha256": bundleSHA,
-		}},
-	})
+	publishSignedCatalogueApps(t, catPath, catalogueTestApp{id, version, bundlePath, bundleSHA})
+}
+
+// publishSignedCatalogueApps is publishSignedCatalogue for several apps.
+func publishSignedCatalogueApps(t *testing.T, catPath string, apps ...catalogueTestApp) {
+	t.Helper()
+	entries := make([]map[string]any, 0, len(apps))
+	for _, a := range apps {
+		entries = append(entries, map[string]any{
+			"id": a.id, "version": a.version, "description": "stateful test app",
+			"bundle_url": "file://" + a.bundlePath, "bundle_sha256": a.bundleSHA,
+		})
+	}
+	body, err := json.Marshal(map[string]any{"version": 2, "apps": entries})
 	if err != nil {
 		t.Fatal(err)
 	}

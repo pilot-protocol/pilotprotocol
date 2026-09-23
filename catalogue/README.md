@@ -275,17 +275,41 @@ git show origin/main:catalogue/catalogue.json > /tmp/base.json
 ### What install and upgrade do with app state (fixed pilotctl)
 
 - `pilotctl appstore install <id>` on an installed app changes nothing and
-  points at `pilotctl appstore upgrade <id>`.
+  points at `pilotctl appstore upgrade <id>`. With `--version X` for a version
+  other than the installed one (or a local bundle of another version) it fails
+  with `conflict` unless `--force` is given, and with `version_unavailable`
+  when the catalogue does not offer X.
 - `install --force` and `upgrade` carry everything in `$APP` that the new
-  bundle does not ship into the new install (hard links, so a running app
-  loses no writes), except control files (`manifest.json`, `install.json`,
-  `install.sh`, `.sideloaded`, `.suspended`, `.resume`, `.bundle-sha256`,
-  next-steps caches) and sockets. The old dir stays at `<id>.previous` until
-  the new one verifies, and is then kept as a backup in `app-backups/<id>/`
-  beside the install root (`~/.pilot/app-backups`, or
-  `$PILOT_APPSTORE_BACKUP_ROOT`); the newest 3 per app are kept.
+  bundle does not ship into the new install, except control files
+  (`manifest.json`, `install.json`, `install.sh`, `.sideloaded`, `.suspended`,
+  `.resume`, `.bundle-sha256`, next-steps caches) and sockets. Files are
+  hard-linked, so writes the still-running app makes to them in place are
+  kept; read-only dirs carry like any other; an entry this user cannot link
+  or read (say, a root-owned file) is moved across instead. After the swap
+  the old dir is checked again: a file the app replaced (write + rename) or
+  created there during the install is taken into the new install, unless the
+  new install's copy changed since (the newer write wins). A write the old
+  process makes after that through a path relative to its working directory
+  (not through `$APP`) still lands in the backup, until the supervisor
+  restarts it on the new version (within ~30s). The old dir stays at
+  `<id>.previous` until the new one verifies.
+- Installs, upgrades and uninstalls of one app take a lock
+  (`<install root>/.<id>.lock`), so the hourly `upgrade --all` and an agent's
+  `install` never interleave.
+- The replaced dir is kept as a backup in `app-backups/<id>/` beside the
+  install root (`~/.pilot/app-backups`, or `$PILOT_APPSTORE_BACKUP_ROOT`,
+  which may be on another filesystem: it is then copied). If that location is
+  unusable, the backup goes to the default location, then to
+  `<install root>/.app-backups/<id>/`, and pilotctl warns. Each backup has a
+  `.pilot-backup.json` saying what kind it is. Routine backups are rotated
+  (the newest 3 upgrades and the newest 3 same-version reinstalls per app);
+  a backup that holds the only copy of state (`--reset-state`, state that
+  could not be carried, a crash leftover) is never removed automatically.
+  `uninstall` leaves backups and lists every one of them.
 - `install --reset-state` (implies `--force`) is the explicit way to start an
   app empty. It warns loudly and still keeps the backup.
+- `upgrade --all` goes on to the next app when one fails, and exits 1 at the
+  end naming the apps that were not upgraded.
 
 ## Catalogue signing key
 
