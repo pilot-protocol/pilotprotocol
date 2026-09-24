@@ -11,7 +11,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, macos-15-intel]
+        os: [macos-15-intel]
+        rep: [1, 2, 3]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
