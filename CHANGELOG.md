@@ -96,8 +96,8 @@ Detailed per-release notes are on the
 - **`install.sh --transport <auto|udp|compat>`** (or `PILOT_TRANSPORT`).
   install.sh here is a copy of `pilot-protocol/release:install.sh`, the script
   https://pilotprotocol.network/install.sh serves; these installer changes
-  reach users through the matching pilot-protocol/release change, which also
-  keeps the managed-node mode (`--managed-url`).
+  reach users through pilot-protocol/release#49, which also keeps the
+  managed-node mode (`--managed-url`).
   `udp` and `compat` are saved; `auto` (the default) is not — `--transport
   auto` removes a saved transport. `compat` skips the UDP probe. No `proxy`
   key is written (the daemon default already uses the environment's proxy).
