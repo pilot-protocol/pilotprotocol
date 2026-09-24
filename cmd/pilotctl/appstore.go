@@ -2658,7 +2658,7 @@ func cmdAppStoreCall(args []string) {
 		// instead of blaming the daemon. No silent retarget: the method
 		// namespace changed too. (An installed app whose daemon is down skips
 		// the catalogue fetch.)
-		if _, derr := os.Stat(filepath.Dir(sockPath)); errors.Is(derr, os.ErrNotExist) {
+		if _, derr := os.Stat(filepath.Dir(sockPath)); errors.Is(derr, os.ErrNotExist) { // #nosec G703 -- only a stat of the dir whose app.sock was stat'ed just above; nothing is read or written
 			if c, lerr := loadCatalogue(); lerr == nil {
 				if e := c.findEntry(appID); e != nil && e.RenamedTo != "" {
 					fatalHint("invalid_argument",

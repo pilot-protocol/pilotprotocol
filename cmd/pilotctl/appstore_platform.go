@@ -109,7 +109,7 @@ func peMachineArch(machine uint16) string {
 // build). An install.json that does not parse, or lists no assets, is left to
 // the app, as before.
 func checkBundleAssetsPlatform(bundleDir, goos, goarch string) error {
-	raw, err := os.ReadFile(filepath.Join(bundleDir, "install.json")) // #nosec G304 -- a file of the bundle being installed
+	raw, err := os.ReadFile(filepath.Join(bundleDir, "install.json")) // #nosec G304 G703 -- install.json of the bundle being installed (the dir pilotctl unpacked, or the --local dir the operator named); only read and parsed
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
