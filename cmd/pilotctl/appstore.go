@@ -1302,6 +1302,12 @@ func cmdAppStoreInstall(args []string) {
 			m.ID, m.AppVersion, m.Binary.Path, runtime.GOOS, runtime.GOARCH, err)
 	}
 
+	if err := checkBundleAssetsPlatform(bundleDir, runtime.GOOS, runtime.GOARCH); err != nil {
+		fatalHint("platform_mismatch",
+			fmt.Sprintf("nothing was installed and any existing install of %s is untouched. %s/%s is not supported by this app; it would exit at every start", m.ID, runtime.GOOS, runtime.GOARCH),
+			"refusing to install %s v%s: %v", m.ID, m.AppVersion, err)
+	}
+
 	root := appStoreRoot()
 	finalDir := filepath.Join(root, m.ID)
 	stagingDir := finalDir + appStagingSuffix
