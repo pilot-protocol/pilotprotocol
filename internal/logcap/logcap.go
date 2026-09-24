@@ -27,10 +27,10 @@
 // the current user; a symlink, a directory or another user's file at
 // one of them stops that round's backup (the log is still truncated).
 // Files are created O_EXCL|O_NOFOLLOW, never through an existing name.
-// When the log's directory is writable by group or others, or owned by
-// another user (not root), logcap keeps no backups at all and only
-// truncates, so it creates nothing where someone else could have
-// planted a link.
+// When the log's directory is writable by others, or by a group other
+// than the user's own private group, or owned by another user (not
+// root), logcap keeps no backups at all and only truncates, so it
+// creates nothing where someone else could have planted a link.
 //
 // A rotation that dies between the copy and the compress (crash, kill)
 // leaves <log>.pilot.1 behind; the next rotation in that directory
@@ -381,6 +381,10 @@ var ownerOf = fileOwner
 // tryLock is flock; tests swap it to simulate a filesystem without locks.
 var tryLock = flock
 
+// groupIsPrivate is privateGroupDir; tests swap it to simulate a
+// directory's group being, or not being, the user's private group.
+var groupIsPrivate = privateGroupDir
+
 // ours reports whether fi is a regular file owned by this process's user,
 // the only kind of file logcap reads back, renames or removes.
 func ours(fi os.FileInfo) bool {
@@ -427,10 +431,15 @@ func openOurs(name string) (*os.File, error) {
 }
 
 // checkDir refuses a directory where another user could have planted a
-// link or a file at one of logcap's names: one writable by group or
-// others — a sticky /tmp included, as the sticky bit stops removing
-// others' names, not creating new ones — or one owned by another user
-// (root excepted).
+// link or a file at one of logcap's names: one writable by others — a
+// sticky /tmp included, as the sticky bit stops removing others' names,
+// not creating new ones — or by a group other users may be in, or one
+// owned by another user (root excepted).
+//
+// A group-writable directory is accepted when its group is the user's
+// own private group (privateGroupDir): with user private groups, the
+// default on Debian/Ubuntu and Fedora/RHEL, the login umask 002 makes
+// ~/.pilot group-writable with a group no one else is in.
 func checkDir(dir string) error {
 	fi, err := os.Lstat(dir)
 	if err != nil {
@@ -439,11 +448,14 @@ func checkDir(dir string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("%s is not a directory", dir)
 	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("log directory %s is writable by group or others", dir)
+	if fi.Mode().Perm()&0o002 != 0 {
+		return fmt.Errorf("log directory %s is writable by others", dir)
 	}
 	if uid, ok := ownerOf(fi); !ok || (uid != os.Geteuid() && uid != 0) {
 		return fmt.Errorf("log directory %s is owned by another user", dir)
+	}
+	if fi.Mode().Perm()&0o020 != 0 && !groupIsPrivate(dir, fi) {
+		return fmt.Errorf("log directory %s is writable by a group other users may be in", dir)
 	}
 	return nil
 }

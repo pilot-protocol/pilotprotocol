@@ -355,18 +355,44 @@ func TestCheckReplacesItsOwnStaleTemp(t *testing.T) {
 	}
 }
 
+// sameDir reports whether a and b name the same directory (the log path
+// resolved from a descriptor may differ, as /private/var for /var).
+func sameDir(a, b string) bool {
+	afi, aerr := os.Stat(a)
+	bfi, berr := os.Stat(b)
+	return aerr == nil && berr == nil && os.SameFile(afi, bfi)
+}
+
+// fakeGroup makes every directory's group look like the user's private
+// group (private) or like a group other users are in.
+func fakeGroup(t *testing.T, private bool) *[]string {
+	t.Helper()
+	var asked []string
+	orig := groupIsPrivate
+	groupIsPrivate = func(dir string, _ os.FileInfo) bool {
+		asked = append(asked, dir)
+		return private
+	}
+	t.Cleanup(func() { groupIsPrivate = orig })
+	return &asked
+}
+
 // TestCheckKeepsNoBackupInSharedDirectory: where other users can create
-// names — group- or world-writable, sticky /tmp included — or in another
-// user's directory, rotation only truncates and creates nothing.
+// names — writable by a group they are in or by others, sticky /tmp
+// included — or in another user's directory, rotation only truncates and
+// creates nothing.
 func TestCheckKeepsNoBackupInSharedDirectory(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		mode    os.FileMode
-		foreign bool
+		name         string
+		mode         os.FileMode
+		foreign      bool
+		privateGroup bool
 	}{
-		{"group-writable", 0o770, false},
-		{"world-writable sticky", 0o777 | os.ModeSticky, false},
-		{"another user's", 0o755, true},
+		{"group-writable, shared group", 0o770, false, false},
+		{"world-writable sticky", 0o777 | os.ModeSticky, false, true},
+		{"world-writable, private group", 0o777, false, true},
+		{"another user's", 0o755, true, false},
+		{"another user's, private group", 0o775, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "logs")
@@ -380,6 +406,7 @@ func TestCheckKeepsNoBackupInSharedDirectory(t *testing.T) {
 			if tc.foreign {
 				fakeForeign(t, dir)
 			}
+			fakeGroup(t, tc.privateGroup)
 			path := filepath.Join(dir, "daemon.log")
 			f := openLog(t, path)
 			writeFile(t, backupName(path, 1), "ours-1")
@@ -398,6 +425,53 @@ func TestCheckKeepsNoBackupInSharedDirectory(t *testing.T) {
 				t.Fatalf("generation changed: %q", got)
 			}
 		})
+	}
+}
+
+// TestCheckKeepsBackupsInPrivateGroupDirectory: a directory that is
+// group-writable only because of the umask 002 of user-private-group
+// systems — its group is the user's own — rotates as usual: generations
+// are kept, shifted and finished, nothing is thrown away.
+func TestCheckKeepsBackupsInPrivateGroupDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".pilot")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	asked := fakeGroup(t, true)
+	path := filepath.Join(dir, "daemon.log")
+	f := openLog(t, path)
+	writeFile(t, stagingName(path), "interrupted round")
+	orphan := filepath.Join(dir, "pilot-22.log")
+	writeFile(t, stagingName(orphan), "another log's staged copy")
+
+	r := New(f, Options{MaxBytes: 10, MaxBackups: 3, Within: []string{dir}})
+	write(t, f, "round-0 "+strings.Repeat("x", 20))
+	mustRotate(t, r)
+	if len(*asked) == 0 || !sameDir((*asked)[0], dir) {
+		t.Fatalf("group checked for %v, want %s", *asked, dir)
+	}
+	if got := gunzip(t, backupName(path, 2)); got != "interrupted round" {
+		t.Fatalf("%s = %q, want the interrupted round finished", backupName(path, 2), got)
+	}
+	if got := gunzip(t, backupName(orphan, 1)); got != "another log's staged copy" {
+		t.Fatalf("orphaned copy = %q, want it finished", got)
+	}
+
+	for i := 1; i <= 2; i++ {
+		write(t, f, fmt.Sprintf("round-%d %s", i, strings.Repeat("x", 20)))
+		mustRotate(t, r)
+	}
+	for gen := 1; gen <= 3; gen++ {
+		want := fmt.Sprintf("round-%d ", 3-gen)
+		if got := gunzip(t, backupName(path, gen)); !strings.HasPrefix(got, want) {
+			t.Fatalf("%s = %q, want the round %d log", backupName(path, gen), got, 3-gen)
+		}
+	}
+	if readFile(t, path) != "" {
+		t.Fatal("log not truncated")
 	}
 }
 

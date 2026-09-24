@@ -37,9 +37,13 @@ Detailed per-release notes are on the
   - It never touches files it did not create. The `.pilot` infix keeps its
     backups apart from logrotate's and newsyslog's names (`daemon.log.1`,
     `daemon.log.2.gz`, …). It skips a symlink or another user's file at one
-    of its own names, and creates its files with `O_EXCL|O_NOFOLLOW`. If the
-    log's directory is writable by group or others, or owned by another
-    user, it only truncates and keeps no backups.
+    of its own names, and creates its files with `O_EXCL|O_NOFOLLOW`. If
+    other users can create files in the log's directory, it only truncates
+    and keeps no backups. That is the case when the directory is writable
+    by others, is owned by another user, or is writable by a group other
+    than the user's own private group. A `~/.pilot` that is group-writable
+    only because of the umask 002 on Ubuntu, Debian or Fedora (the group
+    is the user's own, with no other members) keeps its backups.
 - **Opt out of automatic app-store updates with `PILOT_APP_UPDATE_OPT_OUT`.** The
   `pilot-updater` keeps installed apps current by periodically running
   `pilotctl appstore upgrade --all`. Set `PILOT_APP_UPDATE_OPT_OUT=true` in the
