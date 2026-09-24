@@ -1,6 +1,6 @@
 module github.com/pilot-protocol/pilotprotocol
 
-go 1.25.13
+go 1.26.0
 
 require (
 	github.com/coder/websocket v1.8.15
@@ -18,7 +18,7 @@ require (
 	github.com/pilot-protocol/trustedagents v0.2.6
 	github.com/pilot-protocol/updater v0.2.5
 	github.com/pilot-protocol/webhook v0.2.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
