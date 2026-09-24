@@ -463,14 +463,17 @@ func (b *proxiedBeacon) handle(w http.ResponseWriter, r *http.Request, lookup fu
 		conn.Close(websocket.StatusPolicyViolation, "auth_fail")
 		return
 	}
-	ok2, _ := json.Marshal(map[string]string{"type": "auth_ok"})
-	if err := conn.Write(ctx, websocket.MessageText, ok2); err != nil {
-		return
-	}
+	// Record the node before answering: the daemon's Start returns as soon
+	// as it reads auth_ok, and a test checking authed right after Start
+	// must not race this goroutine (it lost on a loaded CI runner).
 	b.authed.Store(reply.NodeID)
 	b.mu.Lock()
 	b.conns = append(b.conns, conn)
 	b.mu.Unlock()
+	ok2, _ := json.Marshal(map[string]string{"type": "auth_ok"})
+	if err := conn.Write(ctx, websocket.MessageText, ok2); err != nil {
+		return
+	}
 	for {
 		if _, _, err := conn.Read(r.Context()); err != nil {
 			return
