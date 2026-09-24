@@ -60,7 +60,75 @@ Detailed per-release notes are on the
   binary updates are never affected. Honors the existing
   `PILOT_UPDATER_NO_APP_UPGRADE` as a back-compat alias.
 
+### Changed
+- **Dependencies: skillinject v0.2.4, dataexchange v0.2.3, updater v0.2.5**
+  (plus common v0.5.14, and the sigstore-go v1.3.0 / go-openapi versions
+  updater v0.2.5 requires).
+  - skillinject: heartbeats are rendered literally, so a `$5` in a heartbeat is
+    no longer read as a regex group and dropped. A heartbeat-only edit now
+    reaches hosts. Retired surfaces from older manifests (the OpenClaw
+    `workspace/HEARTBEAT.md` block, the PicoClaw `workspace/AGENT.md` block, the
+    `pilotprotocol-prompt-injector` plugin and `~/.pilot/bin/pilot-ask`) are
+    removed on every tick, including on hosts that already ran
+    `pilotctl skills disable all`. The disclosure line in each block now says
+    `pilotctl skills disable all`. Existing blocks are rewritten in place once.
+  - dataexchange: the default inbox byte cap no longer deletes the whole inbox.
+    It evicts the oldest messages instead. Frames can carry optional request
+    and reply IDs, and a re-delivered frame with the same ID is stored only
+    once.
+  - updater: downloads resume after a stall instead of failing after 30 s. The
+    releases API call sends `GITHUB_TOKEN`/`GH_TOKEN` when set. On Linux, a
+    daemon under a systemd unit with `Restart=always` is now restarted onto the
+    new binary. In every other case the daemon keeps running and
+    `restart_error` says how to restart it. Every check is recorded in
+    `~/.pilot/update-state.json`.
+
 ### Fixed
+- **`pilotctl update` no longer reports success when the update failed.** It
+  used to print `Update check complete` (or `{"status":"ok"}`) and exit 0 even
+  when the check failed, for example on a GitHub rate limit. It now exits 1
+  with code `update_failed` and the updater's error. A successful run says
+  whether it installed a release or found the node up to date. When the
+  updater has recorded a failed daemon restart (`restart_error`), pilotctl asks
+  the daemon over IPC which version it runs before it says anything. The
+  record alone can be out of date: updater v0.2.5 keeps an earlier
+  `restart_error` after a manual update that restarted the daemon, and on
+  macOS it never clears it on a later check. If the daemon runs another
+  version, pilotctl warns and names the command that restarts it. If an
+  update leaves no daemon running, it says so and how to start it. If the
+  daemon already runs the installed version, it says nothing. `--json` adds
+  `result`, `updated`, `current_version`, `latest_version`, `restart_error`
+  (empty when the daemon runs the installed version), `restart_needed`,
+  `daemon_running`, `daemon_version` and `status_file`. Manual runs are now
+  recorded in `~/.pilot/update-state.json`, the file the pilot-updater service
+  writes.
+- **`pilotctl update status` shows what the updater last did.** Before, it only
+  showed whether auto-update was on. It now also shows the last check (time,
+  auto or manual, result), the last error, the failure streak, the installed
+  and latest versions and the last update. When a `restart_error` is recorded
+  it checks the daemon too, and shows one of three results.
+  `Daemon restart: NEEDED` means the daemon runs another version.
+  `daemon not running` means it runs the installed version once started.
+  `not needed` means the record is out of date. `--json` adds `status_file`,
+  `last_result`, `last_error`, `restart_error`, `restart_needed`,
+  `daemon_running`, `daemon_version` and the full record as `update_state`
+  (null when no check has been recorded).
+- **`pilotctl skills check`, `skills enable` and the `pilotctl update` skills
+  summary now count removals and print notes.** Retired surfaces that
+  skillinject cleaned up are counted (`remove:` and `removes` in `--json`) and
+  listed with what happened to each file. A helper or plugin file is
+  `deleted`. From a heartbeat file only the pilot block is stripped, and from
+  `openclaw.json` only the plugin entry is removed; both files are kept. When
+  skill injection is disabled, the summary says so: that pass installs nothing
+  and only cleans up retired surfaces. `--json` adds `disabled`. Rows that
+  carry a note are printed under `Notes:` and returned as `notes` in `--json`:
+  a heartbeat file shared with another tool, or a retired plugin that was
+  neutralized instead of removed. `skills disable all` counts `neutralized`
+  rows and prints their notes. `skills status --json` includes each row's
+  `note`, and `--verbose` prints it.
+- **`pilotctl skills status --verbose` prints per-file detail again.** `main`
+  consumed `--verbose` (and `-v`) as the global flag before the subcommand
+  saw it, so only `--verbose=true` worked.
 - **Watchdog restarts no longer orphan app-store apps.** When the inbound-path
   watchdog gave up on a wedged transport it called `os.Exit(86)` directly,
   skipping the graceful shutdown that stops plugins — so every installed app
