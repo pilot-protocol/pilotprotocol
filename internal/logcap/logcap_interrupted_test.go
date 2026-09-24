@@ -38,6 +38,13 @@ func holdLock(t *testing.T, path string) (release func()) {
 	return release
 }
 
+// pilotDir returns Options for a log directly in dir, as Pilot's own
+// directory: the one `pilotctl daemon start` puts each daemon's log in,
+// where a rotation also finishes the other daemons' interrupted ones.
+func pilotDir(dir string, maxBytes int64, maxBackups int) Options {
+	return Options{MaxBytes: maxBytes, MaxBackups: maxBackups, Within: []string{dir}}
+}
+
 // locked reports whether some open file description holds path's lock.
 func locked(t *testing.T, path string) bool {
 	t.Helper()
@@ -72,7 +79,7 @@ func TestCheckFinishesAnotherLogsInterruptedRotation(t *testing.T) {
 	f := openLog(t, path)
 	content := strings.Repeat("pilot-40 line\n", 5)
 	write(t, f, content)
-	mustRotate(t, New(f, anywhere(10, 3)))
+	mustRotate(t, New(f, pilotDir(dir, 10, 3)))
 
 	if got := gunzip(t, backupName(dead, 1)); got != "staged by pilot-22\n" {
 		t.Fatalf("%s = %q, want the staged copy", backupName(dead, 1), got)
@@ -112,7 +119,7 @@ func TestCheckLeavesAnotherRotationInProgressAlone(t *testing.T) {
 
 	path := filepath.Join(dir, "pilot-40.log")
 	f := openLog(t, path)
-	r := New(f, anywhere(10, 3))
+	r := New(f, pilotDir(dir, 10, 3))
 	write(t, f, strings.Repeat("a", 50))
 	mustRotate(t, r)
 	if got := readFile(t, stagingName(other)); got != "being copied\n" {
@@ -141,7 +148,7 @@ func TestCheckLeavesEmptyStagedCopyOfAnotherLogAlone(t *testing.T) {
 	path := filepath.Join(dir, "pilot-40.log")
 	f := openLog(t, path)
 	write(t, f, strings.Repeat("c", 50))
-	mustRotate(t, New(f, anywhere(10, 3)))
+	mustRotate(t, New(f, pilotDir(dir, 10, 3)))
 	if !exists(stagingName(other)) {
 		t.Fatal("empty staged copy removed")
 	}
@@ -151,10 +158,12 @@ func TestCheckLeavesEmptyStagedCopyOfAnotherLogAlone(t *testing.T) {
 }
 
 // TestCheckOnlyFinishesStagedCopiesOfOurs: the search for other logs'
-// interrupted rotations touches only regular files of this user at
-// "<log>.pilot.1" names; everything else in the directory — a link, a
-// directory, another user's file, a bare ".pilot.1", other rotators'
-// names — is left as it was, and so is anything outside the directory.
+// interrupted rotations touches only regular files of this user at the
+// staging names of `pilotctl daemon start`'s logs, pilot-<pid>.log.pilot.1;
+// everything else in the directory — a link, a directory, another user's
+// file at such a name, a bare ".pilot.1", other rotators' names, the
+// staging name of any other log — is left as it was, and so is anything
+// outside the directory.
 func TestCheckOnlyFinishesStagedCopiesOfOurs(t *testing.T) {
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "logs")
@@ -167,12 +176,12 @@ func TestCheckOnlyFinishesStagedCopiesOfOurs(t *testing.T) {
 	writeFile(t, outside, "outside the log directory\n")
 	secret := filepath.Join(t.TempDir(), "identity.json")
 	writeFile(t, secret, "SECRET-KEY-MATERIAL\n")
-	link := stagingName(filepath.Join(dir, "linked.log"))
+	link := stagingName(filepath.Join(dir, "pilot-1.log"))
 	symlink(t, secret, link)
-	if err := os.Mkdir(stagingName(filepath.Join(dir, "dir.log")), 0o700); err != nil {
+	if err := os.Mkdir(stagingName(filepath.Join(dir, "pilot-2.log")), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	theirs := stagingName(filepath.Join(dir, "theirs.log"))
+	theirs := stagingName(filepath.Join(dir, "pilot-3.log"))
 	writeFile(t, theirs, "another user's file\n")
 	fakeForeign(t, theirs)
 	untouched := map[string]string{
@@ -183,15 +192,25 @@ func TestCheckOnlyFinishesStagedCopiesOfOurs(t *testing.T) {
 		filepath.Join(dir, "x.log.1"):           "logrotate's\n",
 		filepath.Join(dir, "x.log.pilot.1.bak"): "not a staging name\n",
 	}
+	// Staging names of logs that are not `pilotctl daemon start`'s.
+	for _, log := range []string{
+		"x.log", "app", "pilot-daemon.log", "pilot-starting.log",
+		"pilot-.log", "pilot-12a.log", "pilot-12.log.1", "pilot-12",
+	} {
+		untouched[stagingName(filepath.Join(dir, log))] = "the staging name of " + log + "\n"
+	}
 	for name, content := range untouched {
 		writeFile(t, name, content)
 	}
+	// One that is: the scan did run.
+	orphan := filepath.Join(dir, "pilot-9.log")
+	writeFile(t, stagingName(orphan), "pilot-9's copy\n")
 	before := dirNames(t, dir)
 
 	path := filepath.Join(dir, "daemon.log")
 	f := openLog(t, path)
 	write(t, f, strings.Repeat("d", 50))
-	mustRotate(t, New(f, anywhere(10, 3)))
+	mustRotate(t, New(f, pilotDir(dir, 10, 3)))
 
 	for name, want := range untouched {
 		if got := readFile(t, name); got != want {
@@ -204,7 +223,16 @@ func TestCheckOnlyFinishesStagedCopiesOfOurs(t *testing.T) {
 	if got := readFile(t, secret); got != "SECRET-KEY-MATERIAL\n" {
 		t.Fatalf("link target changed: %q", got)
 	}
-	want := append([]string{"daemon.log", filepath.Base(backupName(path, 1))}, before...)
+	if got := gunzip(t, backupName(orphan, 1)); got != "pilot-9's copy\n" {
+		t.Fatalf("%s = %q, want pilot-9's copy finished", backupName(orphan, 1), got)
+	}
+	var want []string
+	for _, name := range before {
+		if name != filepath.Base(stagingName(orphan)) {
+			want = append(want, name)
+		}
+	}
+	want = append(want, "daemon.log", filepath.Base(backupName(path, 1)), filepath.Base(backupName(orphan, 1)))
 	sort.Strings(want)
 	if got := dirNames(t, dir); !equal(got, want) {
 		t.Fatalf("dir = %v, want %v", got, want)
@@ -214,6 +242,83 @@ func TestCheckOnlyFinishesStagedCopiesOfOurs(t *testing.T) {
 	}
 	if got := dirNames(t, parent); !equal(got, []string{"logs", filepath.Base(outside)}) {
 		t.Fatalf("parent dir = %v, want nothing created or removed there", got)
+	}
+}
+
+// TestCheckFinishesOrphansOnlyInPilotDirectory: other daemons' copies
+// are finished only where `pilotctl daemon start` puts its logs, a
+// Within directory itself. A log rotated anywhere else — explicitly, in a
+// shared /var/log; as the brew service log, in brew's var/log; in a
+// directory below ~/.pilot — leaves the other files in its directory
+// alone, even at a pilot-<pid>.log.pilot.1 name.
+func TestCheckFinishesOrphansOnlyInPilotDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// opts for a log in dir, with pilot as ~/.pilot.
+		opts func(pilot, dir string) Options
+		dir  func(root string) string
+	}{
+		{
+			"explicit, outside Within",
+			func(pilot, _ string) Options {
+				return Options{MaxBytes: 10, MaxBackups: 3, Anywhere: true, Within: []string{pilot}}
+			},
+			func(root string) string { return filepath.Join(root, "var", "log") },
+		},
+		{
+			"explicit, no Within",
+			func(string, string) Options { return anywhere(10, 3) },
+			func(root string) string { return filepath.Join(root, "var", "log") },
+		},
+		{
+			"brew service log",
+			func(pilot, dir string) Options {
+				return Options{MaxBytes: 10, MaxBackups: 3, Within: []string{pilot}, Files: []string{filepath.Join(dir, "pilot-daemon.log")}}
+			},
+			func(root string) string { return filepath.Join(root, "var", "log") },
+		},
+		{
+			"below Within",
+			func(pilot, _ string) Options { return Options{MaxBytes: 10, MaxBackups: 3, Within: []string{pilot}} },
+			func(root string) string { return filepath.Join(root, ".pilot", "logs") },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			pilot := filepath.Join(root, ".pilot")
+			dir := tc.dir(root)
+			for _, d := range []string{pilot, dir} {
+				if err := os.MkdirAll(d, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			others := map[string]string{
+				stagingName(filepath.Join(dir, "pilot-22.log")): "a pilot-<pid>.log copy\n",
+				filepath.Join(dir, "app.pilot.1"):               "logrotate's delaycompress generation\n",
+			}
+			for name, content := range others {
+				writeFile(t, name, content)
+			}
+			path := filepath.Join(dir, "pilot-daemon.log")
+			f := openLog(t, path)
+			content := strings.Repeat("o", 50)
+			write(t, f, content)
+			mustRotate(t, New(f, tc.opts(pilot, dir)))
+
+			if got := gunzip(t, backupName(path, 1)); got != content {
+				t.Fatalf("own backup = %q, want the log", got)
+			}
+			for name, want := range others {
+				if got := readFile(t, name); got != want {
+					t.Fatalf("%s = %q, want it untouched", name, got)
+				}
+			}
+			want := []string{"app.pilot.1", "pilot-22.log.pilot.1", "pilot-daemon.log", filepath.Base(backupName(path, 1))}
+			sort.Strings(want)
+			if got := dirNames(t, dir); !equal(got, want) {
+				t.Fatalf("dir = %v, want %v", got, want)
+			}
+		})
 	}
 }
 
@@ -443,7 +548,7 @@ func TestCheckFinishesCopyOfKilledDaemon(t *testing.T) {
 
 	path := filepath.Join(dir, "pilot-40.log")
 	f := openLog(t, path)
-	r := New(f, anywhere(10, 3))
+	r := New(f, pilotDir(dir, 10, 3))
 	write(t, f, strings.Repeat("h", 50))
 	mustRotate(t, r)
 	if exists(backupName(dead, 1)) {
@@ -483,7 +588,7 @@ func TestCheckWithoutFileLocking(t *testing.T) {
 
 	content := strings.Repeat("k", 50)
 	write(t, f, content)
-	mustRotate(t, New(f, anywhere(10, 3)))
+	mustRotate(t, New(f, pilotDir(dir, 10, 3)))
 	if got := gunzip(t, backupName(path, 1)); got != content {
 		t.Fatalf(".1.gz = %q, want the log", got)
 	}

@@ -5,6 +5,8 @@ package logcap
 import (
 	"compress/gzip"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -211,6 +213,159 @@ func TestCheckFinishesInterruptedRotation(t *testing.T) {
 	}
 	if exists(stagingName(path)) {
 		t.Fatal("staging copy left behind")
+	}
+}
+
+// readOnly opens path read-only. Such a descriptor cannot truncate the
+// log, as the daemon's cannot when the log is append-only (chflags
+// uappnd, chattr +a) or on a filesystem that refuses ftruncate.
+func readOnly(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// TestCheckKeepsGenerationsWhenLogCannotBeTruncated: a round that cannot
+// truncate the log keeps no backup, so it moves nothing — every
+// generation stays where it was, the oldest included, and no copy is
+// left — however many rounds fail. Once the log can be truncated again,
+// it rotates as if those rounds had not happened.
+func TestCheckKeepsGenerationsWhenLogCannotBeTruncated(t *testing.T) {
+	for _, gens := range [][]int{{1, 2, 3}, {1, 3}, {2, 3}, {1}, {3}, nil} {
+		t.Run(fmt.Sprint(gens), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.log")
+			old := map[int]string{}
+			for _, gen := range gens {
+				old[gen] = fmt.Sprintf("generation %d", gen)
+				writeFile(t, backupName(path, gen), old[gen])
+			}
+			content := strings.Repeat("l", 50)
+			writeFile(t, path, content)
+			before := dirNames(t, dir)
+
+			r := New(readOnly(t, path), anywhere(10, 3))
+			for round := range 3 {
+				rotated, err := r.Check()
+				if rotated || !errors.Is(err, errTruncate) {
+					t.Fatalf("round %d: Check = (%v, %v), want (false, errTruncate)", round, rotated, err)
+				}
+				if got := dirNames(t, dir); !equal(got, before) {
+					t.Fatalf("round %d: dir = %v, want %v (nothing moved, no copy left)", round, got, before)
+				}
+				for gen, want := range old {
+					if got := readFile(t, backupName(path, gen)); got != want {
+						t.Fatalf("round %d: %s = %q, want %q", round, backupName(path, gen), got, want)
+					}
+				}
+				if got := readFile(t, path); got != content {
+					t.Fatalf("round %d: log changed: %d bytes", round, len(got))
+				}
+			}
+
+			r.file = openLog(t, path)
+			mustRotate(t, r)
+			if got := gunzip(t, backupName(path, 1)); got != content {
+				t.Fatalf(".1.gz = %q, want the log", got)
+			}
+			for gen := 2; gen <= 3; gen++ {
+				want, ok := old[gen-1]
+				if got := exists(backupName(path, gen)); got != ok {
+					t.Fatalf("%s exists = %v, want %v", backupName(path, gen), got, ok)
+				}
+				if ok {
+					if got := readFile(t, backupName(path, gen)); got != want {
+						t.Fatalf("%s = %q, want %q", backupName(path, gen), got, want)
+					}
+				}
+			}
+			if exists(backupName(path, 4)) {
+				t.Fatal("kept more generations than maxBackups")
+			}
+		})
+	}
+}
+
+// TestUnstageLeavesGenerationOneFreeForACopyItCannotRemove: when the
+// copy of a log that could not be truncated cannot be removed either, it
+// is left for a later round to finish into generation 1, so the shift
+// stays and only the parked generation is dropped, as before parking.
+func TestUnstageLeavesGenerationOneFreeForACopyItCannotRemove(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.log")
+	for gen := 1; gen <= 3; gen++ {
+		writeFile(t, backupName(path, gen), fmt.Sprintf("generation %d", gen))
+	}
+	parked, err := shiftBackups(path, 3)
+	if err != nil || !parked {
+		t.Fatalf("shiftBackups = (%v, %v), want (true, nil)", parked, err)
+	}
+	// A name os.Remove fails on: a directory that is not empty.
+	if err := os.Mkdir(stagingName(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(stagingName(path), "x"), "x")
+
+	if err := unstage(path, 3, parked); err == nil {
+		t.Fatal("unstage reported no error for a copy it could not remove")
+	}
+	if exists(backupName(path, 1)) {
+		t.Fatal("generation 1 taken back while a copy is waiting for it")
+	}
+	for gen, want := range map[int]string{2: "generation 1", 3: "generation 2"} {
+		if got := readFile(t, backupName(path, gen)); got != want {
+			t.Fatalf("%s = %q, want %q", backupName(path, gen), got, want)
+		}
+	}
+	if exists(backupName(path, 4)) {
+		t.Fatal("parked generation not dropped")
+	}
+}
+
+// TestRetryAfter: after each round in a row that could not truncate the
+// log, the wait doubles, up to 64 intervals.
+func TestRetryAfter(t *testing.T) {
+	for failures, want := range map[int]time.Duration{
+		1: 1, 2: 2, 3: 4, 4: 8, 5: 16, 6: 32, 7: 64, 8: 64, 1000: 64,
+	} {
+		if got := retryAfter(time.Minute, failures); got != want*time.Minute {
+			t.Errorf("retryAfter(1m, %d) = %v, want %v", failures, got, want*time.Minute)
+		}
+	}
+}
+
+// TestTickBacksOffWhileLogCannotBeTruncated: the watcher does not copy a
+// log it cannot truncate every interval: it waits longer after each
+// failed round, and goes back to the interval once a round gets through.
+func TestTickBacksOffWhileLogCannotBeTruncated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	writeFile(t, path, strings.Repeat("t", 50))
+	r := New(readOnly(t, path), anywhere(10, 3))
+
+	for i, want := range []time.Duration{1, 2, 4, 8, 16, 32, 64, 64} {
+		wait, ok := r.tick(time.Minute)
+		if !ok || wait != want*time.Minute {
+			t.Fatalf("failed round %d: tick = (%v, %v), want (%v, true)", i+1, wait, ok, want*time.Minute)
+		}
+	}
+
+	w := openLog(t, path)
+	r.file = w
+	if wait, ok := r.tick(time.Minute); !ok || wait != time.Minute {
+		t.Fatalf("rotating round: tick = (%v, %v), want (1m, true)", wait, ok)
+	}
+	if got := readFile(t, path); got != "" {
+		t.Fatalf("log not truncated: %d bytes", len(got))
+	}
+
+	write(t, w, strings.Repeat("u", 50))
+	r.file = readOnly(t, path)
+	if wait, ok := r.tick(time.Minute); !ok || wait != time.Minute {
+		t.Fatalf("first failed round after one got through: tick = (%v, %v), want (1m, true)", wait, ok)
 	}
 }
 

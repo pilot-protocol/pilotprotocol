@@ -29,11 +29,18 @@ Detailed per-release notes are on the
     off unless you set `-log-max-size` explicitly, on the command line or in
     `config.json`, so your own rotation (logrotate, newsyslog) keeps working
     as before.
-  - A rotation interrupted by a crash or kill is finished by the next one in
-    that directory, including one left under a previous daemon's
-    `pilot-<pid>.log` name. A rotation holds its uncompressed copy
-    (`<log>.pilot.1`) locked with `flock` until it is compressed, so a copy
-    another running daemon is still working on is left alone.
+  - A rotation interrupted by a crash or kill is finished by the next
+    rotation of that log. In `~/.pilot` this includes a rotation left under
+    the `pilot-<pid>.log` name of a daemon that `pilotctl daemon start`
+    launched earlier. Only those names are finished this way, so another
+    program's `<name>.pilot.1` is never taken for one. A rotation holds its
+    uncompressed copy (`<log>.pilot.1`) locked with `flock` until it is
+    compressed, so a copy that another running daemon is still working on
+    is left alone.
+  - If the log cannot be truncated (an append-only file, or a filesystem
+    that refuses it), no backup is lost. The round's copy is removed, the
+    generations are put back, and the next attempt waits twice as long as
+    the last, up to about an hour.
   - It never touches files it did not create. The `.pilot` infix keeps its
     backups apart from logrotate's and newsyslog's names (`daemon.log.1`,
     `daemon.log.2.gz`, …). It skips a symlink or another user's file at one

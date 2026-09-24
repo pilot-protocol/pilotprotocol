@@ -262,6 +262,32 @@ func TestCheckLeavesOtherUsersFilesAlone(t *testing.T) {
 		}
 	})
 
+	t.Run("in the slot the oldest is parked in", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "daemon.log")
+		f := openLog(t, path)
+		for gen := 1; gen <= 3; gen++ {
+			writeFile(t, backupName(path, gen), fmt.Sprintf("ours-%d", gen))
+		}
+		writeFile(t, backupName(path, 4), "theirs-4")
+		fakeForeign(t, backupName(path, 4))
+		before := dirNames(t, dir)
+
+		write(t, f, strings.Repeat("p", 50))
+		rotateWithoutBackup(t, New(f, anywhere(10, 3)), path)
+		if got := readFile(t, backupName(path, 4)); got != "theirs-4" {
+			t.Fatalf("other user's file replaced: %q", got)
+		}
+		for gen := 1; gen <= 3; gen++ {
+			if got := readFile(t, backupName(path, gen)); got != fmt.Sprintf("ours-%d", gen) {
+				t.Fatalf("shift moved generations before stopping: %s = %q", backupName(path, gen), got)
+			}
+		}
+		if got := dirNames(t, dir); !equal(got, before) {
+			t.Fatalf("dir = %v, want %v", got, before)
+		}
+	})
+
 	t.Run("beyond the kept slots", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "daemon.log")
@@ -415,7 +441,10 @@ func TestCheckKeepsNoBackupInSharedDirectory(t *testing.T) {
 			writeFile(t, orphan, "another log's staged copy")
 
 			write(t, f, strings.Repeat("f", 50))
-			rotateWithoutBackup(t, New(f, anywhere(10, 3)), path)
+			// Within too, so the other log's copy is left alone because of
+			// the directory's permissions, not its scope.
+			opts := Options{MaxBytes: 10, MaxBackups: 3, Anywhere: true, Within: []string{dir}}
+			rotateWithoutBackup(t, New(f, opts), path)
 			want := []string{"daemon.log", filepath.Base(stagingName(path)), filepath.Base(backupName(path, 1)), filepath.Base(orphan)}
 			sort.Strings(want)
 			if got := dirNames(t, dir); !equal(got, want) {

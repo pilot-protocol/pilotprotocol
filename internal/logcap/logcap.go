@@ -19,6 +19,12 @@
 // written between the copy and the truncate are lost — the usual
 // copy-truncate trade-off, a window of milliseconds.
 //
+// The oldest generation is dropped only once the log is truncated. A log
+// that cannot be truncated (an append-only file, a filesystem that
+// refuses it) keeps all its generations: the copy is removed and the
+// shift undone, and the daemon retries at growing intervals rather than
+// copying the whole log every minute.
+//
 // Files logcap did not create are left alone. The ".pilot" infix keeps
 // its names apart from the ones other rotators give the same log
 // (logrotate's <log>.1 and <log>.N.gz, newsyslog's <log>.0.gz), so an
@@ -33,12 +39,17 @@
 // creates nothing where someone else could have planted a link.
 //
 // A rotation that dies between the copy and the compress (crash, kill)
-// leaves <log>.pilot.1 behind; the next rotation in that directory
-// finishes it. That includes another log's copy: `pilotctl daemon start`
-// names each daemon's log pilot-<pid>.log, so no later daemon writes to
-// the name a crashed one staged under. A rotation holds its staged copy
-// flock(2)ed from creation until it is compressed, which is how a copy
-// another live daemon is still working on is told apart and left alone.
+// leaves <log>.pilot.1 behind; the next rotation of that log finishes
+// it. `pilotctl daemon start` names each daemon's log pilot-<pid>.log,
+// so no later daemon rotates the name a crashed one staged under: a
+// rotation in the directory `pilotctl daemon start` uses (one of
+// Options.Within, not a directory below it) also finishes the copies of
+// those logs, pilot-<pid>.log.pilot.1. It takes no other <name>.pilot.1
+// for an interrupted copy: that may be another program's file, such as
+// logrotate's delaycompress generation of a log named <name>.pilot. A
+// rotation holds its staged copy flock(2)ed from creation until it is
+// compressed, which is how a copy another live daemon is still working
+// on is told apart and left alone.
 //
 // Options.Anywhere, Options.Within and Options.Files set where it
 // applies: the daemon rotates by default only a log Pilot set up —
@@ -77,7 +88,10 @@ type Options struct {
 	// inside one of the Within directories (at any depth), or at one of
 	// the Files paths, is rotated, so the zero Options rotate nothing.
 	Anywhere bool
-	Within   []string
+	// Within are Pilot's own directories. A rotation of a log directly in
+	// one of them, with or without Anywhere, also finishes the
+	// interrupted rotations of `pilotctl daemon start`'s logs there.
+	Within []string
 	// Files are single logs in scope in a directory that is not Pilot's
 	// as a whole, such as the Homebrew service's
 	// <prefix>/var/log/pilot-daemon.log. A log matches one by name within
@@ -94,6 +108,10 @@ type Rotator struct {
 	anywhere   bool
 	within     []string
 	files      []string
+
+	// truncateFailures counts the rounds in a row, up to now, in which
+	// the log could not be truncated (tick).
+	truncateFailures int
 }
 
 // New returns a Rotator that rotates f once it exceeds opts.MaxBytes.
@@ -120,8 +138,17 @@ var errOutOfScope = errors.New("log is outside the directories rotation is limit
 // still in progress, in this process or another.
 var errBusy = errors.New("staged copy is in use by another rotation")
 
+// errTruncate reports a log that could not be truncated. Nothing was
+// rotated, and run retries at growing intervals (retryAfter).
+var errTruncate = errors.New("truncate log")
+
+// maxRetryDoublings caps retryAfter at 2^6 = 64 intervals, about an hour
+// at the daemon's one-minute interval.
+const maxRetryDoublings = 6
+
 // Watch checks f every interval until ctx is done, rotating it whenever it
-// has grown past opts.MaxBytes. It returns false, starting nothing, when
+// has grown past opts.MaxBytes; less often while f cannot be truncated
+// (retryAfter). It returns false, starting nothing, when
 // capping is disabled (MaxBytes <= 0), f is not a regular file, the
 // platform cannot map a descriptor back to its path, or the log is out of
 // scope (see Options.Anywhere).
@@ -145,29 +172,54 @@ func Watch(ctx context.Context, f *os.File, opts Options, interval time.Duration
 }
 
 func (r *Rotator) run(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
 		// Check first so a log already over the limit at startup is
 		// rotated right away rather than an interval later.
-		rotated, err := r.Check()
-		switch {
-		case err == nil:
-		case errors.Is(err, errOutOfScope):
-			// Moved out of the pilot directory: someone else's log now.
-			slog.Info("log rotation stopped", "reason", err)
+		wait, ok := r.tick(interval)
+		if !ok {
 			return
-		case rotated:
-			slog.Warn("log truncated without keeping a backup", "err", err)
-		default:
-			slog.Warn("log rotation failed", "err", err)
 		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
+}
+
+// tick runs one Check and logs its outcome. It returns how long to wait
+// before the next one, or false once rotation has stopped for good.
+func (r *Rotator) tick(interval time.Duration) (time.Duration, bool) {
+	rotated, err := r.Check()
+	if !errors.Is(err, errTruncate) {
+		r.truncateFailures = 0
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, errOutOfScope):
+		// Moved out of the pilot directory: someone else's log now.
+		slog.Info("log rotation stopped", "reason", err)
+		return 0, false
+	case rotated:
+		slog.Warn("log truncated without keeping a backup", "err", err)
+	case errors.Is(err, errTruncate):
+		r.truncateFailures++
+		wait := retryAfter(interval, r.truncateFailures)
+		slog.Warn("log rotation failed", "err", err, "retry_in", wait)
+		return wait, true
+	default:
+		slog.Warn("log rotation failed", "err", err)
+	}
+	return interval, true
+}
+
+// retryAfter is the wait after the log could not be truncated failures
+// rounds in a row. Each such round copies the whole log for nothing, so
+// the wait doubles with every failure: 1, 2, 4 … up to 64 intervals.
+func retryAfter(interval time.Duration, failures int) time.Duration {
+	return interval << min(max(failures-1, 0), maxRetryDoublings)
 }
 
 // Check rotates the log if it has grown past the limit and reports
@@ -199,9 +251,10 @@ func (r *Rotator) rotate(fi os.FileInfo) (bool, error) {
 	}
 
 	var staged *os.File
+	var parked bool
 	if src != nil {
 		if r.maxBackups > 0 {
-			staged, backupErr = stage(src, path, r.maxBackups)
+			staged, parked, backupErr = stage(src, path, r.maxBackups)
 		}
 		_ = src.Close()
 	}
@@ -211,15 +264,16 @@ func (r *Rotator) rotate(fi os.FileInfo) (bool, error) {
 	}
 
 	if err := truncate(r.file); err != nil {
+		err = fmt.Errorf("%w: %w", errTruncate, err)
 		if staged != nil {
-			// Keep the next round from compressing a duplicate.
-			_ = os.Remove(staged.Name())
+			err = errors.Join(err, unstage(path, r.maxBackups, parked))
 		}
-		return false, fmt.Errorf("truncate log: %w", err)
+		return false, err
 	}
 
 	backup := ""
 	if staged != nil {
+		dropParked(path, r.maxBackups, parked)
 		backup = backupName(path, 1)
 		if err := compress(staged.Name(), backup); err != nil {
 			backupErr = fmt.Errorf("compress %s: %w", staged.Name(), err)
@@ -231,11 +285,27 @@ func (r *Rotator) rotate(fi os.FileInfo) (bool, error) {
 		"size_bytes", fi.Size(),
 		"max_bytes", r.maxBytes,
 		"backup", backup)
-	if staged != nil {
+	if staged != nil && r.isWithinDir(filepath.Dir(path)) {
 		// After this log's own rotation, so the log is capped first.
 		finishOrphans(path)
 	}
 	return true, backupErr
+}
+
+// unstage undoes stage after the log could not be truncated: this round
+// keeps no backup, so nothing moves. It removes the copy, which also
+// keeps the next round from compressing a duplicate, and then moves the
+// generations back down. A copy it cannot remove stays for a later round
+// to finish into generation 1, which is left free for it.
+func unstage(path string, keep int, parked bool) error {
+	if err := os.Remove(stagingName(path)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		dropParked(path, keep, parked)
+		return fmt.Errorf("remove copy of a log not truncated: %w", err)
+	}
+	if err := unshiftBackups(path, keep, parked); err != nil {
+		return fmt.Errorf("restore backups: %w", err)
+	}
+	return nil
 }
 
 // openByPath opens the log for reading via its path — the write-only
@@ -265,6 +335,22 @@ func (r *Rotator) openByPath(fi os.FileInfo) (string, *os.File, error) {
 func namesFile(path string, fi os.FileInfo) bool {
 	pfi, err := os.Lstat(path)
 	return err == nil && os.SameFile(fi, pfi)
+}
+
+// isWithinDir reports whether dir is one of r.within itself (not a
+// directory below it), compared by identity: where `pilotctl daemon
+// start` puts each daemon's log.
+func (r *Rotator) isWithinDir(dir string) bool {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	for _, d := range r.within {
+		if wfi, err := os.Stat(d); err == nil && os.SameFile(fi, wfi) {
+			return true
+		}
+	}
+	return false
 }
 
 // inScope reports whether path is one of r.files or lies inside one of
@@ -325,25 +411,31 @@ func (r *Rotator) isScopedFile(path string) bool {
 // stage prepares this round's backup: it finishes an interrupted
 // rotation, shifts the older generations up and copies the log (src,
 // open at offset 0) to <path>.pilot.1, which it returns open and locked
-// for the caller to close once it is compressed. An error means no
-// backup is kept this round; nothing has moved when the interrupted
-// rotation could not be finished.
-func stage(src *os.File, path string, keep int) (*os.File, error) {
+// for the caller to close once it is compressed. The oldest generation
+// is parked rather than dropped (parked reports whether there was one):
+// the caller drops it once the log is truncated (dropParked), or undoes
+// the round if it cannot be (unstage). An error means no backup is kept
+// this round; nothing has moved when the interrupted rotation could not
+// be finished.
+func stage(src *os.File, path string, keep int) (held *os.File, parked bool, err error) {
 	if err := checkDir(filepath.Dir(path)); err != nil {
-		return nil, fmt.Errorf("keeping no backup: %w", err)
+		return nil, false, fmt.Errorf("keeping no backup: %w", err)
 	}
 	if err := finishStaged(path, false); err != nil {
-		return nil, fmt.Errorf("keeping no backup: finish interrupted rotation %s: %w", stagingName(path), err)
+		return nil, false, fmt.Errorf("keeping no backup: finish interrupted rotation %s: %w", stagingName(path), err)
 	}
-	if err := shiftBackups(path, keep); err != nil {
-		return nil, fmt.Errorf("keeping no backup: %w", err)
+	parked, err = shiftBackups(path, keep)
+	if err != nil {
+		dropParked(path, keep, parked)
+		return nil, false, fmt.Errorf("keeping no backup: %w", err)
 	}
 	staged := stagingName(path)
-	held, err := createStaged(src, staged)
+	held, err = createStaged(src, staged)
 	if err != nil {
-		return nil, fmt.Errorf("copy log to %s: %w", staged, err)
+		dropParked(path, keep, parked)
+		return nil, false, fmt.Errorf("copy log to %s: %w", staged, err)
 	}
-	return held, nil
+	return held, parked, nil
 }
 
 // truncate empties the log through the writer's own descriptor.
@@ -460,16 +552,19 @@ func checkDir(dir string) error {
 	return nil
 }
 
-// shiftBackups frees the <path>.pilot.1.gz slot: the oldest generation is
-// dropped and each remaining one moves up by one. Generations beyond keep
-// (left from a larger -log-max-backups) are removed too, up to the first
-// gap. Every slot up to keep is checked before anything moves, so a name
-// holding something that is not ours stops the shift with the
+// shiftBackups frees the <path>.pilot.1.gz slot: each generation moves up
+// by one. The oldest, generation keep, is not dropped yet but parked at
+// keep+1 (parked reports whether it existed), so that unshiftBackups can
+// put everything back until the log is truncated; dropParked then drops
+// it. Generations beyond keep (left from a larger -log-max-backups, or a
+// round that died with one parked) are removed first, up to the first
+// gap. Every slot up to keep+1 is checked before anything moves, so a
+// name holding something that is not ours stops the shift with the
 // generations intact.
-func shiftBackups(path string, keep int) error {
-	for gen := 1; gen <= keep; gen++ {
+func shiftBackups(path string, keep int) (parked bool, err error) {
+	for gen := 1; gen <= keep+1; gen++ {
 		if _, err := lookup(backupName(path, gen)); err != nil {
-			return err
+			return false, err
 		}
 	}
 	for gen := keep + 1; ; gen++ {
@@ -481,16 +576,39 @@ func shiftBackups(path string, keep int) error {
 			break
 		}
 	}
-	if err := os.Remove(backupName(path, keep)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	for gen := keep - 1; gen >= 1; gen-- {
+	for gen := keep; gen >= 1; gen-- {
 		err := os.Rename(backupName(path, gen), backupName(path, gen+1))
+		switch {
+		case err == nil:
+			parked = parked || gen == keep
+		case !errors.Is(err, fs.ErrNotExist):
+			return parked, err
+		}
+	}
+	return parked, nil
+}
+
+// unshiftBackups undoes a completed shiftBackups: each generation moves
+// back down by one, the parked one included.
+func unshiftBackups(path string, keep int, parked bool) error {
+	top := keep
+	if parked {
+		top = keep + 1
+	}
+	for gen := 2; gen <= top; gen++ {
+		err := os.Rename(backupName(path, gen), backupName(path, gen-1))
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 	}
 	return nil
+}
+
+// dropParked removes the generation shiftBackups parked, if it parked one.
+func dropParked(path string, keep int, parked bool) {
+	if parked {
+		_ = os.Remove(backupName(path, keep+1))
+	}
 }
 
 // finishStaged compresses <log>.pilot.1, a copy left by a rotation that
@@ -537,11 +655,13 @@ func finishStaged(log string, orphan bool) error {
 	return compress(staged, backupName(log, 1))
 }
 
-// finishOrphans finishes the interrupted rotations of the other logs in
-// path's directory (finishStaged). `pilotctl daemon start` gives each
-// daemon a log of its own, pilot-<pid>.log, so the copy a daemon staged
-// before it died is under a name no later daemon rotates. Best effort: a
-// copy it cannot finish stays for a later round.
+// finishOrphans finishes the interrupted rotations of the other
+// daemons' logs in path's directory, the one `pilotctl daemon start`
+// uses (finishStaged). It gives each daemon a log of its own,
+// pilot-<pid>.log, so the copy a daemon staged before it died is under a
+// name no later daemon rotates. It considers only those names: any other
+// <name>.pilot.1 may be another program's file. Best effort: a copy it
+// cannot finish stays for a later round.
 func finishOrphans(path string) {
 	dir := filepath.Dir(path)
 	entries, err := os.ReadDir(dir)
@@ -552,13 +672,33 @@ func finishOrphans(path string) {
 	own := filepath.Base(stagingName(path))
 	for _, e := range entries {
 		log, ok := strings.CutSuffix(e.Name(), stagingSuffix)
-		if !ok || log == "" || e.Name() == own {
+		if !ok || !isDaemonStartLog(log) || e.Name() == own {
 			continue
 		}
 		if err := finishStaged(filepath.Join(dir, log), true); err != nil && !errors.Is(err, errBusy) {
 			slog.Warn("log rotation: could not finish interrupted backup", "path", filepath.Join(dir, e.Name()), "err", err)
 		}
 	}
+}
+
+// isDaemonStartLog reports whether name is a log `pilotctl daemon start`
+// names after its daemon: pilot-<pid>.log. Keep in step with
+// cmd/pilotctl's daemon start.
+func isDaemonStartLog(name string) bool {
+	pid, ok := strings.CutPrefix(name, "pilot-")
+	if !ok {
+		return false
+	}
+	pid, ok = strings.CutSuffix(pid, ".log")
+	if !ok || pid == "" {
+		return false
+	}
+	for _, c := range pid {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // createStaged copies src (from its current offset to EOF) into a new
