@@ -28,12 +28,14 @@ import (
 //     outbound TCP/HTTP connection, whatever the transport.
 //
 // opts are passed to netproxy.NewResolver. For an egress proxy that
-// rotates its credentials, pass netproxy.WithRefreshCommand (the daemon's
-// -proxy-cmd): the command's output then supplies the proxy URL — the
+// rotates its credentials, pass a refresh source — netproxy.WithRefreshCommand,
+// or netproxy.WithRefreshFunc over proxyconf.CommandSource as pilot-daemon
+// does for -proxy-cmd: its output then supplies the proxy URL — the
 // explicit one, or under auto the environment's (NO_PROXY still honoured)
 // — re-read every netproxy.DefaultRefreshInterval and whenever the proxy
-// answers 407, after which the rejected connection is retried once. With a
-// refresh command, ResolveProxy runs it once before returning; a failing
+// rejects the credentials (407, or a CONNECT answer that cannot be
+// parsed), after which the rejected connection is retried once. With a
+// refresh source, ResolveProxy runs it once before returning; a failing
 // run leaves the launch-time proxy in use (the error goes to
 // netproxy.WithRefreshErrorHandler).
 //

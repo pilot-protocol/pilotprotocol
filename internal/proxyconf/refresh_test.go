@@ -35,6 +35,12 @@ type rotatingProxy struct {
 	pass string
 	oks  map[string]int // password -> accepted CONNECTs
 	n407 int
+	// garble answers rejected credentials with a status line net/http
+	// cannot parse, the way Meta Muse's proxy does ("malformed HTTP
+	// status code"), instead of a clean 407.
+	garble bool
+	// refuse answers every CONNECT with this status (0: none).
+	refuse int
 }
 
 func newRotatingProxy(t *testing.T, pass, upstream string) *rotatingProxy {
@@ -93,9 +99,18 @@ func (p *rotatingProxy) serve(c net.Conn) {
 	} else {
 		p.n407++
 	}
+	garble, refuse := p.garble, p.refuse
 	p.mu.Unlock()
 	if req.Method != http.MethodConnect || !good {
+		if garble {
+			fmt.Fprint(c, "HTTP/1.1 4O7 Proxy Authentication Required\r\n\r\n")
+			return
+		}
 		fmt.Fprint(c, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"t\"\r\nContent-Length: 0\r\n\r\n")
+		return
+	}
+	if refuse != 0 {
+		fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n", refuse, http.StatusText(refuse))
 		return
 	}
 	up, err := net.Dial("tcp", p.upstream)
@@ -279,7 +294,7 @@ func TestRoundTripperRetriesAfterRotation(t *testing.T) {
 	// place by ConfigureTransport — RoundTripper must not let that hook
 	// swallow the 407 before RefreshingTransport sees it.
 	base := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // #nosec G402 -- test server
-	ConfigureTransport(base, r)
+	ConfigureTransport(base, r, nil)
 	rt := RoundTripper(r, base)
 	client := &http.Client{Transport: rt, Timeout: 10 * time.Second}
 	defer client.CloseIdleConnections()
@@ -354,7 +369,7 @@ func TestConfigureTransportRefreshesOn407(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // #nosec G402 -- test server
-	ConfigureTransport(tr, r)
+	ConfigureTransport(tr, r, nil)
 	clone := tr.Clone() // a plugin that cloned DefaultTransport
 	for name, rt := range map[string]*http.Transport{"configured": tr, "clone": clone} {
 		client := &http.Client{Transport: rt, Timeout: 10 * time.Second}
@@ -385,9 +400,9 @@ func TestConfigureTransportRefreshesOn407(t *testing.T) {
 			t.Fatalf("%s: accepted %v, want the refreshed %s once", name, oks, pass)
 		}
 	}
-	ConfigureTransport(nil, r)
+	ConfigureTransport(nil, r, nil)
 	plain := &http.Transport{}
-	ConfigureTransport(plain, nil)
+	ConfigureTransport(plain, nil, nil)
 	if plain.Proxy != nil || plain.OnProxyConnectResponse != nil {
 		t.Error("ConfigureTransport(nil resolver) changed the transport")
 	}

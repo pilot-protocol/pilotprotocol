@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/netproxy"
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon/routing"
 )
 
@@ -272,14 +273,18 @@ func tlsTrustHint(err error, what string) string {
 }
 
 // ProxyRefusalHint explains a connection the egress proxy refused, "" for
-// any other error. The ConnectError itself never quotes the proxy.
+// any other error: a rejection of the credentials (407, or a CONNECT
+// answer so garbled it cannot be parsed, which is how Meta Muse's proxy
+// rejects them; see proxyconf.CredentialHint), or any other refusal.
+// Neither the ConnectError nor netproxy's report of a garbled answer ever
+// quotes the proxy.
 func ProxyRefusalHint(err error) string {
+	if hint := proxyconf.CredentialHint(err); hint != "" {
+		return hint
+	}
 	var ce *netproxy.ConnectError
 	if !errors.As(err, &ce) {
 		return ""
-	}
-	if ce.StatusCode == http.StatusProxyAuthRequired {
-		return "the proxy rejected its credentials (407), also after re-reading them: check HTTPS_PROXY / -proxy; if the proxy rotates its credentials, set -proxy-cmd ($PILOT_PROXY_CMD, config.json proxy_cmd) to a command that prints the current proxy URL"
 	}
 	return fmt.Sprintf("the proxy refused CONNECT %s (HTTP %d): it must allow CONNECT to the Pilot registry and beacon on port 443", ce.Target, ce.StatusCode)
 }

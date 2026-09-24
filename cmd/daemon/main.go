@@ -117,7 +117,7 @@ func main() {
 	// credentials.
 	transportMode := flag.String("transport", "", "tunnel transport: 'udp' (the default), 'compat' (registry over TLS and beacon over WSS, TCP 443 only, for UDP-blocked or proxy-only hosts) or 'auto' (udp when the beacon answers over UDP, otherwise compat when TCP 443 is reachable, through the proxy if there is one — also when a configured proxy refuses the check, so nothing is dialed past the proxy). Precedence: this flag, $PILOT_TRANSPORT, config.json \"transport\", udp.")
 	proxySpec := flag.String("proxy", "", "outbound proxy for registry, beacon and HTTP connections: 'auto' (the default: with compat, HTTPS_PROXY/ALL_PROXY from the environment, honoring NO_PROXY; nothing with udp), 'off' (also none, no, false, direct), or an http:// or https:// proxy URL, http://[user:pass@]host:port, used for every connection except loopback. Precedence: this flag, $PILOT_PROXY, config.json \"proxy\", auto.")
-	proxyCmd := flag.String("proxy-cmd", "", "command (run with sh -c) whose output is the current proxy URL, for egress proxies that rotate their credentials: it supplies the URL -proxy would use (the explicit URL, or with auto and compat the environment's proxy) and is re-run once 60s have passed and whenever the proxy answers 407, after which that connection is retried once, so new connections always carry fresh credentials. Example: bash -c 'printf %s \"$https_proxy\"'. Precedence: this flag, $PILOT_PROXY_CMD, config.json \"proxy_cmd\".")
+	proxyCmd := flag.String("proxy-cmd", "", "command (run with sh -c) whose output is the current proxy URL, for egress proxies that rotate their credentials: it supplies the URL -proxy would use (the explicit URL, or with auto and compat the environment's proxy) and is re-run once 60s have passed and whenever the proxy rejects the credentials (407, or a CONNECT answer that cannot be parsed), after which that connection is retried once, so new connections always carry fresh credentials; the apps the daemon starts get HTTPS_PROXY pointing at a loopback relay in the daemon that adds them. Runs in the environment the daemon was started with. Example: bash -c 'printf %s \"$https_proxy\"'. Precedence: this flag, $PILOT_PROXY_CMD, config.json \"proxy_cmd\".")
 	compatBeacon := flag.String("compat-beacon", defaultCompatBeacon, "beacon WSS URL for -transport=compat")
 	tlsTrust := flag.String("tls-trust", "system", "TLS trust store for -transport=compat: 'system' (OS trust store; current default while compat mode uses Let's Encrypt certs on beacon.pilotprotocol.network — on a host without a CA bundle set SSL_CERT_FILE or SSL_CERT_DIR) or 'pinned' (Pilot CA root embedded in the daemon binary; will become the default in a future release once production root ships)")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -331,7 +331,11 @@ func main() {
 	*noSkillinject = profileOptions.DisableSkillinject
 	*motdFeedURL = profileOptions.MOTDFeedURL
 
-	installDefaultTransportProxy(proxyResolver)
+	// The proxy relay first: DefaultTransport tunnels through it, and with
+	// -proxy-cmd the apps the app store spawns inherit the environment it
+	// exports.
+	proxyRelay := startProxyRelay(proxyResolver, proxyCommandFor(*proxySpec, *proxyCmd, transport, false))
+	installDefaultTransportProxy(proxyResolver, proxyRelay)
 	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyResolver),
 		"transport_from", transportSrc, "registry", *registryAddr, "registry_tls", *registryTLS)
 
@@ -751,6 +755,7 @@ func main() {
 	// matters). A daemon-requested exit leaves here via os.Exit with its
 	// code once the teardown finishes.
 	shutdown(cause, func() { d.Stop() }, rt.StopPlugins, os.Exit)
+	_ = proxyRelay.Close() // the plugins and apps are stopped
 	if cause.restart {
 		executable, err := os.Executable()
 		if err != nil {
@@ -759,7 +764,9 @@ func main() {
 		}
 		slog.Info("restarting daemon after graceful shutdown")
 		// #nosec G204,G702 -- restart re-execs the current OS-resolved daemon directly; signed fleet commands cannot supply a path or arguments.
-		if err := syscall.Exec(executable, os.Args, os.Environ()); err != nil {
+		// The launch environment, not os.Environ(): that may point the proxy
+		// variables at this daemon's proxy relay, which is gone once it execs.
+		if err := syscall.Exec(executable, os.Args, launchEnvironment); err != nil {
 			slog.Error("remote daemon restart failed", "err", err)
 		}
 	}

@@ -18,12 +18,15 @@
 // scheme, or another scheme — is rejected, so a typo can never turn into a
 // proxy host name. Errors and display strings never contain credentials.
 //
-// Rotating credentials are netproxy's business: a Resolver built with
-// netproxy.WithRefreshCommand (the -proxy-cmd / $PILOT_PROXY_CMD /
-// config.json proxy_cmd setting) re-reads the proxy URL every
-// netproxy.DefaultRefreshInterval and whenever a proxy answers 407, and
-// netproxy's Dialer and RefreshingTransport retry that connection once with
-// the new credentials. This package only adds the loopback rule on top.
+// Rotating credentials are mostly netproxy's business: a Resolver with a
+// refresh source (the -proxy-cmd / $PILOT_PROXY_CMD / config.json proxy_cmd
+// setting; see CommandSource) re-reads the proxy URL every
+// netproxy.DefaultRefreshInterval and whenever a proxy rejects the
+// credentials, and netproxy's Dialer and RefreshingTransport retry that
+// connection once with the new ones. This package adds the loopback rule on
+// top, and the Relay: a loopback CONNECT proxy that gives the processes the
+// daemon starts, which cannot re-read anything, the same refreshed
+// credentials.
 package proxyconf
 
 import (
@@ -262,17 +265,45 @@ func (t *loopbackSplit) CloseIdleConnections() {
 
 // ConfigureTransport routes tr (in place) through r, for transports that
 // cannot be wrapped — http.DefaultTransport, which plugin HTTP clients use
-// or clone: tr.Proxy follows r's current settings (loopback always
-// direct), and a 407 answer to a CONNECT refreshes r before the request
-// fails, so the next request carries the new credentials. (Wrapped clients,
-// see RoundTripper, also retry the failed request.) Every refused CONNECT
-// fails with a *netproxy.ConnectError, whose message never quotes the
-// proxy's reason phrase. A nil r leaves tr alone.
-func ConfigureTransport(tr *http.Transport, r *netproxy.Resolver) {
+// or clone. tr.Proxy follows r's current settings, loopback always direct.
+//
+// relay, when set, is the URL of a Relay for r (Relay.URL): requests that
+// net/http tunnels with CONNECT (https://, wss://) then go to the proxy
+// through it, and the Relay's netproxy.Dialer handles a rejection of the
+// credentials — a 407, or a CONNECT answer so garbled it cannot be parsed
+// (Meta Muse's form) — by refreshing r and retrying the tunnel once, so the
+// request succeeds, and no proxy-supplied text reaches an error. Plain
+// http:// requests, which a proxy forwards rather than tunnels, keep going
+// to the proxy r names. The daemon passes its Relay whenever it proxies.
+//
+// Without a relay, a 407 answer to a CONNECT refreshes r before the
+// request fails, so the next request carries the new credentials, and the
+// refusal fails with a *netproxy.ConnectError, whose message never quotes
+// the proxy's reason phrase. An answer net/http cannot parse fails with
+// net/http's own error (which quotes the offending status text) and
+// refreshes nothing: net/http never passes it to this hook. (Wrapped
+// clients, see RoundTripper, handle both forms and also retry the failed
+// request.) A nil r leaves tr alone.
+func ConfigureTransport(tr *http.Transport, r *netproxy.Resolver, relay *url.URL) {
 	if tr == nil || r == nil {
 		return
 	}
-	tr.Proxy = RequestProxy(r)
+	direct := RequestProxy(r)
+	relayHost := ""
+	if relay == nil {
+		tr.Proxy = direct
+	} else {
+		via := *relay
+		relayHost = via.Host
+		tr.Proxy = func(req *http.Request) (*url.URL, error) {
+			u, err := direct(req)
+			if err != nil || u == nil || !tunnelled(req) {
+				return u, err
+			}
+			v := via
+			return &v, nil
+		}
+	}
 	next := tr.OnProxyConnectResponse
 	tr.OnProxyConnectResponse = func(ctx context.Context, proxyURL *url.URL, connectReq *http.Request, res *http.Response) error {
 		if next != nil {
@@ -283,11 +314,59 @@ func ConfigureTransport(tr *http.Transport, r *netproxy.Resolver) {
 		if res.StatusCode == http.StatusOK {
 			return nil
 		}
+		ce := &netproxy.ConnectError{Target: connectReq.Host, StatusCode: res.StatusCode}
+		if relayHost != "" && proxyURL != nil && proxyURL.Host == relayHost {
+			// The relay's own answer: its reason phrase carries why the
+			// tunnel upstream failed, in netproxy's words.
+			if detail := relayDetail(res.Status); detail != "" {
+				return &relayRefusal{ConnectError: ce, detail: detail}
+			}
+			return ce
+		}
 		if res.StatusCode == http.StatusProxyAuthRequired {
 			_ = r.Refresh(ctx) // failures keep the last good settings; netproxy reports them
 		}
-		return &netproxy.ConnectError{Target: connectReq.Host, StatusCode: res.StatusCode}
+		return ce
 	}
+}
+
+// relayRefusal is a Relay's refusal of a CONNECT as ConfigureTransport
+// reports it: the netproxy error the Relay met upstream (detail, which
+// never holds credentials or proxy-supplied text), and the Relay's own
+// status as the ConnectError it unwraps to.
+type relayRefusal struct {
+	*netproxy.ConnectError
+	detail string
+}
+
+func (e *relayRefusal) Error() string { return e.detail }
+
+func (e *relayRefusal) Unwrap() error { return e.ConnectError }
+
+// relayDetail extracts the reason writeRelayStatus put in a Relay's status
+// line ("502 Bad Gateway (pilot-daemon proxy relay: <detail>)"), "" when
+// there is none. It is passed through reasonText again: the status line
+// came over a socket.
+func relayDetail(status string) string {
+	const marker = " (" + relayReasonPrefix
+	i := strings.Index(status, marker)
+	if i < 0 || !strings.HasSuffix(status, ")") {
+		return ""
+	}
+	return reasonText(status[i+len(marker) : len(status)-1])
+}
+
+// tunnelled reports whether net/http reaches req's target through a
+// CONNECT tunnel when it uses a proxy.
+func tunnelled(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	switch strings.ToLower(req.URL.Scheme) {
+	case "https", "wss":
+		return true
+	}
+	return false
 }
 
 // AuthRejected reports whether err is a proxy's refusal of the credentials
@@ -295,6 +374,34 @@ func ConfigureTransport(tr *http.Transport, r *netproxy.Resolver) {
 func AuthRejected(err error) bool {
 	var ce *netproxy.ConnectError
 	return errors.As(err, &ce) && ce.StatusCode == http.StatusProxyAuthRequired
+}
+
+// UnreadableConnectReply reports whether err is netproxy's report of a
+// CONNECT answer it could not parse. Some egress proxies (Meta Muse's)
+// answer wrong or expired credentials this way; HTTP clients show it as
+// "malformed HTTP status code". netproxy's Dialer and RefreshingTransport
+// treat it as a rejection of the credentials (refresh, retry once); its
+// error type is unexported, so this matches the fixed wording netproxy
+// gives it ("read CONNECT response: <fault> (response text withheld)").
+func UnreadableConnectReply(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "read CONNECT response: ") && strings.Contains(msg, "(response text withheld)")
+}
+
+// CredentialHint explains a proxy's rejection of the credentials — a 407,
+// or an answer that could not be parsed — for a log line or error; "" for
+// any other error.
+func CredentialHint(err error) string {
+	switch {
+	case AuthRejected(err):
+		return "the proxy rejected its credentials (407), also after re-reading them: check HTTPS_PROXY / -proxy; if the proxy rotates its credentials, set -proxy-cmd ($PILOT_PROXY_CMD, config.json proxy_cmd) to a command that prints the current proxy URL"
+	case UnreadableConnectReply(err):
+		return "the proxy's answer to CONNECT could not be parsed, which is how some egress proxies (Meta Muse's) reject wrong or expired credentials: check the credentials in HTTPS_PROXY / -proxy; if the proxy rotates them, set -proxy-cmd ($PILOT_PROXY_CMD, config.json proxy_cmd) to a command that prints the current proxy URL"
+	}
+	return ""
 }
 
 // unwrapNetproxy drops netproxy's "netproxy: " prefix for messages that

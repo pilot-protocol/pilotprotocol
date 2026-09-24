@@ -123,6 +123,7 @@ type refusingProxy struct {
 	goodAuths map[string]int    // Proxy-Authorization value -> accepted requests
 	forwards  map[string]string // CONNECT target -> local address tunnelled to
 	reply407  bool              // answer bad credentials with 407 (rotation)
+	garble    bool              // ... with an unparseable status line instead (Meta Muse)
 }
 
 // forward makes the proxy tunnel CONNECT target to the local address to.
@@ -133,6 +134,14 @@ func (p *refusingProxy) forward(target, to string) {
 		p.forwards = map[string]string{}
 	}
 	p.forwards[target] = to
+}
+
+// garbleRejections makes the proxy answer rejected credentials the way
+// Meta Muse's does: with a status line net/http cannot parse.
+func (p *refusingProxy) garbleRejections() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.garble = true
 }
 
 // rotate makes the proxy accept only user:pass from now on, answering
@@ -193,6 +202,7 @@ func newRefusingProxy(t *testing.T, user, pass string) *refusingProxy {
 					p.badAuths++
 				}
 				reply407 := !authOK && p.reply407
+				garble := p.garble
 				connect := authOK && r.Method == http.MethodConnect
 				to := ""
 				if connect {
@@ -200,6 +210,8 @@ func newRefusingProxy(t *testing.T, user, pass string) *refusingProxy {
 				}
 				p.mu.Unlock()
 				switch {
+				case reply407 && garble:
+					fmt.Fprint(conn, "HTTP/1.1 4O7 Proxy Authentication Required\r\n\r\n")
 				case reply407:
 					fmt.Fprint(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"muse\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 				case to != "":
@@ -322,6 +334,8 @@ type daemonRun struct {
 	env    []string
 	config string
 	await  string
+	// setup, when set, prepares the daemon's $HOME before it starts.
+	setup func(home string)
 }
 
 // runDaemon starts main() in a child process and returns the proxy's
@@ -381,6 +395,9 @@ func startDaemon(t *testing.T, run daemonRun) *runningDaemon {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	if run.setup != nil {
+		run.setup(home)
+	}
 	if run.config != "" {
 		if err := os.MkdirAll(filepath.Join(home, ".pilot"), 0o700); err != nil {
 			t.Fatal(err)
@@ -421,6 +438,9 @@ func startDaemon(t *testing.T, run daemonRun) *runningDaemon {
 	out := &syncBuffer{}
 	cmd.Stdout = out
 	cmd.Stderr = out
+	// An app the daemon spawned shares these pipes; one left running
+	// after a hard stop must not hang Wait (and the test) forever.
+	cmd.WaitDelay = 5 * time.Second
 	if err := cmd.Start(); err != nil {
 		cancel()
 		t.Fatalf("start daemon: %v", err)

@@ -72,24 +72,52 @@ Detailed per-release notes are on the
 - **Rotating proxy credentials: `-proxy-cmd` / `$PILOT_PROXY_CMD` /
   config.json `proxy_cmd`** (`pilotctl daemon start --proxy-cmd`, passed as
   `$PILOT_PROXY_CMD`, never on argv). A command whose output is the current
-  proxy URL (e.g. `bash -c 'printf %s "$https_proxy"'`). It is common
-  v0.5.15's netproxy refresh (`netproxy.WithRefreshCommand`): the command
-  runs at startup, again once 60s have passed, and whenever the proxy answers
-  a CONNECT with 407, after which that connection is retried once with the
-  new credentials (`netproxy.Dialer` for the registry — primary, pool and
-  every redial — and the compat WSS beacon and its reconnects;
-  `netproxy.RefreshingTransport` for the daemon's own HTTP clients; plugin
-  clients on `http.DefaultTransport` pick up the new credentials on their
-  next request). Tunnels already open are never touched. A sandbox that
-  rotates its proxy credentials every few minutes (Meta Muse) no longer
-  leaves a node "online with all apps broken" until a restart. In a Linux
-  container/VM without systemd whose `HTTPS_PROXY` carries credentials,
-  `pilotctl daemon start` hands the daemon `PILOT_PROXY_CMD=bash -c 'printf
-  %s "${https_proxy:-$HTTPS_PROXY}"'` itself when no `proxy_cmd` is
-  configured (so a node set up by any installer gets it), and the installer
-  saves the same command; pilotctl's own registry commands use the same
-  command. The command's output is never logged, and a failing command keeps
-  the last good proxy URL (at first, the launch environment's).
+  proxy URL (e.g. `bash -c 'printf %s "$https_proxy"'`), run with `sh -c`
+  in the environment the daemon was launched with. It drives common
+  v0.5.15's netproxy refresh: the command runs at startup, again once 60s
+  have passed, and whenever the proxy rejects the credentials — a 407, or a
+  CONNECT answer so garbled it cannot be parsed, which is how Meta Muse's
+  proxy answers them ("malformed HTTP status code") — after which that
+  connection is retried once with the new credentials (`netproxy.Dialer` for
+  the registry — primary, pool and every redial — and the compat WSS beacon
+  and its reconnects; `netproxy.RefreshingTransport` for the daemon's own
+  HTTP clients). Tunnels already open are never touched. The command's
+  output is never logged, and a failing command keeps the last good proxy
+  URL (at first, the launch environment's).
+  - **Apps follow the rotation too.** App-store apps are processes the
+    daemon starts, and they inherit its environment — with the launch-time
+    credentials, which the proxy stops accepting within minutes: every app
+    that opened a new connection failed (also after a respawn) while the
+    node stayed online ("node online, all apps broken"). A daemon that
+    proxies now runs a CONNECT relay on loopback (random port, its own
+    random credentials, CONNECT only, never sees inside the TLS tunnels),
+    which opens each tunnel upstream with the current credentials, refreshes
+    and retries once on a rejection, and answers a tunnel it cannot open
+    with a 502/403/504 whose reason says why without proxy text or
+    credentials. With a refresh command, the apps the daemon starts get
+    `HTTPS_PROXY` / `https_proxy` (and `$PILOT_PROXY` if it holds a URL)
+    pointing at the relay, so they never hold the proxy's credentials;
+    `HTTP_PROXY` is left alone (the relay only tunnels). The daemon's own
+    refresh command still runs in the launch environment, a refresh that
+    would name the relay is refused, and a remote restart re-execs with the
+    launch environment. Without a refresh command the apps' environment is
+    left as it is.
+  - **Plugin HTTP clients** (`http.DefaultTransport`: catalogue pins,
+    skillinject, trustedagents, webhook, telemetry) send their https
+    requests through the same relay, so a rejected CONNECT — including
+    Muse's garbled form, which net/http never hands to a hook and quotes
+    in its error — is refreshed and retried instead of failing until the
+    next timed refresh.
+  - In a Linux container/VM without systemd whose `HTTPS_PROXY` or
+    `https_proxy` carries credentials, `pilotctl daemon start` hands the
+    daemon `PILOT_PROXY_CMD=bash -c 'case $https_proxy in *@*) printf %s
+    "$https_proxy";; *) printf %s "${HTTPS_PROXY:-$https_proxy}";; esac'`
+    itself when no `proxy_cmd` is configured (so a node set up by any
+    installer gets it), and the installer saves the same command: the
+    variable that carries credentials wins (`$https_proxy`, which Meta
+    Muse's guidance reads from a fresh shell, when both do), so the command
+    never swaps a credentialed proxy URL for one without credentials.
+    pilotctl's own registry commands use the same command.
 - **`-transport=auto`.** UDP when the beacon answers a UDP discover (one round
   trip), otherwise compat when the compat beacon itself answers over TCP 443
   (through the proxy, if any: a TLS GET of the beacon path must return `426
@@ -149,7 +177,12 @@ Detailed per-release notes are on the
   Required`), with a hint for it (wrong or rotated credentials → `proxy_cmd`),
   instead of only "did not become ready". pilot-daemon logs its fatal
   startup errors at ERROR (they came out at INFO), and a registry or compat
-  beacon dial the proxy refused ends with a hint naming the fix.
+  beacon dial the proxy refused ends with a hint naming the fix. A CONNECT
+  answer that cannot be parsed (`read CONNECT response: malformed HTTP
+  status code (response text withheld)`, Meta Muse's answer to wrong or
+  expired credentials) gets the credentials/`proxy_cmd` hint, and no hint
+  suggests `-transport=udp` except for a proxy that cannot be reached, and
+  then only for a host that can reach the internet without it.
 - **`daemon start` forwards the proxy/TLS environment** (`HTTPS_PROXY`,
   `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` in both cases, `PILOT_PROXY`,
   `PILOT_TRANSPORT`, `PILOT_REGISTRY_TRUST`, `PILOT_REGISTRY_FINGERPRINT`,

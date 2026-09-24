@@ -1099,13 +1099,17 @@ configured proxy. To skip the UDP probe:
   pilotctl config --set transport=compat && pilotctl daemon start
 If the proxy rotates its credentials, give the daemon a command that prints
 the current proxy URL; the daemon re-runs it every 60s and whenever the proxy
-answers 407, and retries that connection once with the new credentials
-(pilotctl's own registry commands use the same command):
+rejects the credentials (407, or an answer that cannot be parsed), and
+retries that connection once with the new credentials (pilotctl's own
+registry commands use the same command):
   pilotctl config --set proxy_cmd="bash -c 'printf %s \"\$https_proxy\"'"
 On Linux without systemd (containers, hosted agent sandboxes), when
-$HTTPS_PROXY carries credentials and no proxy_cmd is configured, daemon start
-passes the daemon PILOT_PROXY_CMD=bash -c 'printf %s "${https_proxy:-$HTTPS_PROXY}"'
-by itself.
+$HTTPS_PROXY or $https_proxy carries credentials and no proxy_cmd is
+configured, daemon start passes the daemon a PILOT_PROXY_CMD by itself that
+prints a fresh bash's $https_proxy ($HTTPS_PROXY when only that one carries
+credentials). With a proxy command, the apps the daemon starts reach the
+proxy through a loopback relay in the daemon that adds the current
+credentials, so they keep working across rotations too.
 If the daemon exits during startup or does not become ready in time, daemon
 start reports the daemon's last error — the proxy's answer (e.g. "407 Proxy
 Authentication Required") when a proxy is involved — with the log path.
@@ -3334,7 +3338,7 @@ func cmdDaemonStart(args []string) {
 				fmt.Printf("  Proxy:    %s\n", redactProxyURL(plan.Proxy))
 			}
 			if src := proxyCmdSource(plan, flags, pidLogPath, sandboxRefresh); src != "" {
-				fmt.Printf("  Proxy credentials: re-read every 60s and on a 407 (%s)\n", src)
+				fmt.Printf("  Proxy credentials: re-read every 60s and when the proxy rejects them, for the daemon and its apps (%s)\n", src)
 			}
 			fmt.Printf("  Socket:   %s\n", socketPath)
 			fmt.Printf("  Logs:     %s\n", pidLogPath)

@@ -1305,7 +1305,7 @@ fi
 # Linux container/VM without systemd whose proxy carries credentials, and
 # never over an existing proxy_cmd.
 # shellcheck disable=SC2016 # literal: the fresh bash expands it, not this shell
-SANDBOX_PROXY_CMD='bash -c '\''printf %s "${https_proxy:-$HTTPS_PROXY}"'\'''
+SANDBOX_PROXY_CMD='bash -c '\''case $https_proxy in *@*) printf %s "$https_proxy";; *) printf %s "${HTTPS_PROXY:-$https_proxy}";; esac'\'''
 PROXY_CMD_TO_SAVE="${PILOT_PROXY_CMD:-}"
 if [ -z "$PROXY_CMD_TO_SAVE" ] && [ "$OS" = "linux" ] && [ ! -d /run/systemd/system ] \
    && command -v bash >/dev/null 2>&1 \

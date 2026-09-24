@@ -223,7 +223,16 @@ func setEnv(env []string, key, value string) []string {
 // sandboxProxyCmd is the proxy_cmd for hosted agent sandboxes: a fresh bash
 // sees the sandbox's current proxy URL, whose credentials rotate (Meta Muse:
 // every few minutes). install.sh saves the same command.
-const sandboxProxyCmd = `bash -c 'printf %s "${https_proxy:-$HTTPS_PROXY}"'`
+//
+// It prints whichever of $https_proxy and $HTTPS_PROXY carries credentials,
+// $https_proxy when both do (the variable Meta Muse's own guidance reads
+// from a fresh shell), and ${HTTPS_PROXY:-$https_proxy} — the daemon's own
+// order — when neither does. It is injected (see sandboxRefreshCmd) when
+// either variable carries credentials, so it never trades a proxy URL with
+// credentials for one without them: with HTTPS_PROXY=http://u:p@proxy and
+// https_proxy=http://proxy, a plain ${https_proxy:-$HTTPS_PROXY} would
+// drop the credentials the daemon started with.
+const sandboxProxyCmd = `bash -c 'case $https_proxy in *@*) printf %s "$https_proxy";; *) printf %s "${HTTPS_PROXY:-$https_proxy}";; esac'`
 
 // Test seams for sandboxProxyCmdFor.
 var (

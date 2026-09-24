@@ -225,12 +225,17 @@ func resolveAutoTransport(reg registrySettings, beacon string, beaconExplicit bo
 }
 
 // proxyErrorHint says what to check when the proxy failed the compat
-// check.
+// check: a refusal or a rejection of the credentials (also in the garbled
+// form Meta Muse's proxy answers them with) per daemon.ProxyRefusalHint,
+// else a proxy that could not be reached or dropped the connection. It
+// never suggests going around the proxy unconditionally: on a proxy-only
+// host (a hosted agent sandbox) -transport=udp dials the registry directly,
+// and that traffic is dropped or gets the sandbox killed.
 func proxyErrorHint(err error) string {
 	if hint := daemon.ProxyRefusalHint(err); hint != "" {
 		return hint
 	}
-	return "the proxy could not be reached or its answer could not be read: check HTTPS_PROXY / -proxy, or pass -transport=udp to bypass it"
+	return "the proxy could not be reached or dropped the connection: check HTTPS_PROXY / -proxy; only if this host can reach the internet without the proxy, -proxy=off (or -transport=udp) stops using it"
 }
 
 // transportDefaultEnv names the transport a daemon uses when neither
