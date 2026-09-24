@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -830,6 +831,19 @@ func cmdAppStoreUninstall(args []string) {
 			"check install root permissions",
 			"remove manifest %s: %v", mfPath, err)
 	}
+	// Stop everything still running from the app's files: the app itself
+	// and whatever it started that outlives it (a smolvm microVM, a
+	// daemonized database server, an instance orphaned by a daemon that
+	// died hard). After the delete nothing could reach them any more. The
+	// backups of earlier installs are included: a process started before an
+	// upgrade keeps running from the retired dir. See appstore_procs.go.
+	backups := listAppBackups(root, appID)
+	procRoots := appDirRoots(dir)
+	for _, b := range backups {
+		procRoots = append(procRoots, appDirRoots(b)...)
+	}
+	stopped, _ := stopProcessesRunningFrom(procRoots, appDirStopGrace)
+
 	// Retry RemoveAll a few times to ride out the supervisor's
 	// in-flight audit writes; the rescan loop cancels the goroutine
 	// within ~RescanInterval (default 30s in prod, but the audit
@@ -855,22 +869,39 @@ func cmdAppStoreUninstall(args []string) {
 			"remove %s: %v", dir, rmErr)
 	}
 
+	// A supervisor that had not yet seen the manifest go may have respawned
+	// the app between the stop above and the delete (its restart backoff
+	// starts at 1s). That instance runs a now-deleted binary; stop it too.
+	respawned, _ := stopProcessesRunningFrom(procRoots, appDirStopGrace)
+	for _, p := range respawned {
+		if !slices.ContainsFunc(stopped, func(q appDirProcess) bool { return q.PID == p.PID }) {
+			stopped = append(stopped, p)
+		}
+	}
+	stillRunning := processesRunningFrom(procRoots)
+
 	// Forensic trail at the install-root level (survives the deletion
 	// of the app dir). Pairs with the install-time event we wrote
 	// into supervisor.log earlier — gives "this app existed between
 	// install T0 and uninstall T1" reconstructable post-hoc.
+	reason := fmt.Sprintf("actor=%s removed=%s", currentActor(), dir)
+	if len(stopped) > 0 {
+		reason += " stopped=" + describeAppDirProcesses(stopped)
+	}
+	if len(stillRunning) > 0 {
+		reason += " still_running=" + describeAppDirProcesses(stillRunning)
+	}
 	writePilotctlAudit(root, pilotctlAuditEvent{
 		Event:  "uninstalled",
 		AppID:  appID,
 		SHA256: snapSHA,
 		AppVer: snapVer,
-		Reason: fmt.Sprintf("actor=%s removed=%s", currentActor(), dir),
+		Reason: reason,
 	})
 
 	// Replaced installs are kept as backups (appstore_state.go), wherever
 	// retireAppDir had to put them, and may hold the app's keys. Uninstall
 	// leaves them, so it says where every one of them is.
-	backups := listAppBackups(root, appID)
 	if jsonOutput {
 		out := map[string]any{
 			"id":            appID,
@@ -880,10 +911,22 @@ func cmdAppStoreUninstall(args []string) {
 		if len(backups) > 0 {
 			out["backups"] = backups
 		}
+		if len(stopped) > 0 {
+			out["stopped_processes"] = stopped
+		}
+		if len(stillRunning) > 0 {
+			out["still_running"] = stillRunning
+		}
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 		return
 	}
 	fmt.Printf("removed %s\n", dir)
+	if len(stopped) > 0 {
+		fmt.Printf("stopped %d process(es) still running from the app's files: %s\n", len(stopped), describeAppDirProcesses(stopped))
+	}
+	if len(stillRunning) > 0 {
+		fmt.Fprintf(os.Stderr, "warn: still running from the removed app's files after SIGKILL: %s; stop them by hand\n", describeAppDirProcesses(stillRunning))
+	}
 	fmt.Println("note: the daemon's supervisor will cancel its per-app goroutine on its next rescan")
 	fmt.Println("      (≤30s); no daemon restart needed")
 	if len(backups) > 0 {
