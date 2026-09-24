@@ -1,0 +1,65 @@
+name: catalogue-lint
+
+# Gates changes to the app-store catalogue (catalogue/catalogue.json):
+#
+#  * Stateful-app release freeze. Nodes upgrade installed apps hourly with the
+#    pilotctl they already run, and a pilotctl without the app-state fix
+#    deletes an app's saved state (wallet EVM key + data.db, smol secrets,
+#    per-app identities) when it applies an update. Any update to an app listed
+#    in catalogue/stateful-apps.json, or whose bundle manifest grants fs.write
+#    or key.sign, fails until it is approved: an approved_bumps entry in
+#    catalogue/stateful-apps.json, or the PR label
+#    `catalogue:stateful-bump-approved` (re-runs on label changes).
+#  * Bundle checks for every added/changed entry: sha pins, manifest id and
+#    version, binary pin, and that each binary runs on the platform it is
+#    published for (a legacy single bundle must not ship a native binary).
+#
+# See catalogue/README.md ("Stateful apps: release freeze").
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - 'catalogue/**'
+      - '.github/workflows/catalogue-lint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: catalogue lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Unit tests (catalogue/lint)
+        working-directory: catalogue/lint
+        run: go test -count=1 ./...
+
+      - name: Lint catalogue changes against the PR base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          STATEFUL_BUMP_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'catalogue:stateful-bump-approved') }}
+        run: |
+          set -euo pipefail
+          merge_base="$(git merge-base "$BASE_SHA" HEAD)"
+          base_json="$RUNNER_TEMP/base-catalogue.json"
+          # A base without a catalogue (first introduction) lints every entry as new.
+          git show "$merge_base:catalogue/catalogue.json" > "$base_json" 2>/dev/null || : > "$base_json"
+          args=(--base "$base_json" --head "$GITHUB_WORKSPACE/catalogue/catalogue.json" --policy "$GITHUB_WORKSPACE/catalogue/stateful-apps.json")
+          if [ "$STATEFUL_BUMP_APPROVED" = "true" ]; then
+            echo "::notice::PR carries catalogue:stateful-bump-approved; stateful-app updates are reported as warnings"
+            args+=(--allow-stateful-bumps)
+          fi
+          cd catalogue/lint
+          go run . "${args[@]}"

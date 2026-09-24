@@ -203,6 +203,114 @@ verifies the signature against the embedded catalogue public key before
 trusting any entry. An unsigned, missing-signature, or tampered catalogue
 is refused (fail-closed).
 
+### A published update reaches every node within the hour
+
+Nodes with auto-update on run `pilotctl appstore upgrade --all` every hour.
+Anything that changes what a node would install triggers it: a new `version`,
+or a new bundle sha under the same version (a republish, which newer pilotctl
+detects via the `.bundle-sha256` it records). Each node runs the upgrade with
+**its own installed pilotctl**, so the upgrade behaves the way the oldest
+pilotctl in the fleet does.
+
+## Stateful apps: release freeze (CI lint)
+
+Apps keep their state inside their install dir (`$APP` = `~/.pilot/apps/<id>/`):
+the wallet's `identity-evm.json` (its EVM private key) and `data.db`, smol's
+`secrets.json`, each metered app's `identity.json`, the `cap-state.jsonl`
+spend-cap ledger and `supervisor.log`. A pilotctl **without** the app-state
+fix (it landed with the "appstore: keep app state across install --force and
+upgrade" change) replaces that dir on every `install --force` and every
+`upgrade` and deletes it, keys included. A catalogue update for a stateful app
+therefore wipes that app's state on every node still running an older
+pilotctl, within the hour, with no prompt.
+
+So every PR that touches `catalogue/` runs the **catalogue-lint** job
+(`.github/workflows/catalogue-lint.yml`, code in `catalogue/lint/`). It
+compares the PR's catalogue with its base and **fails** when an update (new
+version or same-version republish) targets a stateful app:
+
+- an app listed in `catalogue/stateful-apps.json` (`stateful_apps`: wallet,
+  smol, agentphone, bowmark, orthogonal), or
+- any app whose old or new bundle manifest grants `fs.write` or `key.sign`
+  (it writes files into `$APP`, or signs with its own identity key). A bundle
+  that cannot be downloaded to check counts as stateful.
+
+**Hold the release** until the fleet runs the fixed pilotctl. To ship one
+anyway (the fleet has caught up, or the release is urgent and the risk is
+accepted), approve that exact version, one of two ways:
+
+1. **Approval file (preferred, stays in history):** add an entry to
+   `approved_bumps` in `catalogue/stateful-apps.json` in the same PR:
+   ```json
+   {"id": "io.pilot.wallet", "version": "0.3.4",
+    "reason": "fleet runs the fixed pilotctl (registry version query, 2026-10-01)",
+    "approved_by": "<maintainer>"}
+   ```
+   All four fields are required; an approval only covers that id + version.
+2. **PR label:** a maintainer applies `catalogue:stateful-bump-approved`. The
+   job re-runs on label changes and reports the update as a warning.
+
+Remove the freeze (empty `stateful_apps`, or delete the check) only once the
+registry's node-version distribution shows the fleet on a pilotctl with the
+fix.
+
+The same job also checks, for every **added or changed** entry, each bundle it
+publishes: the download matches `bundle_sha256`, the manifest's `id` and
+`app_version` match the entry (a mismatched version makes every node reinstall
+the app every hour), the binary matches the manifest's pin, and the binary runs
+on the platform it is published under. An entry **without** a `bundles` map is
+installed by every platform, so it must not ship a native (ELF, Mach-O, PE)
+binary at all; publish per-platform `bundles` instead. Scripts and portable
+adapters are fine in a single bundle. pilotctl enforces the same at install
+time: a binary built for another platform is refused with `platform_mismatch`
+and nothing is installed.
+
+Run it locally:
+
+```bash
+git show origin/main:catalogue/catalogue.json > /tmp/base.json
+(cd catalogue/lint && GOWORK=off go run . --base /tmp/base.json --head ../catalogue.json)
+```
+
+### What install and upgrade do with app state (fixed pilotctl)
+
+- `pilotctl appstore install <id>` on an installed app changes nothing and
+  points at `pilotctl appstore upgrade <id>`. With `--version X` for a version
+  other than the installed one (or a local bundle of another version) it fails
+  with `conflict` unless `--force` is given, and with `version_unavailable`
+  when the catalogue does not offer X.
+- `install --force` and `upgrade` carry everything in `$APP` that the new
+  bundle does not ship into the new install, except control files
+  (`manifest.json`, `install.json`, `install.sh`, `.sideloaded`, `.suspended`,
+  `.resume`, `.bundle-sha256`, next-steps caches) and sockets. Files are
+  hard-linked, so writes the still-running app makes to them in place are
+  kept; read-only dirs carry like any other; an entry this user cannot link
+  or read (say, a root-owned file) is moved across instead. After the swap
+  the old dir is checked again: a file the app replaced (write + rename) or
+  created there during the install is taken into the new install, unless the
+  new install's copy changed since (the newer write wins). A write the old
+  process makes after that through a path relative to its working directory
+  (not through `$APP`) still lands in the backup, until the supervisor
+  restarts it on the new version (within ~30s). The old dir stays at
+  `<id>.previous` until the new one verifies.
+- Installs, upgrades and uninstalls of one app take a lock
+  (`<install root>/.<id>.lock`), so the hourly `upgrade --all` and an agent's
+  `install` never interleave.
+- The replaced dir is kept as a backup in `app-backups/<id>/` beside the
+  install root (`~/.pilot/app-backups`, or `$PILOT_APPSTORE_BACKUP_ROOT`,
+  which may be on another filesystem: it is then copied). If that location is
+  unusable, the backup goes to the default location, then to
+  `<install root>/.app-backups/<id>/`, and pilotctl warns. Each backup has a
+  `.pilot-backup.json` saying what kind it is. Routine backups are rotated
+  (the newest 3 upgrades and the newest 3 same-version reinstalls per app);
+  a backup that holds the only copy of state (`--reset-state`, state that
+  could not be carried, a crash leftover) is never removed automatically.
+  `uninstall` leaves backups and lists every one of them.
+- `install --reset-state` (implies `--force`) is the explicit way to start an
+  app empty. It warns loudly and still keeps the backup.
+- `upgrade --all` goes on to the next app when one fails, and exits 1 at the
+  end naming the apps that were not upgraded.
+
 ## Catalogue signing key
 
 The catalogue is signed with a dedicated ed25519 key, separate from any

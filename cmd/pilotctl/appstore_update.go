@@ -234,11 +234,31 @@ func cmdAppStoreUpgrade(args []string) {
 		targets = []outdatedApp{o}
 	}
 
+	var failed []string
 	for _, o := range targets {
 		fmt.Printf("==> upgrading %s %s → %s\n", o.ID, o.Installed, o.Available)
 		// --force: install over the existing app dir; the supervisor applies the
-		// version bump (and refuses a downgrade) on its next rescan.
-		cmdAppStoreInstall([]string{o.ID, "--force"})
+		// version bump (and refuses a downgrade) on its next rescan. The app's
+		// state (keys, data.db, secrets, cap-state, audit log) is carried into
+		// the new install and the replaced dir is kept as a backup — see
+		// appstore_state.go. This is the path the hourly updater drives.
+		install := func() { cmdAppStoreInstall([]string{o.ID, "--force"}) }
+		if len(targets) == 1 {
+			install()
+			continue
+		}
+		// One app that cannot be upgraded (its error is printed, and it is
+		// left exactly as it was) must not stop the upgrade of every app
+		// after it, security fixes included.
+		if f := runTrappingFatal(install); f != nil {
+			failed = append(failed, o.ID)
+			fmt.Fprintf(os.Stderr, "==> %s was not upgraded (%s) and stays at %s; continuing with the remaining apps\n", o.ID, f.Code, o.Installed)
+		}
+	}
+	if len(failed) > 0 {
+		fatalHint("upgrade_failed",
+			"every app that failed is unchanged and its error is printed above; fix the cause and re-run `pilotctl appstore upgrade <id>`",
+			"upgraded %s; %d failed: %s", pluralApps(len(targets)-len(failed)), len(failed), strings.Join(failed, ", "))
 	}
 	fmt.Printf("\nupgraded %s\n", strings.TrimSpace(pluralApps(len(targets))))
 }
