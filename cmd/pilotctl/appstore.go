@@ -2648,6 +2648,19 @@ func cmdAppStoreCall(args []string) {
 
 	sockPath := filepath.Join(appStoreRoot(), appID, "app.sock")
 	if _, err := os.Stat(sockPath); err != nil {
+		// Not installed here at all: if the id is a rename tombstone, say so
+		// instead of blaming the daemon. No silent retarget: the method
+		// namespace changed too. (An installed app whose daemon is down skips
+		// the catalogue fetch.)
+		if _, derr := os.Stat(filepath.Dir(sockPath)); errors.Is(derr, os.ErrNotExist) {
+			if c, lerr := loadCatalogue(); lerr == nil {
+				if e := c.findEntry(appID); e != nil && e.RenamedTo != "" {
+					fatalHint("invalid_argument",
+						fmt.Sprintf("install it with `pilotctl appstore install %s` and call its methods (`pilotctl appstore view %s`)", e.RenamedTo, e.RenamedTo),
+						"app %q was renamed to %q", appID, e.RenamedTo)
+				}
+			}
+		}
 		fatalHint("io_error",
 			"is the daemon running and has it supervised this app yet?",
 			"socket %s not present: %v", sockPath, err)

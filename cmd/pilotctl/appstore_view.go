@@ -163,6 +163,9 @@ func cmdAppStoreView(args []string) {
 				break
 			}
 		}
+		if entry != nil && entry.RenamedTo != "" {
+			fmt.Fprintf(os.Stderr, "warn: app %q was renamed to %q; see `pilotctl appstore view %s`\n", appID, entry.RenamedTo, entry.RenamedTo)
+		}
 		if entry != nil {
 			if m, err := loadAppMetadata(*entry); err != nil {
 				fmt.Fprintf(os.Stderr, "warn: could not load detail metadata: %v\n", err)
