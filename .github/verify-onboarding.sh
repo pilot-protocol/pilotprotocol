@@ -10,7 +10,7 @@ base="https://github.com/pilot-protocol/pilotprotocol/releases/download/$want"; 
 curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt" && curl -fsSL "$base/pilot-$os-$arch.tar.gz" -o "$tmp/p.tgz" || exit 1
 exp=$(grep " pilot-$os-$arch.tar.gz$" "$tmp/checksums.txt" | cut -d' ' -f1); act=$( (sha256sum "$tmp/p.tgz" 2>/dev/null || shasum -a 256 "$tmp/p.tgz") | cut -d' ' -f1)
 [ -n "$exp" ] && [ "$exp" = "$act" ] || { echo "checksum mismatch: $exp vs $act"; exit 1; }
-mkdir -p ~/.pilot/bin && tar -xzf "$tmp/p.tgz" -C "$tmp" && find "$tmp" -type f \( -name pilotctl -o -name pilot-daemon -o -name pilot-updater \) -exec cp {} ~/.pilot/bin/ \; && chmod +x ~/.pilot/bin/*
+mkdir -p ~/.pilot/bin && tar -xzf "$tmp/p.tgz" -C "$tmp" && cp "$tmp/pilotctl" ~/.pilot/bin/pilotctl && cp "$tmp/daemon" ~/.pilot/bin/pilot-daemon && cp "$tmp/updater" ~/.pilot/bin/pilot-updater && chmod +x ~/.pilot/bin/*
 echo "$want" > ~/.pilot/bin/.pilot-version
 export PATH="$PATH:$HOME/.pilot/bin"
 got=$(cat ~/.pilot/bin/.pilot-version 2>/dev/null); step "installed version: $got (want $want)"
