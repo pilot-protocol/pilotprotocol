@@ -12,10 +12,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-15-intel]
-        rep: [1, 2, 3]
+        rep: [1, 2]
+        version: [v1.13.10, v1.13.11-rc.1]
+      max-parallel: 2
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Onboard from the beta channel
-        run: bash .github/verify-onboarding.sh v1.13.11-rc.1
+        run: bash .github/verify-onboarding.sh ${{ matrix.version }}
