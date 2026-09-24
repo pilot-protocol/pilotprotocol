@@ -1,0 +1,55 @@
+# Temporary: clean-runner A/B of the first-contact fix (PR #474, built from
+# source release-identically) vs released v1.13.10, interleaved so both see the
+# same directory load. Lives only on the verify/* branch.
+name: verify-onboarding
+on:
+  push:
+    branches: ['verify/**']
+permissions:
+  contents: read
+jobs:
+  onboard:
+    name: ${{ matrix.variant }} ${{ matrix.os }} rep${{ matrix.rep }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        rep: [1, 2, 3]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, macos-15-intel]
+        variant: [fix, control]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        if: matrix.variant == 'fix'
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build fix from source (release-identical flags)
+        if: matrix.variant == 'fix'
+        env:
+          CGO_ENABLED: '0'
+          GOWORK: 'off'
+        run: |
+          set -e
+          LDFLAGS="-s -w -X main.version=v1.13.11-dev"
+          mkdir -p ~/.pilot/bin
+          go build -ldflags "$LDFLAGS" -o ~/.pilot/bin/pilotctl ./cmd/pilotctl
+          go build -ldflags "$LDFLAGS" -o ~/.pilot/bin/pilot-daemon ./cmd/daemon
+          echo v1.13.11-dev > ~/.pilot/bin/.pilot-version
+      - name: Install released v1.13.10 (checksums.txt-verified)
+        if: matrix.variant == 'control'
+        run: |
+          set -e
+          want=v1.13.10
+          os=$(uname -s | tr A-Z a-z); arch=$(uname -m); case "$arch" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac
+          base="https://github.com/pilot-protocol/pilotprotocol/releases/download/$want"; tmp=$(mktemp -d)
+          curl -fsSL "$base/checksums.txt" -o "$tmp/checksums.txt"; curl -fsSL "$base/pilot-$os-$arch.tar.gz" -o "$tmp/p.tgz"
+          exp=$(grep " pilot-$os-$arch.tar.gz$" "$tmp/checksums.txt" | cut -d' ' -f1); act=$( (sha256sum "$tmp/p.tgz" 2>/dev/null || shasum -a 256 "$tmp/p.tgz") | cut -d' ' -f1)
+          [ -n "$exp" ] && [ "$exp" = "$act" ] || { echo "checksum mismatch: $exp vs $act"; exit 1; }
+          mkdir -p ~/.pilot/bin && tar -xzf "$tmp/p.tgz" -C "$tmp"
+          cp "$tmp/pilotctl" ~/.pilot/bin/pilotctl; cp "$tmp/daemon" ~/.pilot/bin/pilot-daemon; chmod +x ~/.pilot/bin/*
+          echo "$want" > ~/.pilot/bin/.pilot-version
+      - name: First contact
+        run: bash .github/verify-onboarding.sh ${{ matrix.variant }} ${{ matrix.variant == 'fix' && 'v1.13.11-dev' || 'v1.13.10' }}
