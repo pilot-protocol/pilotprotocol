@@ -150,6 +150,33 @@ Detailed per-release notes are on the
   or an installer re-run — bypassed the disabled flag and re-injected skills a
   user had turned off. The opt-out is now a hard gate on every write path; only
   the read-only `pilotctl skills` status still previews. (skillinject)
+- **App-store installs and upgrades keep an app's saved state.**
+  `pilotctl appstore install --force` and `appstore upgrade` (which the updater
+  runs hourly as `upgrade --all`) deleted everything an app kept in its own
+  directory, such as the wallet's EVM key (`identity-evm.json`) and `data.db`,
+  smol's `secrets.json` and per-app identities. Every file that is not part of
+  the bundle is now carried into the new install, and the replaced install is
+  kept as a backup in `app-backups/<id>/` beside the install root
+  (`$PILOT_APPSTORE_BACKUP_ROOT` overrides). The newest 3 routine backups of
+  each kind are kept; a backup that may be the only copy of state is never
+  pruned. `uninstall` lists the backups that remain.
+  - `install <id>` on an installed app is now a no-op (exit 0) that points to
+    `upgrade`. Before, it failed with `conflict`. `conflict` now means
+    `--version` or a local bundle names another version without `--force`.
+  - New `--reset-state` (implies `--force`) reinstalls without the old state,
+    with a warning. The backup is still kept.
+  - Installs of one app are serialized. A second one waits up to 5 minutes,
+    then fails with `timeout`.
+  - `upgrade --all` tries every app and exits 1 at the end with
+    `upgrade_failed`, naming the apps that failed.
+  - Install JSON adds `already_installed`, `hint`, `preserved_state`,
+    `state_reset`, `state_not_carried`, `backup_dir` and `backup_warning`.
+    Uninstall JSON adds `backups`.
+  - The check that refuses a bundle whose binary cannot run on this host now
+    also covers universal Mach-O and PE images. The refusal names the app,
+    version and host platform, and says nothing was installed.
+  - The catalogue lint blocks releases of stateful apps until nodes run a
+    pilotctl with this fix.
 
 ## [1.12.8] - 2026-07-16
 
