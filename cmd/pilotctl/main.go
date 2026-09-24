@@ -1316,14 +1316,19 @@ Print the pilotctl build version string.
 	"update": `Usage: pilotctl update [subcommand|flags]
 
 Automatic updates are OFF by default. Control them with:
-  pilotctl update status     show whether auto-update is on and the current version
+  pilotctl update status     show whether auto-update is on, the current version,
+                             the last recorded check (result, error, failure
+                             streak) and whether the daemon needs a restart
   pilotctl update enable     turn automatic updates ON
   pilotctl update disable    turn automatic updates OFF (default)
 
 With no subcommand, runs the updater ONCE — a manual check that installs the
-latest release if available, regardless of the auto-update setting. In manual
-mode (daemon not running), re-runs skill install so newly installed binaries
-have matching skill definitions.
+latest release if available, regardless of the auto-update setting. The result
+is recorded in ~/.pilot/update-state.json (shared with the pilot-updater
+service). A failed check exits 1 with code update_failed. If new binaries are
+installed but the daemon could not be restarted onto them, a warning names the
+command that restarts it. In manual mode (daemon not running), re-runs skill
+install so newly installed binaries have matching skill definitions.
 
 Flags (one-shot mode):
   --repo <name>   GitHub owner/repo for releases (default: pilot-protocol/pilotprotocol)
@@ -2181,7 +2186,7 @@ func contextCatalog() map[string]interface{} {
 			"update": map[string]interface{}{
 				"args":        []string{"[status|enable|disable]", "[--pin <tag>]"},
 				"description": "Self-update. Bare: run the updater once (check + install latest). Subcommands: status, enable, disable (auto-update is OFF by default)",
-				"returns":     "updated (bool), from, to | enabled (bool)",
+				"returns":     "result, updated (bool), current_version, latest_version, restart_error | status: auto_update, last_result, last_error, restart_error, update_state | enable/disable: auto_update (bool)",
 			},
 			"updates": map[string]interface{}{
 				"args":        []string{"[--count <n>]", "[--scope <scope>]"},

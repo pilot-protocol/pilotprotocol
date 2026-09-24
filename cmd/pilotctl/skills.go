@@ -94,6 +94,7 @@ func cmdSkillsStatus(args []string) {
 				"action": string(o.Action),
 				"hash":   o.Hash,
 				"err":    o.Err,
+				"note":   o.Note,
 			})
 		}
 		output(map[string]interface{}{
@@ -178,6 +179,9 @@ func cmdSkillsStatus(args []string) {
 			if o.Err != "" {
 				fmt.Printf("                     ERROR: %s\n", o.Err)
 			}
+			if o.Note != "" {
+				fmt.Printf("                     note: %s\n", o.Note)
+			}
 		}
 		fmt.Println()
 	}
@@ -219,30 +223,97 @@ func cmdSkillsCheck(_ []string) {
 	if err != nil {
 		fatalCode("internal", "skills tick: %v", err)
 	}
-	c := report.Counts()
 
 	if jsonOutput {
-		outputOK(map[string]interface{}{
-			"checked":  len(report.Outcomes),
-			"noops":    c[skillinject.ActionNoop],
-			"creates":  c[skillinject.ActionCreate],
-			"rewrites": c[skillinject.ActionRewrite],
-			"errors":   c[skillinject.ActionError],
-			"skipped":  report.Skipped,
-		})
+		outputOK(skillsReconcileFields(report))
 		return
 	}
+	printSkillsReconcileSummary(report)
+}
 
+// skillsReconcileFields is the JSON summary of one reconcile pass, shared by
+// `skills check` and `skills enable`. removes counts retired surfaces (from
+// an older manifest) that the pass deleted or stripped; notes carries every
+// outcome whose state/action alone would mislead (a heartbeat file shared
+// with another tool, a retired plugin neutralized instead of removed).
+func skillsReconcileFields(report *skillinject.Report) map[string]interface{} {
+	c := report.Counts()
+	return map[string]interface{}{
+		"checked":  len(report.Outcomes),
+		"noops":    c[skillinject.ActionNoop],
+		"creates":  c[skillinject.ActionCreate],
+		"rewrites": c[skillinject.ActionRewrite],
+		"removes":  c[skillinject.ActionRemove],
+		"errors":   c[skillinject.ActionError],
+		"skipped":  report.Skipped,
+		"notes":    skillsOutcomeNotes(report),
+	}
+}
+
+// skillsOutcomeNotes collects the outcomes that carry a Note.
+func skillsOutcomeNotes(report *skillinject.Report) []map[string]string {
+	notes := []map[string]string{}
+	for _, o := range report.Outcomes {
+		if o.Note == "" {
+			continue
+		}
+		notes = append(notes, map[string]string{"tool": o.Tool, "path": o.Path, "note": o.Note})
+	}
+	return notes
+}
+
+// printSkillsReconcileSummary is the text summary of one reconcile pass,
+// shared by `skills check` and `skills enable`.
+func printSkillsReconcileSummary(report *skillinject.Report) {
+	c := report.Counts()
 	fmt.Printf("Reconcile complete — %d files checked.\n", len(report.Outcomes))
 	fmt.Printf("  noop:      %d\n", c[skillinject.ActionNoop])
 	fmt.Printf("  create:    %d\n", c[skillinject.ActionCreate])
 	fmt.Printf("  rewrite:   %d\n", c[skillinject.ActionRewrite])
+	if c[skillinject.ActionRemove] > 0 {
+		fmt.Printf("  remove:    %d (retired surfaces from an older manifest)\n", c[skillinject.ActionRemove])
+	}
 	if c[skillinject.ActionError] > 0 {
 		fmt.Printf("  errors:    %d (run `pilotctl skills status` for detail)\n", c[skillinject.ActionError])
 	}
+	if c[skillinject.ActionRemove] > 0 {
+		fmt.Println("Removed:")
+		for _, o := range report.Outcomes {
+			if o.Action == skillinject.ActionRemove {
+				fmt.Printf("  %s — %s\n", o.Path, o.Tool)
+			}
+		}
+	}
+	printSkillsOutcomeNotes(report, "")
 	if len(report.Skipped) > 0 {
 		fmt.Printf("Not installed (skipped): %s\n", strings.Join(report.Skipped, ", "))
 	}
+}
+
+// printSkillsOutcomeNotes prints a "Notes:" block for outcomes with a Note,
+// each line prefixed with indent. Prints nothing when there are none.
+func printSkillsOutcomeNotes(report *skillinject.Report, indent string) {
+	notes := skillsOutcomeNotes(report)
+	if len(notes) == 0 {
+		return
+	}
+	fmt.Printf("%sNotes:\n", indent)
+	for _, n := range notes {
+		fmt.Printf("%s  %s (%s): %s\n", indent, n["tool"], n["path"], n["note"])
+	}
+}
+
+// printSkillsUpdateSummary is the one-line skills summary `pilotctl update`
+// prints after re-running skill install in manual mode.
+func printSkillsUpdateSummary(report *skillinject.Report) {
+	c := report.Counts()
+	fmt.Printf("Skills: %d files checked (%d up-to-date, %d installed, %d removed, %d errors)\n",
+		len(report.Outcomes),
+		c[skillinject.ActionNoop],
+		c[skillinject.ActionCreate]+c[skillinject.ActionRewrite],
+		c[skillinject.ActionRemove],
+		c[skillinject.ActionError])
+	printSkillsOutcomeNotes(report, "  ")
 }
 
 // skillsHomeRel returns a $HOME-relative pretty path for display (purely
@@ -322,19 +393,40 @@ func cmdSkillsDisable(args []string) {
 	if uErr != nil {
 		fmt.Printf("warning: %v\n", uErr)
 	}
+	printSkillsRemovalReport(report)
+
+	if persistErr != nil {
+		fmt.Printf("\nwarning: opt-out flag could not be persisted: %v\n", persistErr)
+		fmt.Println("(future daemon ticks may re-install — fix permissions on ~/.pilot/config.json and re-run)")
+	} else {
+		fmt.Println()
+		fmt.Println("Opt-out persisted at ~/.pilot/config.json — future ticks are no-ops.")
+		fmt.Println("To re-enable: pilotctl skills enable all")
+	}
+}
+
+// skillsRemovalKinds is the order `skills disable all` prints its counts in.
+var skillsRemovalKinds = []skillinject.RemovalKind{
+	skillinject.RemovalDeleted,
+	skillinject.RemovalStripped,
+	skillinject.RemovalMerged,
+	skillinject.RemovalRestored,
+	skillinject.RemovalNeutralized,
+	skillinject.RemovalNoop,
+	skillinject.RemovalError,
+}
+
+// printSkillsRemovalReport prints the per-kind counts and the paths
+// `skills disable all` processed. A neutralized row is a retired plugin whose
+// tool config could not be edited safely: its entry file was replaced with a
+// no-op, and its note says how to finish the removal.
+func printSkillsRemovalReport(report *skillinject.RemovalReport) {
 	counts := report.Counts()
-	for _, k := range []skillinject.RemovalKind{
-		skillinject.RemovalDeleted,
-		skillinject.RemovalStripped,
-		skillinject.RemovalMerged,
-		skillinject.RemovalRestored,
-		skillinject.RemovalNoop,
-		skillinject.RemovalError,
-	} {
+	for _, k := range skillsRemovalKinds {
 		if counts[k] == 0 {
 			continue
 		}
-		fmt.Printf("  %-10s %d\n", string(k)+":", counts[k])
+		fmt.Printf("  %-12s %d\n", string(k)+":", counts[k])
 	}
 
 	if len(report.Removals) > 0 {
@@ -348,16 +440,10 @@ func cmdSkillsDisable(args []string) {
 			if x.Err != "" {
 				fmt.Printf("        ERROR: %s\n", x.Err)
 			}
+			if x.Note != "" {
+				fmt.Printf("        note: %s\n", x.Note)
+			}
 		}
-	}
-
-	if persistErr != nil {
-		fmt.Printf("\nwarning: opt-out flag could not be persisted: %v\n", persistErr)
-		fmt.Println("(future daemon ticks may re-install — fix permissions on ~/.pilot/config.json and re-run)")
-	} else {
-		fmt.Println()
-		fmt.Println("Opt-out persisted at ~/.pilot/config.json — future ticks are no-ops.")
-		fmt.Println("To re-enable: pilotctl skills enable all")
 	}
 }
 
@@ -391,32 +477,17 @@ func cmdSkillsEnable(args []string) {
 	if err != nil {
 		fatalCode("internal", "skills tick: %v", err)
 	}
-	c := report.Counts()
 
 	if jsonOutput {
-		outputOK(map[string]interface{}{
-			"enabled":  true,
-			"checked":  len(report.Outcomes),
-			"creates":  c[skillinject.ActionCreate],
-			"rewrites": c[skillinject.ActionRewrite],
-			"errors":   c[skillinject.ActionError],
-			"skipped":  report.Skipped,
-		})
+		fields := skillsReconcileFields(report)
+		fields["enabled"] = true
+		outputOK(fields)
 		return
 	}
 
 	fmt.Println("Pilot Protocol skill — enabled")
 	fmt.Println("===============================")
-	fmt.Printf("Reconcile complete — %d files checked.\n", len(report.Outcomes))
-	fmt.Printf("  noop:      %d\n", c[skillinject.ActionNoop])
-	fmt.Printf("  create:    %d\n", c[skillinject.ActionCreate])
-	fmt.Printf("  rewrite:   %d\n", c[skillinject.ActionRewrite])
-	if c[skillinject.ActionError] > 0 {
-		fmt.Printf("  errors:    %d (run `pilotctl skills status` for detail)\n", c[skillinject.ActionError])
-	}
-	if len(report.Skipped) > 0 {
-		fmt.Printf("Not installed (skipped): %s\n", strings.Join(report.Skipped, ", "))
-	}
+	printSkillsReconcileSummary(report)
 }
 
 // cmdSkillsSetMode persists the skillinject mode to ~/.pilot/config.json.

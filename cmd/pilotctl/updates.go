@@ -5,8 +5,10 @@ package main
 import (
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,7 +16,6 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/driver"
-	"github.com/pilot-protocol/skillinject"
 	"github.com/pilot-protocol/updater"
 )
 
@@ -61,16 +62,56 @@ func cmdAutoUpdateSet(on bool) {
 	}
 }
 
-// cmdAutoUpdateStatus shows whether automatic updates are on and the current
-// version (`pilotctl update status`).
+// updateStatusPath is the updater's record of its last check
+// (updater.Status): result, error, failure streak, versions and any pending
+// daemon restart. The pilot-updater loop writes it beside its --state-path
+// (~/.pilot/auto-update.json -> ~/.pilot/update-state.json) and `pilotctl
+// update` passes it as StatusPath, so manual and automatic checks share one
+// record.
+func updateStatusPath() string { return configDir() + "/" + updater.StatusFileName }
+
+// readUpdateStatus loads the updater's status record. ok is false when no
+// check has been recorded yet (the file is absent); err is set when the file
+// exists but cannot be read or parsed.
+func readUpdateStatus() (st updater.Status, ok bool, err error) {
+	st, err = updater.ReadStatus(updateStatusPath())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return updater.Status{}, false, nil
+		}
+		return updater.Status{}, false, err
+	}
+	return st, true, nil
+}
+
+// cmdAutoUpdateStatus shows whether automatic updates are on, the current
+// version, and what the updater last recorded: the result of the last check,
+// its error, the failure streak and whether the daemon still needs a restart
+// onto installed binaries (`pilotctl update status`).
 func cmdAutoUpdateStatus() {
 	on := autoUpdateEnabled()
+	st, recorded, readErr := readUpdateStatus()
 	if jsonOutput {
-		outputOK(map[string]interface{}{
+		out := map[string]interface{}{
 			"auto_update":     on,
 			"current_version": version,
 			"state_file":      autoUpdateStatePath(),
-		})
+			"status_file":     updateStatusPath(),
+			// Promoted from update_state so scripts can check them without
+			// walking the record. restart_error is "" when the daemon runs
+			// the installed binaries (or no update was recorded).
+			"last_result":   st.LastResult,
+			"last_error":    st.LastError,
+			"restart_error": st.RestartError,
+			"update_state":  nil,
+		}
+		if recorded {
+			out["update_state"] = st
+		}
+		if readErr != nil {
+			out["status_error"] = readErr.Error()
+		}
+		outputOK(out)
 		return
 	}
 	state := "disabled"
@@ -80,12 +121,80 @@ func cmdAutoUpdateStatus() {
 	fmt.Printf("Automatic updates: %s\n", state)
 	fmt.Printf("Current version:   %s\n", version)
 	fmt.Printf("State file:        %s\n", autoUpdateStatePath())
+	fmt.Printf("Status file:       %s\n", updateStatusPath())
+	fmt.Println()
+	switch {
+	case readErr != nil:
+		fmt.Printf("Last check:        unknown (status file unreadable: %v)\n", readErr)
+	case !recorded:
+		fmt.Println("Last check:        none recorded yet")
+	default:
+		printUpdateState(st)
+	}
 	if on {
 		fmt.Println("\nTurn off with:  pilotctl update disable")
 	} else {
 		fmt.Println("\nTurn on with:   pilotctl update enable")
 		fmt.Println("One-time check: pilotctl update")
 	}
+}
+
+// printUpdateState renders the recorded updater status for `update status`.
+func printUpdateState(st updater.Status) {
+	when := "unknown"
+	if !st.LastCheckAt.IsZero() {
+		when = formatUpdateTime(st.LastCheckAt)
+	}
+	result := st.LastResult
+	switch result {
+	case updater.ResultUpToDate:
+		result = "up to date"
+	case "":
+		result = "unknown"
+	}
+	trigger := ""
+	if st.LastCheckTrigger != "" {
+		trigger = " (" + st.LastCheckTrigger + ")"
+	}
+	fmt.Printf("Last check:        %s%s — %s\n", when, trigger, result)
+	if st.LastError != "" {
+		fmt.Printf("Last error:        %s\n", st.LastError)
+	}
+	if st.ConsecutiveFailures > 0 {
+		fmt.Printf("Failures in a row: %d\n", st.ConsecutiveFailures)
+		if !st.LastSuccessAt.IsZero() {
+			fmt.Printf("Last success:      %s\n", formatUpdateTime(st.LastSuccessAt))
+		}
+	}
+	if st.CurrentVersion != "" || st.LatestVersion != "" {
+		label := "latest"
+		if st.PinnedVersion != "" {
+			label = "pinned"
+		}
+		fmt.Printf("Installed/%s:  %s / %s\n", label, orDash(st.CurrentVersion), orDash(st.LatestVersion))
+	}
+	if st.LastUpdateVersion != "" {
+		at := ""
+		if !st.LastUpdateAt.IsZero() {
+			at = " at " + formatUpdateTime(st.LastUpdateAt)
+		}
+		fmt.Printf("Last update:       %s%s\n", st.LastUpdateVersion, at)
+	}
+	if st.RestartError != "" {
+		fmt.Println("Daemon restart:    NEEDED — the daemon is not running the installed binaries")
+		fmt.Printf("                   %s\n", st.RestartError)
+	}
+}
+
+func formatUpdateTime(t time.Time) string {
+	return t.Local().Format("2006-01-02 15:04:05 MST")
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // changelogFeedURL is the canonical RSS 2.0 feed for the public Pilot
@@ -316,25 +425,43 @@ func cmdUpdate(args []string) {
 	}
 	installDir := filepath.Dir(updaterBin)
 
-	u := updater.New(updater.Config{
+	statusPath := updateStatusPath()
+	u := newUpdateRunner(updater.Config{
 		CheckInterval: 0, // unused for RunOnce
 		Repo:          repo,
 		InstallDir:    installDir,
 		Version:       version,
 		PinnedVersion: pin,
+		// Record this manual check in the same update-state.json the
+		// pilot-updater loop writes, so `pilotctl update status` shows it.
+		StatusPath: statusPath,
 	})
 
-	u.RunOnce()
+	if err := u.RunOnce(); err != nil {
+		// RunOnce has already recorded the failure in the status file.
+		fatalHint("update_failed",
+			"see `pilotctl update status` for the recorded result",
+			"update failed: %v", err)
+	}
+	st := u.LastStatus()
 
 	if jsonOutput {
-		outputOK(map[string]interface{}{
-			"install_dir": installDir,
-			"repo":        repo,
-			"pinned":      pin != "",
-		})
+		out := map[string]interface{}{
+			"install_dir":     installDir,
+			"repo":            repo,
+			"pinned":          pin != "",
+			"result":          st.LastResult,
+			"updated":         st.LastResult == updater.ResultUpdated,
+			"current_version": st.CurrentVersion,
+			"latest_version":  st.LatestVersion,
+			"restart_error":   st.RestartError,
+			"status_file":     statusPath,
+		}
+		outputOK(out)
 		return
 	}
 	fmt.Printf("Update check complete. Install dir: %s\n", installDir)
+	printUpdateResult(st)
 
 	// In manual mode (no daemon running), re-run skill install so skills
 	// match the (possibly updated) binaries.
@@ -343,13 +470,37 @@ func cmdUpdate(args []string) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skill install failed: %v\n", err)
 		} else {
-			c := report.Counts()
-			fmt.Printf("Skills: %d files checked (%d up-to-date, %d installed, %d errors)\n",
-				len(report.Outcomes),
-				c[skillinject.ActionNoop],
-				c[skillinject.ActionCreate]+c[skillinject.ActionRewrite],
-				c[skillinject.ActionError])
+			printSkillsUpdateSummary(report)
 		}
+	}
+}
+
+// updateRunner is the part of *updater.Updater that `pilotctl update` uses.
+type updateRunner interface {
+	RunOnce() error
+	LastStatus() updater.Status
+}
+
+// newUpdateRunner builds the one-shot updater. Tests swap it for a fake that
+// never reaches GitHub or replaces binaries.
+var newUpdateRunner = func(cfg updater.Config) updateRunner { return updater.New(cfg) }
+
+// printUpdateResult reports what a successful `pilotctl update` did. A
+// restart_error means new binaries are installed but the daemon still runs
+// the old ones; the message names the command that restarts it.
+func printUpdateResult(st updater.Status) {
+	switch st.LastResult {
+	case updater.ResultUpdated:
+		fmt.Printf("Updated to %s.\n", orDash(st.CurrentVersion))
+	case updater.ResultUpToDate:
+		if st.CurrentVersion != "" {
+			fmt.Printf("Already up to date (%s).\n", st.CurrentVersion)
+		} else {
+			fmt.Println("Already up to date.")
+		}
+	}
+	if st.RestartError != "" {
+		fmt.Fprintf(os.Stderr, "warning: new binaries are installed but the daemon is not running them:\n  %s\n", st.RestartError)
 	}
 }
 
