@@ -1019,6 +1019,19 @@ func isTunnelKeepalive(pkt *protocol.Packet) bool {
 		len(pkt.Payload) == 0
 }
 
+// isLegacyUnstampedKeepalive matches the NAT keepalive sent by peers older
+// than v1.12.1, which left the inner Src zero (newKeepalivePacket started
+// stamping it in v1.12.1). Such a frame is AEAD-authenticated as the peer,
+// has no payload, claims no node (Src.Node 0 is not an address) and is
+// dropped by the isTunnelKeepalive check before recvCh — so letting it past
+// the identity binding cannot impersonate anyone. Dropping it as "spoofed"
+// instead skipped recordInboundDecrypt, so every quiet pre-v1.12.1 peer
+// looked inbound-silent to the path watchdog 55s after each handshake and
+// PktsRecv never advanced for the rx watchdog (2026-09-23 desync loop).
+func isLegacyUnstampedKeepalive(pkt *protocol.Packet) bool {
+	return pkt.Src.Node == 0 && isTunnelKeepalive(pkt)
+}
+
 // ReadyPeerIDs returns a snapshot of peers that have an established
 // crypto session (pc.Ready). These are the peers the path watchdog
 // health-checks: a Ready peer exchanges keepalives both ways every
@@ -1060,6 +1073,12 @@ var pathProbePayload = []byte("pathprobe.v1")
 // SrcPort is PortPing so the peer's pong comes back with
 // DstPort==PortPing + FlagACK, which handleControlPacket ignores by
 // design (anti-amplification) — the application layer never sees it.
+//
+// Dst MUST name the peer: every deployed handleControlPacket builds the
+// pong with Src = ping.Dst. With Dst unset the pong claimed Src.Node=0,
+// handleEncrypted's identity binding dropped it as "spoofed" before
+// recordInboundDecrypt, and no probe could ever prove a path alive — the
+// watchdog reset every quiet peer it probed (2026-09-23 desync loop).
 func (tm *TunnelManager) SendPathProbe(peerNodeID uint32) error {
 	tm.mu.RLock()
 	addr := tm.peers[peerNodeID]
@@ -1077,6 +1096,7 @@ func (tm *TunnelManager) SendPathProbe(peerNodeID uint32) error {
 		SrcPort:  protocol.PortPing,
 		DstPort:  protocol.PortPing,
 		Src:      protocol.Addr{Node: tm.loadNodeID()},
+		Dst:      protocol.Addr{Node: peerNodeID},
 		Payload:  pathProbePayload,
 	}
 	plaintext, err := probe.Marshal()
@@ -1650,7 +1670,12 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 	// untrusted srcNodeID, so the check covers direct and relayed traffic
 	// alike. Src.Network may vary across a node's networks; identity is the
 	// node id, so only .Node is compared.
-	if pkt.Src.Node != peerNodeID {
+	//
+	// The one exemption is the pre-v1.12.1 NAT keepalive (see
+	// isLegacyUnstampedKeepalive): it claims no identity and is never
+	// delivered, but it is the only inbound a quiet old peer sends, so it
+	// must still reach the liveness side-effects below.
+	if pkt.Src.Node != peerNodeID && !isLegacyUnstampedKeepalive(pkt) {
 		slog.Warn("tunnel: dropping frame with spoofed source node",
 			"authenticated_peer", peerNodeID, "claimed_src", pkt.Src.Node)
 		tm.publishEvent("security.src_spoofed", map[string]interface{}{

@@ -3702,11 +3702,21 @@ func (d *Daemon) handleControlPacket(pkt *protocol.Packet) {
 			return
 		}
 		// Ping request — send pong back
+		src := pkt.Dst
+		if src.Node == 0 {
+			// Path probes from v1.13.0–v1.13.9 leave Dst unset. The ping was
+			// delivered to us, so we are its destination: name ourselves.
+			// Echoing the zero Dst makes the pong claim node 0, the prober's
+			// identity binding drops it as spoofed, and its path watchdog
+			// resets this healthy path. A Dst that names a node is echoed
+			// unchanged, as before.
+			src.Node = d.tunnels.loadNodeID()
+		}
 		pong := &protocol.Packet{
 			Version:  protocol.Version,
 			Flags:    protocol.FlagACK,
 			Protocol: protocol.ProtoControl,
-			Src:      pkt.Dst,
+			Src:      src,
 			Dst:      pkt.Src,
 			SrcPort:  protocol.PortPing,
 			DstPort:  pkt.SrcPort,
