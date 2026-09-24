@@ -1218,15 +1218,36 @@ if [ "$OS" = "linux" ] && [ "$CAN_PRIV" = true ] \
     done
 fi
 if [ "$OS" = "darwin" ]; then
-    for _label in network.pilotprotocol.pilot-daemon network.pilotprotocol.pilot-updater; do
+    for _label in network.pilotprotocol.pilot-daemon network.pilotprotocol.pilot-updater com.vulturelabs.pilot-daemon com.vulturelabs.pilot-updater; do
         _lp="$HOME/Library/LaunchAgents/${_label}.plist"
-        if [ -f "$_lp" ] && launchctl list 2>/dev/null | grep -q "$_label"; then
-            if { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$PILOT_MANAGED_NO_START" != "1" ]; } \
-               && { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$_label" != "network.pilotprotocol.pilot-updater" ]; }; then
-                RESTART_LAUNCHD="${RESTART_LAUNCHD}${RESTART_LAUNCHD:+ }${_label}"
+        _new_label="$_label"
+        case "$_label" in
+            com.vulturelabs.*) _new_label="network.pilotprotocol.${_label#com.vulturelabs.}" ;;
+        esac
+        if launchctl print "gui/$(id -u)/${_label}" >/dev/null 2>&1; then
+            # Do not replace binaries or install a duplicate service if the
+            # old job cannot be stopped. bootout also handles a missing plist.
+            if ! launchctl bootout "gui/$(id -u)/${_label}" 2>/dev/null; then
+                echo "Error: could not unload ${_label}; aborting upgrade" >&2
+                exit 1
             fi
-            launchctl unload "$_lp" 2>/dev/null || true
-            echo "  Unloaded ${_label} (will reload after upgrade)"
+            if { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$PILOT_MANAGED_NO_START" != "1" ]; } \
+               && { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$_new_label" != "network.pilotprotocol.pilot-updater" ]; }; then
+                case " $RESTART_LAUNCHD " in
+                    *" ${_new_label} "*) ;;
+                    *) RESTART_LAUNCHD="${RESTART_LAUNCHD}${RESTART_LAUNCHD:+ }${_new_label}" ;;
+                esac
+            fi
+            echo "  Unloaded ${_label} (will reload as ${_new_label} after upgrade)"
+        fi
+        if [ "$_new_label" != "$_label" ] && [ -f "$_lp" ]; then
+            # Preserve operator arguments for the plist-regeneration code,
+            # then retire the legacy RunAtLoad job even if it was not loaded.
+            _new_lp="$HOME/Library/LaunchAgents/${_new_label}.plist"
+            if [ ! -f "$_new_lp" ]; then
+                cp "$_lp" "$_new_lp"
+            fi
+            mv "$_lp" "${_lp}.migrated"
         fi
     done
 fi
@@ -1718,7 +1739,7 @@ if [ "$PILOT_MANAGED_MODE" = "1" ]; then
     # a background downgrade to silently remove enforcement.
     printf '{\n  "enabled": false,\n  "reason": "managed-runtime-pinned-by-authority"\n}\n' > "$PILOT_DIR/auto-update.json"
     echo "Auto-updates pinned to the management authority runtime channel"
-elif [ "$UPDATING" != true ] && [ ! -f "$PILOT_DIR/auto-update.json" ]; then
+elif [ ! -f "$PILOT_DIR/auto-update.json" ]; then
     printf '{\n  "enabled": true\n}\n' > "$PILOT_DIR/auto-update.json"
     echo "Auto-updates ENABLED (opt-out) — disable with: pilotctl update disable"
 fi
@@ -1845,7 +1866,7 @@ USVC
     if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
         # shellcheck disable=SC2086
         if $PILOT_SUDO systemctl enable --now pilot-updater; then
-            echo "  Started: pilot-updater (auto-updates enabled)"
+            echo "  Started: pilot-updater (check automatic-update state: pilotctl update status)"
         else
             echo "  Note: could not enable pilot-updater via systemd (non-fatal)."
         fi
@@ -2047,7 +2068,7 @@ UPLIST
     if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ] && [ -f "$UPLIST" ]; then
         launchctl unload "$UPLIST" 2>/dev/null || true
         launchctl load -w "$UPLIST"
-        echo "  Started: pilot-updater (auto-updates enabled)"
+        echo "  Started: pilot-updater (check automatic-update state: pilotctl update status)"
     fi
 
     # Reload the daemon agent if it was loaded before we swapped its binary,

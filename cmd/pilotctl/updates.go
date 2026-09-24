@@ -192,7 +192,6 @@ func printUpdateState(st updater.Status, restart daemonRestart) {
 	case restart.recorded == "":
 	case restart.resolved():
 		fmt.Printf("Daemon restart:    not needed — the daemon runs the installed %s\n", restart.daemonVersion)
-		fmt.Printf("%s(the recorded restart error is out of date: %s)\n", indent, restart.recorded)
 	case restart.daemonDown():
 		fmt.Printf("Daemon restart:    daemon not running — %s runs when it starts\n", orDash(restart.installed))
 		fmt.Printf("%slast restart attempt: %s\n", indent, restart.recorded)
