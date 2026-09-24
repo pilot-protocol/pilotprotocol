@@ -52,6 +52,16 @@ Detailed per-release notes are on the
     version and host platform, and says nothing was installed.
   - The catalogue lint blocks releases of stateful apps until nodes run a
     pilotctl with this fix.
+- **The path watchdog no longer resets healthy, quiet peers.** Two kinds of
+  authenticated inbound traffic were thrown away as "spoofed" before they
+  could count as liveness. The first was the pong to the watchdog's own path
+  probe: the probe had no destination, so the pong came back claiming node 0.
+  The second was the NAT keepalive from peers older than v1.12.1, which carries
+  a zero source. A quiet peer therefore looked inbound-silent about 55s after
+  every handshake, and its path was reset about 30s later, which could leave
+  the session unusable until a restart. Probes now name the peer, and the
+  empty zero-source keepalive counts as liveness. Any other frame whose source
+  does not match the authenticated peer is still dropped. No wire change.
 
 ## [1.12.8] - 2026-07-16
 
