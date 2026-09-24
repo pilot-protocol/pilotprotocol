@@ -17,4 +17,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Onboard from the beta channel
-        run: bash .github/verify-onboarding.sh v1.13.10
+        run: bash .github/verify-onboarding.sh v1.13.11-rc.1
