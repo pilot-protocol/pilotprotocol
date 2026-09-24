@@ -493,3 +493,34 @@ func TestE2EDaemonStartBehindRejectingProxy(t *testing.T) {
 		t.Errorf("auto did not stay on compat:\n%s", logs)
 	}
 }
+
+// A new pilotctl starting a daemon that predates -proxy (v1.13.9) from a
+// shell whose only way out is $HTTPS_PROXY warns at start instead of
+// leaving a bare "did not become ready" to explain it (phase-2 E2E
+// scenario 3).
+func TestCLIDaemonStartWarnsOldDaemonIgnoresProxy(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	out := filepath.Join(dir, "daemon")
+	bin := writeFakeDaemon(t, append([]string{v1139TransportUsage}, baseDaemonFlags...), out)
+	env := cliEnvCleared(map[string]string{
+		"PILOT_DAEMON_BIN": bin,
+		"PILOT_SOCKET":     filepath.Join(dir, "pilot.sock"),
+		"HTTPS_PROXY":      "http://muse:s3cret@egress.test:3128",
+	})
+	_, stderr, code := runCLI(t, []string{"daemon", "start", "--foreground"}, env)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "predates HTTPS-proxy support") || !strings.Contains(stderr, "$HTTPS_PROXY") {
+		t.Errorf("no warning that the daemon ignores the proxy:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "s3cret") {
+		t.Errorf("warning leaks the proxy password:\n%s", stderr)
+	}
+	// --proxy off: the operator asked for no proxy; nothing to warn about.
+	_, stderr, _ = runCLI(t, []string{"daemon", "start", "--foreground", "--proxy", "off"}, env)
+	if strings.Contains(stderr, "predates HTTPS-proxy support") {
+		t.Errorf("warned although --proxy off:\n%s", stderr)
+	}
+}

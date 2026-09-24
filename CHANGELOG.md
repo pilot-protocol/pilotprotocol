@@ -132,6 +132,12 @@ Detailed per-release notes are on the
   sandboxes run the agent as root); regular hosts still refuse root.
 
 ### Fixed
+- **`pilotctl --json trusted list` printed the text table**; it now returns
+  `{"trusted": [{"hostname", "address", "node_id"}], "count"}`.
+- **A new pilotctl starting a pilot-daemon that predates proxy support**
+  (v1.13.9) from a shell with `$HTTPS_PROXY` / `$ALL_PROXY` now warns that
+  the daemon will not use the proxy, instead of leaving a bare "did not
+  become ready" to explain it.
 - **Downgrading after `transport=auto` was saved no longer bricks the daemon.**
   A pilot-daemon that predates `auto` exits on `"transport":"auto"` in
   config.json. Reinstalling an older release with `install.sh --version` and

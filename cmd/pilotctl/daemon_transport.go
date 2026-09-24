@@ -460,16 +460,36 @@ func adaptDaemonArgs(bin string, plan daemonLaunchPlan) (args []string, proxyEnv
 	}
 
 	if flags != nil && !flags["proxy"] {
+		asked := false
 		if hasFlag(args, "--proxy") {
 			warn("%s does not support -proxy (older pilot-daemon); not passing -proxy %s — upgrade pilot-daemon to use it", bin, redactProxyURL(flagValue(args, "--proxy")))
 			args = removeFlag(args, "--proxy")
+			asked = true
 		}
 		if proxyEnv != "" {
 			warn("%s does not support -proxy (older pilot-daemon); proxy %s will not be used — upgrade pilot-daemon to use it", bin, redactProxyURL(proxyEnv))
 			proxyEnv = ""
+			asked = true
+		}
+		if v := envProxyVar(); v != "" && !asked && plan.Proxy != proxyconf.Off {
+			// Nothing was asked for explicitly, but this shell gets out
+			// through a proxy the daemon cannot use: say so now rather than
+			// leave a bare "did not become ready" to explain it.
+			warn("%s predates HTTPS-proxy support (older pilot-daemon) and will not use $%s; where the proxy is the only way out it cannot reach the registry — upgrade pilot-daemon", bin, v)
 		}
 	}
 	return args, proxyEnv, transport
+}
+
+// envProxyVar names the first proxy variable set in this environment
+// that a proxy-aware daemon would use for the registry ("" when none).
+func envProxyVar() string {
+	for _, k := range []string{"HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
+		if strings.TrimSpace(os.Getenv(k)) != "" {
+			return k
+		}
+	}
+	return ""
 }
 
 func hasFlag(args []string, name string) bool {
