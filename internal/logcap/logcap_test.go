@@ -1,0 +1,494 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+package logcap
+
+import (
+	"compress/gzip"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// openLog opens path the way launchd opens StandardErrorPath: write-only,
+// append, create.
+func openLog(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+func write(t *testing.T, f *os.File, s string) {
+	t.Helper()
+	if _, err := f.WriteString(s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func gunzip(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	b, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return string(b)
+}
+
+func exists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+// anywhere returns Options that rotate the log wherever it lives, as an
+// explicit -log-max-size does.
+func anywhere(maxBytes int64, maxBackups int) Options {
+	return Options{MaxBytes: maxBytes, MaxBackups: maxBackups, Anywhere: true}
+}
+
+func mustRotate(t *testing.T, r *Rotator) {
+	t.Helper()
+	rotated, err := r.Check()
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if !rotated {
+		t.Fatal("Check did not rotate an over-limit log")
+	}
+}
+
+func TestCheckBelowLimitIsNoop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	write(t, f, strings.Repeat("x", 100))
+
+	r := New(f, anywhere(100, 3)) // exactly at the limit: not over it
+	rotated, err := r.Check()
+	if err != nil || rotated {
+		t.Fatalf("Check = (%v, %v), want (false, nil)", rotated, err)
+	}
+	if got := readFile(t, path); len(got) != 100 {
+		t.Fatalf("log size = %d, want 100 (untouched)", len(got))
+	}
+	if exists(backupName(path, 1)) {
+		t.Fatal("backup written for a log under the limit")
+	}
+}
+
+func TestCheckRotatesTruncatesAndGzips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	first := strings.Repeat("first line\n", 20)
+	write(t, f, first)
+
+	r := New(f, anywhere(100, 3))
+	mustRotate(t, r)
+
+	if got := readFile(t, path); got != "" {
+		t.Fatalf("log after rotation = %d bytes, want empty", len(got))
+	}
+	if got := gunzip(t, backupName(path, 1)); got != first {
+		t.Fatalf("backup content mismatch: got %d bytes, want %d", len(got), len(first))
+	}
+	if exists(stagingName(path)) {
+		t.Fatal("uncompressed staging copy left behind")
+	}
+	fi, err := os.Stat(backupName(path, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode = %v, want 0600", fi.Mode().Perm())
+	}
+
+	// The O_APPEND writer carries on at the new end of file: no sparse
+	// hole, no stale bytes.
+	write(t, f, "after\n")
+	if got := readFile(t, path); got != "after\n" {
+		t.Fatalf("log after post-rotation write = %q, want %q", got, "after\n")
+	}
+}
+
+func TestCheckShiftsGenerationsAndDropsOldest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	r := New(f, anywhere(10, 3))
+
+	contents := []string{"generation-A\n", "generation-B\n", "generation-C\n", "generation-D\n"}
+	for _, c := range contents {
+		write(t, f, c)
+		mustRotate(t, r)
+	}
+
+	// Newest in .1, oldest kept in .3; generation-A fell off the end.
+	for gen, want := range map[int]string{1: contents[3], 2: contents[2], 3: contents[1]} {
+		if got := gunzip(t, backupName(path, gen)); got != want {
+			t.Fatalf("%s = %q, want %q", backupName(path, gen), got, want)
+		}
+	}
+	if exists(backupName(path, 4)) {
+		t.Fatal("kept more generations than maxBackups")
+	}
+}
+
+func TestCheckRemovesGenerationsBeyondLoweredLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	// Leftovers from a run with a larger -log-max-backups.
+	for gen := 1; gen <= 5; gen++ {
+		if err := os.WriteFile(backupName(path, gen), []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(t, f, strings.Repeat("y", 50))
+	mustRotate(t, New(f, anywhere(10, 2)))
+
+	if !exists(backupName(path, 1)) || !exists(backupName(path, 2)) {
+		t.Fatal("expected .1.gz and .2.gz")
+	}
+	for gen := 3; gen <= 5; gen++ {
+		if exists(backupName(path, gen)) {
+			t.Fatalf("%s survived with maxBackups=2", backupName(path, gen))
+		}
+	}
+}
+
+func TestCheckZeroBackupsJustTruncates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	write(t, f, strings.Repeat("z", 50))
+
+	mustRotate(t, New(f, anywhere(10, 0)))
+	if got := readFile(t, path); got != "" {
+		t.Fatalf("log not truncated: %d bytes", len(got))
+	}
+	matches, _ := filepath.Glob(path + ".*")
+	if len(matches) != 0 {
+		t.Fatalf("backups written with maxBackups=0: %v", matches)
+	}
+}
+
+func TestCheckFinishesInterruptedRotation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	// A previous rotation copied to .1 and died before compressing it;
+	// its shift had already moved the older backup to .2.gz.
+	if err := os.WriteFile(stagingName(path), []byte("interrupted\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write(t, f, strings.Repeat("n", 50))
+	mustRotate(t, New(f, anywhere(10, 3)))
+
+	if got := gunzip(t, backupName(path, 2)); got != "interrupted\n" {
+		t.Fatalf(".2.gz = %q, want the interrupted generation", got)
+	}
+	if got := gunzip(t, backupName(path, 1)); got != strings.Repeat("n", 50) {
+		t.Fatalf(".1.gz = %q, want the current log", got)
+	}
+	if exists(stagingName(path)) {
+		t.Fatal("staging copy left behind")
+	}
+}
+
+// readOnly opens path read-only. Such a descriptor cannot truncate the
+// log, as the daemon's cannot when the log is append-only (chflags
+// uappnd, chattr +a) or on a filesystem that refuses ftruncate.
+func readOnly(t *testing.T, path string) *os.File {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// TestCheckKeepsGenerationsWhenLogCannotBeTruncated: a round that cannot
+// truncate the log keeps no backup, so it moves nothing — every
+// generation stays where it was, the oldest included, and no copy is
+// left — however many rounds fail. Once the log can be truncated again,
+// it rotates as if those rounds had not happened.
+func TestCheckKeepsGenerationsWhenLogCannotBeTruncated(t *testing.T) {
+	for _, gens := range [][]int{{1, 2, 3}, {1, 3}, {2, 3}, {1}, {3}, nil} {
+		t.Run(fmt.Sprint(gens), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.log")
+			old := map[int]string{}
+			for _, gen := range gens {
+				old[gen] = fmt.Sprintf("generation %d", gen)
+				writeFile(t, backupName(path, gen), old[gen])
+			}
+			content := strings.Repeat("l", 50)
+			writeFile(t, path, content)
+			before := dirNames(t, dir)
+
+			r := New(readOnly(t, path), anywhere(10, 3))
+			for round := range 3 {
+				rotated, err := r.Check()
+				if rotated || !errors.Is(err, errTruncate) {
+					t.Fatalf("round %d: Check = (%v, %v), want (false, errTruncate)", round, rotated, err)
+				}
+				if got := dirNames(t, dir); !equal(got, before) {
+					t.Fatalf("round %d: dir = %v, want %v (nothing moved, no copy left)", round, got, before)
+				}
+				for gen, want := range old {
+					if got := readFile(t, backupName(path, gen)); got != want {
+						t.Fatalf("round %d: %s = %q, want %q", round, backupName(path, gen), got, want)
+					}
+				}
+				if got := readFile(t, path); got != content {
+					t.Fatalf("round %d: log changed: %d bytes", round, len(got))
+				}
+			}
+
+			r.file = openLog(t, path)
+			mustRotate(t, r)
+			if got := gunzip(t, backupName(path, 1)); got != content {
+				t.Fatalf(".1.gz = %q, want the log", got)
+			}
+			for gen := 2; gen <= 3; gen++ {
+				want, ok := old[gen-1]
+				if got := exists(backupName(path, gen)); got != ok {
+					t.Fatalf("%s exists = %v, want %v", backupName(path, gen), got, ok)
+				}
+				if ok {
+					if got := readFile(t, backupName(path, gen)); got != want {
+						t.Fatalf("%s = %q, want %q", backupName(path, gen), got, want)
+					}
+				}
+			}
+			if exists(backupName(path, 4)) {
+				t.Fatal("kept more generations than maxBackups")
+			}
+		})
+	}
+}
+
+// TestUnstageLeavesGenerationOneFreeForACopyItCannotRemove: when the
+// copy of a log that could not be truncated cannot be removed either, it
+// is left for a later round to finish into generation 1, so the shift
+// stays and only the parked generation is dropped, as before parking.
+func TestUnstageLeavesGenerationOneFreeForACopyItCannotRemove(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.log")
+	for gen := 1; gen <= 3; gen++ {
+		writeFile(t, backupName(path, gen), fmt.Sprintf("generation %d", gen))
+	}
+	parked, err := shiftBackups(path, 3)
+	if err != nil || !parked {
+		t.Fatalf("shiftBackups = (%v, %v), want (true, nil)", parked, err)
+	}
+	// A name os.Remove fails on: a directory that is not empty.
+	if err := os.Mkdir(stagingName(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(stagingName(path), "x"), "x")
+
+	if err := unstage(path, 3, parked); err == nil {
+		t.Fatal("unstage reported no error for a copy it could not remove")
+	}
+	if exists(backupName(path, 1)) {
+		t.Fatal("generation 1 taken back while a copy is waiting for it")
+	}
+	for gen, want := range map[int]string{2: "generation 1", 3: "generation 2"} {
+		if got := readFile(t, backupName(path, gen)); got != want {
+			t.Fatalf("%s = %q, want %q", backupName(path, gen), got, want)
+		}
+	}
+	if exists(backupName(path, 4)) {
+		t.Fatal("parked generation not dropped")
+	}
+}
+
+// TestRetryAfter: after each round in a row that could not truncate the
+// log, the wait doubles, up to 64 intervals.
+func TestRetryAfter(t *testing.T) {
+	for failures, want := range map[int]time.Duration{
+		1: 1, 2: 2, 3: 4, 4: 8, 5: 16, 6: 32, 7: 64, 8: 64, 1000: 64,
+	} {
+		if got := retryAfter(time.Minute, failures); got != want*time.Minute {
+			t.Errorf("retryAfter(1m, %d) = %v, want %v", failures, got, want*time.Minute)
+		}
+	}
+}
+
+// TestTickBacksOffWhileLogCannotBeTruncated: the watcher does not copy a
+// log it cannot truncate every interval: it waits longer after each
+// failed round, and goes back to the interval once a round gets through.
+func TestTickBacksOffWhileLogCannotBeTruncated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	writeFile(t, path, strings.Repeat("t", 50))
+	r := New(readOnly(t, path), anywhere(10, 3))
+
+	for i, want := range []time.Duration{1, 2, 4, 8, 16, 32, 64, 64} {
+		wait, ok := r.tick(time.Minute)
+		if !ok || wait != want*time.Minute {
+			t.Fatalf("failed round %d: tick = (%v, %v), want (%v, true)", i+1, wait, ok, want*time.Minute)
+		}
+	}
+
+	w := openLog(t, path)
+	r.file = w
+	if wait, ok := r.tick(time.Minute); !ok || wait != time.Minute {
+		t.Fatalf("rotating round: tick = (%v, %v), want (1m, true)", wait, ok)
+	}
+	if got := readFile(t, path); got != "" {
+		t.Fatalf("log not truncated: %d bytes", len(got))
+	}
+
+	write(t, w, strings.Repeat("u", 50))
+	r.file = readOnly(t, path)
+	if wait, ok := r.tick(time.Minute); !ok || wait != time.Minute {
+		t.Fatalf("first failed round after one got through: tick = (%v, %v), want (1m, true)", wait, ok)
+	}
+}
+
+// TestCheckNonAppendWriterRewinds: a writer that did not open the file
+// O_APPEND (a shell's `2>file`) shares the descriptor offset; rotation
+// must rewind it or the next write re-creates the old size as a hole.
+func TestCheckNonAppendWriterRewinds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	write(t, f, strings.Repeat("w", 50))
+
+	mustRotate(t, New(f, anywhere(10, 1)))
+	write(t, f, "next\n")
+	if got := readFile(t, path); got != "next\n" {
+		t.Fatalf("log = %q (%d bytes), want %q — offset not rewound", got, len(got), "next\n")
+	}
+}
+
+// TestCheckTruncatesWithoutBackupWhenPathIsGone: an unlinked log still
+// fills the disk through the open descriptor, so it is truncated even
+// though no backup can be made.
+func TestCheckTruncatesWithoutBackupWhenPathIsGone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.log")
+	f := openLog(t, path)
+	write(t, f, strings.Repeat("d", 50))
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := New(f, anywhere(10, 3)).Check()
+	if !rotated {
+		t.Fatalf("Check did not truncate an unlinked over-limit log (err %v)", err)
+	}
+	if err == nil {
+		t.Fatal("expected an error reporting the missing backup")
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 0 {
+		t.Fatalf("unlinked log size = %d, want 0", fi.Size())
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, "*.gz")); len(matches) != 0 {
+		t.Fatalf("backup written for an unlinked log: %v", matches)
+	}
+}
+
+// TestCheckFollowsRenamedLog: fdPath resolves the file's current name,
+// so backups land next to wherever the open log now lives.
+func TestCheckFollowsRenamedLog(t *testing.T) {
+	dir := t.TempDir()
+	orig := filepath.Join(dir, "daemon.log")
+	f := openLog(t, orig)
+	write(t, f, strings.Repeat("r", 50))
+	moved := filepath.Join(dir, "moved.log")
+	if err := os.Rename(orig, moved); err != nil {
+		t.Fatal(err)
+	}
+
+	mustRotate(t, New(f, anywhere(10, 1)))
+	if !exists(backupName(moved, 1)) {
+		t.Fatal("backup not written next to the renamed log")
+	}
+}
+
+func TestWatchNoopForNonRegularFiles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	defer pw.Close()
+	if Watch(ctx, pw, anywhere(1, 3), time.Minute) {
+		t.Fatal("Watch started on a pipe (journald/systemd case)")
+	}
+
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devnull.Close()
+	if Watch(ctx, devnull, anywhere(1, 3), time.Minute) {
+		t.Fatal("Watch started on a character device (terminal case)")
+	}
+}
+
+func TestWatchDisabledByZeroLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	if Watch(context.Background(), f, anywhere(0, 3), time.Minute) {
+		t.Fatal("Watch started with maxBytes=0 (disabled)")
+	}
+}
+
+func TestWatchRotatesInBackground(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.log")
+	f := openLog(t, path)
+	content := strings.Repeat("background\n", 10)
+	write(t, f, content)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !Watch(ctx, f, anywhere(20, 1), 10*time.Millisecond) {
+		t.Fatal("Watch did not start on a regular file")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !exists(backupName(path, 1)) {
+		if time.Now().After(deadline) {
+			t.Fatal("background watcher never rotated the log")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if got := gunzip(t, backupName(path, 1)); got != content {
+		t.Fatalf("backup = %d bytes, want %d", len(got), len(content))
+	}
+}

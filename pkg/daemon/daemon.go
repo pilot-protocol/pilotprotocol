@@ -76,6 +76,10 @@ const registryCallDeadline = 8 * time.Second
 
 var errRegistryCallTimedOut = errors.New("registry: call timed out, connection likely half-open")
 
+// errDaemonStopping is returned by background work that declines to start
+// (or undoes itself) because Stop has begun.
+var errDaemonStopping = errors.New("daemon is stopping")
+
 func withRegistryDeadline(timeout time.Duration, fn func() (map[string]interface{}, error)) (map[string]interface{}, error) {
 	type registryCallResult struct {
 		resp map[string]interface{}
@@ -2355,6 +2359,12 @@ func (d *Daemon) dialRegistryClient() (*registry.Client, error) {
 }
 
 func (d *Daemon) forceReconnectRegistry() error {
+	// The heartbeat and rx-watchdog call this without coordinating with
+	// Stop. Once Stop has begun, a reconnect would only leak a fresh pool
+	// that nothing closes.
+	if d.stopping() {
+		return errDaemonStopping
+	}
 	newConn, err := d.dialRegistryClient()
 	if err != nil {
 		return err
@@ -2362,6 +2372,12 @@ func (d *Daemon) forceReconnectRegistry() error {
 	old := d.regConn.Swap(newConn)
 	if old != nil {
 		go old.Close()
+	}
+	// Stop may have closed the registry between the check above and the
+	// swap; if so it closed the old conn, so close the one we installed.
+	if d.stopping() {
+		newConn.Close()
+		return errDaemonStopping
 	}
 	slog.Warn("registry connection force-reconnected after half-open detection", "addr", d.config.RegistryAddr)
 	return nil

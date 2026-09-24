@@ -10,6 +10,47 @@ Detailed per-release notes are on the
 ## [Unreleased]
 
 ### Added
+- **The daemon caps its own log file.** launchd never rotates the daemon's
+  `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
+  without bound — 22 MB on one laptop. When stderr is a regular file the
+  daemon now checks it every minute and, past `-log-max-size` MB (default 50;
+  `0` disables), copy-truncates it into gzipped generations
+  `daemon.log.pilot.1.gz` … `daemon.log.pilot.N.gz` (`-log-max-backups`,
+  default 3). Truncation is safe for every writer — the file is opened
+  append-only and shared by child processes. Both flags can also be set in
+  `~/.pilot/config.json` (`log_max_size`, `log_max_backups`). No-op when the
+  output goes to journald, a pipe or a terminal.
+  - By default only a log Pilot set up is rotated: one inside `~/.pilot`,
+    where install.sh's launchd job and `pilotctl daemon start` put it (also
+    `$PILOT_HOME/.pilot`), and the Homebrew service's
+    `$(brew --prefix)/var/log/pilot-daemon.log` when the daemon is the one
+    `brew install pilotprotocol` installed (`brew services`, launchd or
+    systemd). If you send the daemon's output somewhere else, rotation stays
+    off unless you set `-log-max-size` explicitly, on the command line or in
+    `config.json`, so your own rotation (logrotate, newsyslog) keeps working
+    as before.
+  - A rotation interrupted by a crash or kill is finished by the next
+    rotation of that log. In `~/.pilot` this includes a rotation left under
+    the `pilot-<pid>.log` name of a daemon that `pilotctl daemon start`
+    launched earlier. Only those names are finished this way, so another
+    program's `<name>.pilot.1` is never taken for one. A rotation holds its
+    uncompressed copy (`<log>.pilot.1`) locked with `flock` until it is
+    compressed, so a copy that another running daemon is still working on
+    is left alone.
+  - If the log cannot be truncated (an append-only file, or a filesystem
+    that refuses it), no backup is lost. The round's copy is removed, the
+    generations are put back, and the next attempt waits twice as long as
+    the last, up to about an hour.
+  - It never touches files it did not create. The `.pilot` infix keeps its
+    backups apart from logrotate's and newsyslog's names (`daemon.log.1`,
+    `daemon.log.2.gz`, …). It skips a symlink or another user's file at one
+    of its own names, and creates its files with `O_EXCL|O_NOFOLLOW`. If
+    other users can create files in the log's directory, it only truncates
+    and keeps no backups. That is the case when the directory is writable
+    by others, is owned by another user, or is writable by a group other
+    than the user's own private group. A `~/.pilot` that is group-writable
+    only because of the umask 002 on Ubuntu, Debian or Fedora (the group
+    is the user's own, with no other members) keeps its backups.
 - **Opt out of automatic app-store updates with `PILOT_APP_UPDATE_OPT_OUT`.** The
   `pilot-updater` keeps installed apps current by periodically running
   `pilotctl appstore upgrade --all`. Set `PILOT_APP_UPDATE_OPT_OUT=true` in the
@@ -183,6 +224,17 @@ Detailed per-release notes are on the
 - **An https:// proxy was verified with the beacon's pinned roots** under
   `-tls-trust=pinned`; the proxy's certificate is now checked against the
   system roots and the beacon's trust store applies to the beacon only.
+- **Watchdog restarts no longer orphan app-store apps.** When the inbound-path
+  watchdog gave up on a wedged transport it called `os.Exit(86)` directly,
+  skipping the graceful shutdown that stops plugins — so every installed app
+  (each in its own process group) was left running on every respawn. One
+  laptop accumulated 94 copies of each of 12 apps (~2.8 GB RSS) in a week.
+  The watchdog now asks the daemon's shutdown loop to stop the daemon and its
+  plugins, then exits with code 86 as before so launchd/systemd still respawn
+  it; a 15 s hard deadline forces the exit if the teardown hangs. Startup
+  failures after plugins have started now stop them before exiting, too.
+  (Complements the app-store's orphan reaping at spawn,
+  pilot-protocol/app-store#38.)
 - **The `pilotctl skills disable` opt-out now survives updates and explicit
   reconciles.** A forced reconcile — `pilotctl skills check`, `pilotctl update`,
   or an installer re-run — bypassed the disabled flag and re-injected skills a
