@@ -78,6 +78,8 @@ func main() {
 	// stays on. Mirrors the --state-path pattern with an env fallback.
 	skipAttestation := flag.Bool("skip-attestation", envBool("PILOT_UPDATER_SKIP_ATTESTATION"),
 		"skip SLSA attestation verification (default off); for test/air-gapped use only — production verifies in-process, no `gh` needed")
+	logMaxSize := flag.Int("log-max-size", defaultUpdaterLogMaxMB, "rotate the updater's log once it exceeds this many MB (copy-truncate into gzipped <log>.pilot.N.gz backups). By default only a log inside ~/.pilot is rotated (install.sh's launchd updater.log); a log elsewhere only when this is set explicitly. 0 disables")
+	logMaxBackups := flag.Int("log-max-backups", defaultUpdaterLogBackups, "gzipped generations kept by -log-max-size rotation (<log>.pilot.1.gz ... <log>.pilot.N.gz); 0 keeps none")
 	flag.Parse()
 
 	if *showVersion {
@@ -91,6 +93,10 @@ func main() {
 	}
 
 	setupLogging(*logLevel, *logFormat)
+	// launchd never rotates ~/.pilot/updater.log; cap it from the inside
+	// (logcap.go). Lives for the process's lifetime.
+	capUpdaterLog(context.Background(), os.Stderr, *logMaxSize, *logMaxBackups,
+		flagSetOnCommandLine("log-max-size"), updaterLogCheckInterval)
 
 	u := updater.New(updater.Config{
 		CheckInterval:   *interval,
