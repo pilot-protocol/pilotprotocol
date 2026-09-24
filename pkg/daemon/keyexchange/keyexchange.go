@@ -147,6 +147,25 @@ const (
 
 	NegativePubKeyCacheTTL = 3 * time.Second
 	MaxNegPubKeyEntries    = 4096
+
+	// KeyRequestAfterSends is how many of our key-exchange frames to a peer
+	// may go unanswered, while we hold no session key for it, before each
+	// further send also carries a key request: an unauthenticated PILK
+	// frame next to the PILA. See SendKeyExchangeToNode.
+	//
+	// Why: a node answers a new peer's PILA exactly once and clears its
+	// own retransmit state (HandleAuthFrame, the !hadCrypto branch). If
+	// that one reply is lost, every retransmit of ours carries the same
+	// X25519 key, so the peer treats it as a same-session keepalive and
+	// stays silent: the peer holds a session for us, we hold none, and
+	// nothing on either side recovers it until the peer's path watchdog
+	// drops its half (which our own PILAs keep postponing). Every
+	// released daemon answers a PILK from a peer whose identity it knows
+	// by rejecting it and sending its authenticated PILA instead
+	// (HandleUnauthFrame), and that reply is marked pending, so the peer
+	// retransmits it until our PILA arrives. The PILK installs nothing on
+	// such a peer and costs one 40-byte frame per retransmit.
+	KeyRequestAfterSends = 1
 )
 
 // PendingRekeyState tracks a key-exchange we sent and are waiting on.
@@ -248,6 +267,13 @@ type Manager struct {
 	// KeyExchangeReplyMinInterval to break the symmetric ping-pong
 	// described on that constant.
 	lastKeyExchangeReply map[uint32]time.Time
+	// keyRequestDue marks peers whose next SendKeyExchangeToNode must
+	// carry a key request (PILK) regardless of the attempt count: set by
+	// MarkKeyRequestDue when the peer is known to hold a session we lack
+	// (it sent us an encrypted frame we have no key for).
+	keyRequestDue map[uint32]struct{}
+	// keyRequestsSent counts key requests (PILK nudges) sent. Metric only.
+	keyRequestsSent atomic.Uint64
 
 	// PILOT-344: per-peer whitelist for the reply-interval gate.
 	// Whitelisted peers always pass MarkReplyKeyExchangeSent so trusted
@@ -285,6 +311,7 @@ func New(store *Store) *Manager {
 		lastInboundDecrypt:   make(map[uint32]time.Time),
 		rekeyGaveUp:          make(map[uint32]time.Time),
 		lastKeyExchangeReply: make(map[uint32]time.Time),
+		keyRequestDue:        make(map[uint32]struct{}),
 	}
 }
 
@@ -718,5 +745,38 @@ func (m *Manager) RemovePeer(nodeID uint32) {
 	delete(m.pendingRekey, nodeID)
 	delete(m.lastInboundDecrypt, nodeID)
 	delete(m.lastKeyExchangeReply, nodeID)
+	delete(m.keyRequestDue, nodeID)
 	m.rkPendingMu.Unlock()
 }
+
+// MarkKeyRequestDue makes the next SendKeyExchangeToNode to peerNodeID
+// also send a key request (PILK), provided we still hold no session key
+// for it then. The tunnel calls it when the peer sends us an encrypted
+// frame we cannot decrypt: proof that the peer holds a session for us
+// that we lack, which a same-key PILA alone cannot repair (see
+// KeyRequestAfterSends).
+func (m *Manager) MarkKeyRequestDue(peerNodeID uint32) {
+	m.rkPendingMu.Lock()
+	if len(m.keyRequestDue) < MaxNegPubKeyEntries {
+		m.keyRequestDue[peerNodeID] = struct{}{}
+	}
+	m.rkPendingMu.Unlock()
+}
+
+// takeKeyRequest reports whether the send about to go out to peerNodeID
+// should carry a key request, and consumes a MarkKeyRequestDue mark.
+// Caller has already checked that no session key is installed.
+func (m *Manager) takeKeyRequest(peerNodeID uint32) bool {
+	m.rkPendingMu.Lock()
+	defer m.rkPendingMu.Unlock()
+	if _, due := m.keyRequestDue[peerNodeID]; due {
+		delete(m.keyRequestDue, peerNodeID)
+		return true
+	}
+	st, ok := m.pendingRekey[peerNodeID]
+	return ok && st.Attempts >= KeyRequestAfterSends
+}
+
+// KeyRequestsSent returns how many key requests (PILK nudges) this
+// manager has sent.
+func (m *Manager) KeyRequestsSent() uint64 { return m.keyRequestsSent.Load() }

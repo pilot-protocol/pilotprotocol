@@ -650,6 +650,16 @@ func resolveHostnameToAddr(d *driver.Driver, hostname string) (protocol.Addr, ui
 //
 // Skip with --no-auto-handshake. Pre-#99 daemons don't have SubHandshakeWait;
 // we treat the IPC error as "wait unsupported" and proceed best-effort.
+//
+// With a daemon that has the reply window (feature "reply_window"), trust
+// is no longer a precondition for a reply: the daemon admits the dial-back
+// reply from a peer it just contacted. Branches 2 and 3 then no longer
+// block. Measured on clean runners, that block cost ~17-22 s of every
+// first query to list-agents (a direct handshake dial that times out, a
+// registry-relayed fallback, then the 5 s wait) before the data dial even
+// started. For a trusted agent the daemon still fires the handshake itself,
+// in parallel with the dial (DialConnection's inline auto-handshake). A
+// private peer we don't trust is still refused up front.
 func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 	if skip {
 		return
@@ -661,6 +671,7 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 			return
 		}
 	}
+	replyWindow := daemonHasFeature(d, "reply_window")
 
 	// Branch 2 — peer is in the embedded trusted-agents allowlist.
 	//
@@ -672,6 +683,9 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 	// at the inbound auto-accept path inside its NewService(), where the
 	// presented key IS available. See that repo, not this call site.
 	if name, ok := trustedagents.IsTrusted(addr.Node); ok {
+		if replyWindow {
+			return
+		}
 		if !jsonOutput {
 			fmt.Fprintf(os.Stderr, "establishing handshake with Trusted Agent %s (%s)...\n", name, addr)
 		}
@@ -728,6 +742,10 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 		fatalHint("trust_required",
 			fmt.Sprintf("run: pilotctl handshake %s", addr),
 			"refusing tunnel to private node %s without trust", addr)
+	}
+	if replyWindow {
+		// Public peer: it accepts our SYN, and our daemon admits its reply.
+		return
 	}
 	// Public peer — best-effort handshake so replies survive our local
 	// trust gate. Without this, a request/reply pattern (e.g. send-message
@@ -884,7 +902,11 @@ Flags:
   --type text|json|binary  payload encoding (default: text)
   --count <n>           send N times (default: 1)
   --reuse-conn          reuse the connection across --count sends (saves ~1 RTT)
-  --wait [<dur>]        reply wait only, after sending (default: 30s)
+  --wait [<dur>]        wait for a reply in the inbox (default timeout: 30s,
+                        counted from the receiver's acknowledgement)
+  --no-resend           on first contact, never send the request a second
+                        time (by default a request with no reply by mid-wait
+                        is re-sent once on a new stream)
   --timeout <dur>       total wall time, including connect, handshake and reply
   --trace               print per-step timing breakdown to stderr
   --no-auto-handshake   skip automatic trust handshake with known agents
@@ -4822,7 +4844,7 @@ func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
 	for name := range flags {
 		switch name {
-		case "data", "type", "count", "reuse-conn", "wait", "timeout", "trace", "no-auto-handshake", "enterprise-control", "governed-resource":
+		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake", "enterprise-control", "governed-resource":
 		default:
 			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
 		}
@@ -4842,7 +4864,7 @@ func cmdSendMessage(args []string) {
 		defer timer.Stop()
 	}
 	if len(pos) != 1 {
-		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--enterprise-control <path> --governed-resource <receiver-resource>]")
+		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend] [--enterprise-control <path> --governed-resource <receiver-resource>]")
 	}
 
 	sendCount := flagInt(flags, "count", 1)
@@ -4888,7 +4910,8 @@ func cmdSendMessage(args []string) {
 
 	d := connectDriver()
 	tracef("connectDriver")
-	defer d.Close()
+	// d may be replaced by a fresh connection when a dial is retried.
+	defer func() { d.Close() }()
 
 	target, err := parseAddrOrHostname(d, pos[0])
 	tracef("parseAddrOrHostname")
@@ -4901,6 +4924,14 @@ func cmdSendMessage(args []string) {
 		fatalCode("invalid_argument", "--data is required")
 	}
 	msgType := flagString(flags, "type", "text")
+
+	// First contact: the daemon holds no session with the peer yet, so this
+	// command builds the whole path (see firstcontact.go). Checked before
+	// anything is sent.
+	firstContact := false
+	if info, err := d.Info(); err == nil {
+		firstContact = !peerSessionUp(info, target.Node)
+	}
 
 	// Auto-handshake to peers in the embedded trusted-agents list.
 	// Best-effort: warns on stderr and continues if handshake fails.
@@ -5030,18 +5061,50 @@ func cmdSendMessage(args []string) {
 	}
 	tracef("dial+send")
 
-	// Snapshot time before the send so --wait can find replies that arrive
-	// after this point even if the filesystem has 1-second mtime granularity.
-	inboxCutoff := time.Now().Add(-time.Second)
 	// agentHint is the resolved pilot address used to filter inbox replies
 	// against the "from" field written by the daemon when it saves the message.
 	agentHint := target.String()
+	// Snapshot the inbox before the send so --wait only takes a reply that
+	// arrives after it (never one already sitting there).
+	var watch *inboxWatch
+	if waitDur > 0 {
+		watch = newInboxWatch(agentHint)
+	}
 
 	if sendCount == 1 {
-		cl := dialOnce()
+		// On first contact a dial can fail while the path is still
+		// converging (a busy peer finishing the key exchange); dial once
+		// more before giving up, and say which step failed if it does.
+		dialStart := time.Now()
+		dialAttempts := 0
+		var cl *dataexchange.Client
+		for cl == nil {
+			dialAttempts++
+			c, err := dataexchange.Dial(d, target)
+			if err == nil {
+				cl = c
+				break
+			}
+			if firstContact && dialAttempts < 2 && isConvergingDialError(err) {
+				if isDriverSideTimeout(err) {
+					// The SDK gave up waiting, the daemon may still be
+					// dialing: use a fresh connection so a late reply to
+					// the first dial cannot be taken for the second.
+					d.Close()
+					d = connectDriver()
+				}
+				if !jsonOutput {
+					fmt.Fprintf(os.Stderr, "path to %s still converging (%v); dialing again...\n", pos[0], err)
+				}
+				continue
+			}
+			fatalHint("connection_failed", dialFailureHint(pos[0], err, dialAttempts, time.Since(dialStart)),
+				"cannot connect to %s (data exchange port %d)", target, protocol.PortDataExchange)
+		}
 		tracef("dataexchange.Dial")
 		defer cl.Close()
 		r := sendOne(cl, 0, false)
+		ackAt := time.Now()
 		if governedOutbound != nil {
 			if message, failed := r["error"].(string); failed {
 				fatalCode("permission_denied", "governed send-message: %s", message)
@@ -5058,31 +5121,82 @@ func cmdSendMessage(args []string) {
 		if len(traceEvents) > 0 {
 			result["trace"] = traceEvents
 		}
+		if firstContact {
+			result["first_contact"] = true
+		}
+		if dialAttempts > 1 {
+			result["dial_attempts"] = dialAttempts
+		}
 		if waitDur > 0 {
+			cfg := replyWait{wait: waitDur}
+			cfg.observe = func() int {
+				if info, err := d.Info(); err == nil {
+					return replyConnsFrom(info, agentHint)
+				}
+				return 0
+			}
+			// First contact: the service answers once, on a new connection
+			// it dials back, and that one reply is easily lost while its
+			// side of the new path is still settling (measured: the query
+			// then succeeded on the next attempt). Send the request once
+			// more on a new stream if nothing arrived by mid-window.
+			// Governed sends are never repeated (each needs its own
+			// authorization); --no-resend opts out for requests that are
+			// not safe to repeat.
+			_, sendFailed := r["error"]
+			if firstContact && !sendFailed && governedOutbound == nil && !flagBool(flags, "no-resend") {
+				if after := resendDelay(waitDur); after > 0 {
+					cfg.resendAfter = after
+					cfg.resend = func() (time.Time, error) {
+						rd, err := driver.Connect(getSocket())
+						if err != nil {
+							return time.Time{}, err
+						}
+						defer rd.Close()
+						c, err := dataexchange.Dial(rd, target)
+						if err != nil {
+							return time.Time{}, err
+						}
+						defer c.Close()
+						rr := sendOne(c, 1, false)
+						if e, failed := rr["error"].(string); failed {
+							return time.Time{}, errors.New(e)
+						}
+						if !jsonOutput {
+							fmt.Fprintf(os.Stderr, "no reply yet from %s; request sent again on a new stream\n", pos[0])
+						}
+						return time.Now(), nil
+					}
+				}
+			}
+			waitReply := func() map[string]interface{} {
+				stop := startWaitProgress("waiting for reply")
+				out, err := awaitReply(watch, ackAt, cfg)
+				stop()
+				if err != nil {
+					fatalCode("internal", "%v", err)
+				}
+				if out.resent {
+					result["resent"] = true
+				}
+				if out.reply == nil {
+					fatalHint("timeout", replyTimeoutHint(pos[0], out, firstContact), "%v", errNoReply(agentHint, waitDur))
+				}
+				result["reply_after_ms"] = out.waited.Milliseconds()
+				return out.reply
+			}
 			// Defer all output until the reply is in (or times out) so that
 			// --json emits a SINGLE document: a machine parser reading stdout
 			// must not see the send-result object followed by a second reply
 			// object. In JSON mode we fold the reply into one envelope; in
 			// human mode we still print the send result first, then the reply.
 			if jsonOutput {
-				stop := startWaitProgress("waiting for reply")
-				reply, err := waitForInboxReply(agentHint, inboxCutoff, waitDur)
-				stop()
-				if err != nil {
-					fatalCode("timeout", "%v", err)
-				}
-				result["reply"] = reply
+				result["reply"] = waitReply()
 				outputOK(result)
 			} else {
 				outputOK(result)
 				fmt.Fprintf(os.Stderr, "waiting for reply from %s (up to %s)...\n", pos[0], waitDur)
-				stop := startWaitProgress("waiting for reply")
-				reply, err := waitForInboxReply(agentHint, inboxCutoff, waitDur)
-				stop()
-				if err != nil {
-					fatalCode("timeout", "%v", err)
-				}
-				output(reply)
+				output(waitReply())
 			}
 		} else {
 			outputOK(result)
@@ -6919,52 +7033,25 @@ func cmdReceived(args []string) {
 	fmt.Println(sDim("filters: --since <dur> --limit <n> (0 = all) · clear: --clear [--before 24h] · json: --json"))
 }
 
-// cmdInbox lists or clears messages received via data exchange (port 1001).
 // waitForInboxReply polls ~/.pilot/inbox/ until a JSON file arrives that is
-// newer than cutoff and (if agentHint is non-empty) has a matching "agent"
-// field. Returns the parsed message or an error on timeout.
+// newer than cutoff and (if agentHint is non-empty) has a matching "from"
+// field, taking the oldest such file. Returns the parsed message or an
+// error on timeout. send-message --wait uses inboxWatch directly, which
+// also ignores files that were already in the inbox before the send.
 func waitForInboxReply(agentHint string, cutoff time.Time, timeout time.Duration) (map[string]interface{}, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Join(home, ".pilot", "inbox")
+	w := &inboxWatch{from: agentHint, cutoff: cutoff, seen: map[string]bool{}}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		entries, err := os.ReadDir(dir)
-		if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("read inbox: %w", err)
+		msg, err := w.poll()
+		if err != nil {
+			return nil, err
 		}
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			info, err := e.Info()
-			if err != nil {
-				continue
-			}
-			if !info.ModTime().After(cutoff) {
-				continue
-			}
-			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
-			if err != nil {
-				continue
-			}
-			var msg map[string]interface{}
-			if json.Unmarshal(data, &msg) != nil {
-				continue
-			}
-			if agentHint != "" {
-				from, _ := msg["from"].(string)
-				if from != agentHint {
-					continue
-				}
-			}
+		if msg != nil {
 			return msg, nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("no reply from %q within %s", agentHint, timeout)
+	return nil, errNoReply(agentHint, timeout)
 }
 
 // inboxMessage is one parsed inbox entry plus its stable ID — the filename
