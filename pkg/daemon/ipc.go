@@ -1201,6 +1201,7 @@ func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 		"beacon_addr":               info.BeaconAddr,
 		"motd":                      info.MOTD,
 		"features":                  daemonFeatures,
+		"transport":                 info.Transport,
 	})
 	if err != nil {
 		s.sendError(conn, reqID, fmt.Sprintf("info marshal: %v", err))

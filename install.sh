@@ -9,6 +9,15 @@ set -e
 #   Install:        curl -fsSL https://pilotprotocol.network/install.sh | sh
 #   Pin a version:  curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --version v1.13.6
 #   Beta channel:   curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --channel beta
+#   UDP blocked /   curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --transport compat
+#   HTTPS proxy:    (with a release that has transport "auto" nothing extra is
+#                   needed: auto picks TLS/WSS over TCP 443, through
+#                   $HTTPS_PROXY when set, where UDP does not work. Releases
+#                   before auto stay on UDP unless given --transport compat, and
+#                   use no proxy: the installer prints what to do instead.
+#                   Proxy credentials that rotate: see PILOT_PROXY_CMD below)
+#   Managed node:   export PILOT_ENROLLMENT_TOKEN   # enter it without putting it in shell history
+#                   sh install.sh --managed-url https://management.pilotprotocol.network
 #   Uninstall:      curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall
 #
 # Flags:
@@ -19,6 +28,22 @@ set -e
 #                      never silently falls back to an unverified source build.
 #   --yes / -y         Skip the older-version confirmation prompt.
 #   --no-warn          Suppress the older-version warning entirely.
+#   --transport <mode> auto (the default), udp or compat. udp and compat are
+#                      saved as "transport" in ~/.pilot/config.json; auto is
+#                      never saved (it is what `pilotctl daemon start` and the
+#                      service units use when nothing is saved, and a daemon
+#                      that predates auto would refuse it after a downgrade).
+#                      auto: UDP when the beacon answers over UDP, else compat.
+#                      compat: TLS/WSS over TCP 443 only, through
+#                      $HTTPS_PROXY/$ALL_PROXY when set (CONNECT by hostname) —
+#                      for UDP-blocked hosts and agent sandboxes whose only way
+#                      out is an HTTPS proxy.
+#   --managed-url <origin>
+#                       Install the checksum-pinned core managed runtime, claim
+#                       a one-time hosted identity, and start signed reporting.
+#                       This does not install pilot-mcp or a harness adapter.
+#   --no-start          With --managed-url, install and adopt without starting
+#                       the daemon. The hosted onboarding flow omits this flag.
 #
 # Legacy env vars (still honored, lower precedence than flags):
 #   PILOT_RELEASE_TAG=vX.Y.Z   Same as --version.
@@ -27,6 +52,29 @@ set -e
 #                              non-interactive/headless installs (no TTY prompt).
 #                              If omitted headless, the daemon auto-synthesizes a
 #                              <fingerprint>@nodes.pilotprotocol.network identity.
+#   PILOT_TRANSPORT=compat     Same as --transport compat.
+#   PILOT_PROXY_CMD=<command>  Saved as "proxy_cmd": a command printing the
+#                              current proxy URL, for proxies that rotate their
+#                              credentials. In a Linux container/VM without
+#                              systemd whose HTTPS_PROXY carries credentials
+#                              (hosted agent sandboxes such as Meta Muse), the
+#                              installer saves one that reads a fresh shell's
+#                              $https_proxy when none is set. The installer
+#                              also uses it to retry a failed download.
+#   PILOT_ALLOW_ROOT=1         Install as root on a host with systemd/launchd,
+#                              or under sudo/doas (not needed where the agent
+#                              itself is root in a container/VM without systemd).
+#   PILOT_MANAGEMENT_URL=https://management.example
+#                              Same as --managed-url. Requires the one-time
+#                              PILOT_ENROLLMENT_TOKEN on first adoption.
+#
+# Proxies: every download is a curl HTTPS request, so HTTPS_PROXY / https_proxy /
+# ALL_PROXY / NO_PROXY are honored (curl asks the proxy to CONNECT by hostname —
+# no local DNS lookup of the target); a PILOT_PROXY http(s):// URL is used when
+# none of those is set. Nothing here needs UDP, a non-443 port, or a direct
+# connection to the registry/beacon. Proxy credentials are never printed or
+# written to disk. Steps that need root, sudo, systemd or launchd are skipped
+# with a message, never fatal.
 #
 # WHAT THIS SCRIPT DOES (read before piping to sh):
 #   1. Detects OS/arch (Linux/Darwin × amd64/arm64)
@@ -34,7 +82,8 @@ set -e
 #   3. Downloads the release tarball + checksums.txt from that release
 #   4. *** Verifies SHA-256 of the tarball against checksums.txt AND the signed
 #         manifest (aborts on mismatch OR if it cannot verify — never extracts
-#         an unverified archive) ***
+#         an unverified archive; the manifest hashes the release it describes,
+#         so a --version pin or beta tag is checked against checksums.txt) ***
 #   5. Extracts binaries to ~/.pilot/bin (per-user, NOT system-wide)
 #   6. Adds ~/.pilot/bin to PATH in your shell profiles (~/.profile, ~/.bashrc,
 #      ~/.zshenv, ~/.zshrc, ~/.bash_profile when it already exists)
@@ -62,7 +111,9 @@ set -e
 #     Network 9 directory and for receiving identifier-based deliveries.
 #
 # WHAT THIS SCRIPT DOES NOT DO:
-#   - Run as root (refuses if invoked as root; see check at line ~25)
+#   - Run as root on a host with systemd or launchd, or under sudo (refuses;
+#     see the root check below). A Linux container/VM without systemd, where
+#     the agent itself is root, installs into root's own $HOME/.pilot.
 #   - Send any personal data anywhere (the install script only fetches the
 #     release tarball from GitHub; the daemon registers its public key + a
 #     synthetic or user-supplied email with the rendezvous server, nothing else)
@@ -85,10 +136,16 @@ set -e
 # error.
 
 REPO="pilot-protocol/pilotprotocol"
-REGISTRY="${PILOT_REGISTRY:-34.71.57.205:9000}"
-BEACON="${PILOT_BEACON:-34.71.57.205:9001}"
+# Production defaults — the same raw-TCP/UDP endpoints compiled into
+# pilot-daemon. Compat mode must not pin them explicitly (see NET_FLAGS).
+DEFAULT_REGISTRY="34.71.57.205:9000"
+DEFAULT_BEACON="34.71.57.205:9001"
+COMPAT_REGISTRY="registry.pilotprotocol.network:443"
+REGISTRY="${PILOT_REGISTRY:-$DEFAULT_REGISTRY}"
+BEACON="${PILOT_BEACON:-$DEFAULT_BEACON}"
 PILOT_DIR="$HOME/.pilot"
 BIN_DIR="$PILOT_DIR/bin"
+MANAGED_CONTROL_PATH="$PILOT_DIR/managed/enterprise-control.json"
 
 # validate_safe LABEL VALUE EXTRA — abort if VALUE contains any character
 # outside [A-Za-z0-9] plus the punctuation in EXTRA. These values are
@@ -131,7 +188,10 @@ PILOT_REQUESTED_VERSION=""
 PILOT_REQUESTED_CHANNEL=""
 PILOT_YES=0
 PILOT_NO_WARN=0
+PILOT_MANAGED_NO_START=0
+PILOT_MANAGEMENT_URL="${PILOT_MANAGEMENT_URL:-}"
 PILOT_POSITIONAL=""
+PILOT_REQUESTED_TRANSPORT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -145,12 +205,26 @@ while [ $# -gt 0 ]; do
             PILOT_REQUESTED_CHANNEL="$2"; shift 2 ;;
         --channel=*)
             PILOT_REQUESTED_CHANNEL="${1#--channel=}"; shift ;;
+        --transport)
+            if [ $# -lt 2 ]; then echo "Error: --transport requires a value" >&2; exit 2; fi
+            PILOT_REQUESTED_TRANSPORT="$2"; shift 2 ;;
+        --transport=*)
+            PILOT_REQUESTED_TRANSPORT="${1#--transport=}"; shift ;;
         --yes|-y)
             PILOT_YES=1; shift ;;
         --no-warn)
             PILOT_NO_WARN=1; shift ;;
+        --managed-url|--management-url)
+            if [ $# -lt 2 ]; then echo "Error: $1 requires an HTTPS origin" >&2; exit 2; fi
+            PILOT_MANAGEMENT_URL="$2"; shift 2 ;;
+        --managed-url=*|--management-url=*)
+            PILOT_MANAGEMENT_URL="${1#*=}"; shift ;;
+        --no-start)
+            PILOT_MANAGED_NO_START=1; shift ;;
         -h|--help)
-            sed -n '4,21p' "$0" 2>/dev/null || echo "See https://pilotprotocol.network/install.sh"
+            # The usage header: from line 4 up to "WHAT THIS SCRIPT DOES".
+            awk 'NR >= 4 { if (/^# WHAT THIS SCRIPT DOES/) exit; print }' "$0" 2>/dev/null \
+                || echo "See https://pilotprotocol.network/install.sh"
             exit 0 ;;
         --)
             shift
@@ -164,6 +238,70 @@ while [ $# -gt 0 ]; do
             PILOT_POSITIONAL="$PILOT_POSITIONAL $1"; shift ;;
     esac
 done
+
+PILOT_MANAGED_MODE=0
+MANAGED_TOKEN=""
+if [ -n "$PILOT_MANAGEMENT_URL" ]; then
+    PILOT_MANAGED_MODE=1
+    # Accept a cosmetic trailing slash, but require an HTTPS origin with no
+    # credentials, path, query, or fragment. The value later becomes both a
+    # manifest URL and the enrollment authority endpoint.
+    PILOT_MANAGEMENT_URL="${PILOT_MANAGEMENT_URL%/}"
+    case "$PILOT_MANAGEMENT_URL" in
+        https://*) ;;
+        *) echo "Error: --managed-url must be an HTTPS origin." >&2; exit 2 ;;
+    esac
+    _managed_host="${PILOT_MANAGEMENT_URL#https://}"
+    case "$_managed_host" in
+        ""|*/*|*@*|*\?*|*\#*)
+            echo "Error: --managed-url must not contain credentials, a path, query, or fragment." >&2
+            exit 2 ;;
+    esac
+    validate_safe "management host" "$_managed_host" ".:-"
+
+    if [ -n "$PILOT_POSITIONAL" ]; then
+        echo "Error: --managed-url cannot be combined with an install/uninstall positional command." >&2
+        exit 2
+    fi
+    if [ -n "$PILOT_REQUESTED_VERSION" ] || [ -n "${PILOT_RELEASE_TAG:-}" ] \
+       || [ -n "$PILOT_REQUESTED_CHANNEL" ] || [ "${PILOT_RC:-}" = "1" ]; then
+        echo "Error: managed adoption uses the runtime pinned by the management authority; do not combine it with --version or --channel." >&2
+        exit 2
+    fi
+
+    MANAGED_TOKEN="${PILOT_ENROLLMENT_TOKEN:-}"
+    # Do not let the bearer secret reach curl, tar, service managers, or any
+    # other child. It is exported only to the single pilotctl claim process.
+    unset PILOT_ENROLLMENT_TOKEN
+    if [ -e "$MANAGED_CONTROL_PATH" ]; then
+        if [ -L "$MANAGED_CONTROL_PATH" ] || [ ! -f "$MANAGED_CONTROL_PATH" ]; then
+            echo "Error: the existing managed control attachment is not a regular file." >&2
+            exit 1
+        fi
+        if [ -n "$MANAGED_TOKEN" ]; then
+            echo "Error: this node is already managed; refusing to consume a new enrollment token." >&2
+            echo "       Re-run without PILOT_ENROLLMENT_TOKEN to repair or update the managed runtime." >&2
+            exit 1
+        fi
+    else
+        if [ -z "$MANAGED_TOKEN" ]; then
+            echo "Error: PILOT_ENROLLMENT_TOKEN is required for first managed adoption." >&2
+            exit 1
+        fi
+        _managed_token_bytes=$(printf '%s' "$MANAGED_TOKEN" | wc -c | tr -d ' ')
+        if [ "$_managed_token_bytes" -gt 4096 ] \
+           || LC_ALL=C printf '%s' "$MANAGED_TOKEN" | grep -q '[[:cntrl:]]'; then
+            echo "Error: PILOT_ENROLLMENT_TOKEN is invalid." >&2
+            exit 1
+        fi
+    fi
+    # Managed credentials and state created by this process default owner-only.
+    umask 077
+    MANIFEST_URL="${PILOT_MANAGEMENT_URL}/.well-known/pilot-managed-runtime.json"
+elif [ "$PILOT_MANAGED_NO_START" = "1" ]; then
+    echo "Error: --no-start is only valid with --managed-url." >&2
+    exit 2
+fi
 
 # Validate channel value early so we fail fast. `edge` is a back-compat alias
 # for `beta`: the manifest publishes channels.stable and channels.beta only, so
@@ -179,18 +317,237 @@ if [ -n "$PILOT_REQUESTED_CHANNEL" ] \
     exit 2
 fi
 
+# --transport beats the PILOT_TRANSPORT env var. Empty means "not requested on
+# this run": a re-run keeps whatever transport config.json already has.
+TRANSPORT="$(printf '%s' "${PILOT_REQUESTED_TRANSPORT:-${PILOT_TRANSPORT:-}}" | tr '[:upper:]' '[:lower:]')"
+case "$TRANSPORT" in
+    ""|udp|compat|auto) ;;
+    *)
+        echo "Error: --transport must be 'udp', 'compat' or 'auto' (got: $TRANSPORT)" >&2
+        exit 2 ;;
+esac
+
 # Restore positional args so the existing uninstall handler still uses $1.
 # shellcheck disable=SC2086 # intentional word-split on PILOT_POSITIONAL
 set -- $PILOT_POSITIONAL
 
-# Refuse to run as root — daemon must run as the invoking user so identity.json
-# and received files land under that user's home, not /root.
-if [ "${1:-}" != "uninstall" ] && [ "$(id -u)" = "0" ] && [ -z "${PILOT_ALLOW_ROOT:-}" ]; then
-    echo "Error: refusing to install as root."
-    echo "       Run as a regular user; the installer uses sudo only when needed."
-    echo "       Set PILOT_ALLOW_ROOT=1 to override (not recommended)."
-    exit 1
+# Refuse to run as root on a regular host — the daemon must run as the
+# invoking user so identity.json and received files land under that user's
+# home, not /root. A Linux container or VM without systemd (CI runners,
+# hosted agent sandboxes such as Meta Muse, where the agent IS root) has no
+# other user to install for and no system service to protect, so root is
+# allowed there — but only when root is who runs it. Root reached through
+# sudo/doas/pkexec is a regular user's install (`curl ... | sudo sh` on WSL,
+# OpenRC/runit hosts, dev containers): it would land in /root/.pilot (0700,
+# with the /usr/local/bin links pointing into it) or, with sudo -E, in a
+# root-owned ~/.pilot, and that user could run neither. Refused everywhere.
+SANDBOX_HOST=false
+if [ "$(uname -s)" = "Linux" ] && [ ! -d /run/systemd/system ]; then
+    SANDBOX_HOST=true
 fi
+ELEVATED_FROM=""
+if [ -n "${SUDO_UID:-}" ]; then
+    if [ "$SUDO_UID" != "0" ]; then
+        ELEVATED_FROM="sudo for ${SUDO_USER:-uid $SUDO_UID}"
+    fi
+elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    ELEVATED_FROM="sudo for $SUDO_USER"
+elif [ -n "${DOAS_USER:-}" ] && [ "$DOAS_USER" != "root" ]; then
+    ELEVATED_FROM="doas for $DOAS_USER"
+elif [ -n "${PKEXEC_UID:-}" ] && [ "$PKEXEC_UID" != "0" ]; then
+    ELEVATED_FROM="pkexec for uid $PKEXEC_UID"
+fi
+if [ "${1:-}" != "uninstall" ] && [ "$(id -u)" = "0" ] && [ -z "${PILOT_ALLOW_ROOT:-}" ]; then
+    if [ -n "$ELEVATED_FROM" ]; then
+        echo "Error: refusing to install as root: this runs under ${ELEVATED_FROM}."
+        echo "       The node would be installed for root, into ${HOME}/.pilot, and that"
+        echo "       user could not use it. Run the installer as that user, without sudo or doas:"
+        echo "         curl -fsSL https://pilotprotocol.network/install.sh | sh"
+        echo "       It uses sudo itself only where needed (never with a password prompt)."
+        echo "       Set PILOT_ALLOW_ROOT=1 to install for root anyway (not recommended)."
+        exit 1
+    elif [ "$SANDBOX_HOST" = true ]; then
+        echo "Note: installing as root (no systemd: container/VM sandbox) into ${HOME}/.pilot"
+    else
+        echo "Error: refusing to install as root."
+        echo "       Run as a regular user; the installer uses sudo only when needed."
+        echo "       Set PILOT_ALLOW_ROOT=1 to override (not recommended)."
+        exit 1
+    fi
+fi
+
+# A managed identity is per node, but the CLI links, service label and daemon
+# socket are machine-wide. A different HOME therefore does not make a second
+# installation safe. Refuse before downloading, stopping services, replacing
+# links or consuming the enrollment token. An existing attachment in this
+# same PILOT_DIR remains the ordinary repair/update path handled above.
+if [ "$PILOT_MANAGED_MODE" = "1" ] && [ ! -e "$MANAGED_CONTROL_PATH" ] \
+   && [ "${PILOT_REPLACE_EXISTING_NODE:-}" != "1" ]; then
+    _pilot_collision=""
+    for _pilot_link in /usr/local/bin/pilotctl /usr/local/bin/pilot-daemon; do
+        if [ -L "$_pilot_link" ]; then
+            _pilot_target=$(readlink "$_pilot_link" 2>/dev/null || true)
+            case "$_pilot_target" in
+                "$BIN_DIR"/*) ;;
+                */.pilot/bin/*) _pilot_collision="${_pilot_collision}${_pilot_collision:+, }$_pilot_link -> $_pilot_target" ;;
+            esac
+        fi
+    done
+    _pilot_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    if [ "$_pilot_os" = "darwin" ] && command -v launchctl >/dev/null 2>&1; then
+        _pilot_service=$(launchctl print "gui/$(id -u)/network.pilotprotocol.pilot-daemon" 2>/dev/null || true)
+        if [ -n "$_pilot_service" ] && ! printf '%s\n' "$_pilot_service" | grep -Fq "$BIN_DIR/pilot-daemon"; then
+            _pilot_collision="${_pilot_collision}${_pilot_collision:+, }LaunchAgent network.pilotprotocol.pilot-daemon"
+        fi
+    elif [ "$_pilot_os" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+        _pilot_service=$(systemctl cat pilot-daemon 2>/dev/null || true)
+        if [ -n "$_pilot_service" ] && ! printf '%s\n' "$_pilot_service" | grep -Fq "$BIN_DIR/pilot-daemon"; then
+            _pilot_collision="${_pilot_collision}${_pilot_collision:+, }systemd pilot-daemon"
+        fi
+    fi
+    if [ -n "$_pilot_collision" ]; then
+        MANAGED_TOKEN=""
+        unset MANAGED_TOKEN
+        echo "Error: another Pilot node installation already owns machine-wide resources." >&2
+        echo "       Detected: $_pilot_collision" >&2
+        echo "       This enrollment token was not consumed and nothing was changed." >&2
+        echo "       Manage or remove the existing node first; do not run two node identities under one service label." >&2
+        exit 1
+    fi
+    _pilot_collision=""; _pilot_target=""; _pilot_service=""; _pilot_os=""
+fi
+
+# The transport already saved in config.json, if any ("udp", "compat",
+# "auto"). A re-run without --transport keeps it, so regenerated service
+# units stay consistent with it.
+CONFIG_TRANSPORT=""
+if [ -f "$PILOT_DIR/config.json" ]; then
+    CONFIG_TRANSPORT=$(sed -n 's/.*"transport"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' "$PILOT_DIR/config.json" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')
+fi
+# Without any choice, new installs get auto (settled below, once the
+# installed daemon is known to support it).
+EFFECTIVE_TRANSPORT="${TRANSPORT:-${CONFIG_TRANSPORT:-auto}}"
+
+# --- Egress proxy ---
+#
+# Every download below is a curl HTTPS request, and curl honors HTTPS_PROXY /
+# https_proxy / ALL_PROXY / NO_PROXY on its own, asking the proxy to CONNECT
+# by hostname (no local DNS lookup of the target — which matters where local
+# DNS for pilotprotocol.network is poisoned). PILOT_PROXY_URL is only used in
+# messages, and only ever printed redacted: the userinfo of an
+# authenticating proxy is a credential. Nothing in this script writes a proxy
+# URL to disk.
+#
+# ENV_PROXY_CREDS: the proxy environment itself carries credentials — read
+# before PILOT_PROXY is copied into it below for this run's downloads. Only
+# then can the sandbox proxy command (SANDBOX_PROXY_CMD), which prints what a
+# fresh shell's $https_proxy / $HTTPS_PROXY hold, print them: credentials
+# that arrive in PILOT_PROXY never reach a fresh shell.
+ENV_PROXY_CREDS=false
+case "${https_proxy:-}${HTTPS_PROXY:-}" in
+    *@*) ENV_PROXY_CREDS=true ;;
+esac
+
+# PILOT_PROXY is the daemon's own proxy setting; an http(s):// URL there
+# carries this run's downloads too when the environment names no proxy
+# (exported to this process and its children only).
+if [ -z "${https_proxy:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]; then
+    case "${PILOT_PROXY:-}" in
+        http://*|https://*|HTTP://*|HTTPS://*)
+            https_proxy="$PILOT_PROXY"
+            HTTPS_PROXY="$PILOT_PROXY"
+            export https_proxy HTTPS_PROXY ;;
+    esac
+fi
+# The order curl uses for an https:// URL.
+PILOT_PROXY_URL="${https_proxy:-${HTTPS_PROXY:-${all_proxy:-${ALL_PROXY:-}}}}"
+
+# Rotating proxy credentials. Hosted agent sandboxes (Meta Muse) put the proxy
+# credentials in HTTPS_PROXY and replace them every few minutes; a process
+# keeps the ones it started with, and the proxy answers its next CONNECT with
+# 407. A fresh shell sees the current ones. PROXY_REFRESH_CMD prints the
+# current proxy URL: $PILOT_PROXY_CMD, else — in a Linux container/VM without
+# systemd whose HTTPS_PROXY or https_proxy carries credentials (ENV_PROXY_CREDS)
+# and no explicit PILOT_PROXY is set — what a fresh bash has: whichever of
+# $https_proxy and $HTTPS_PROXY carries credentials ($https_proxy when both do, the variable Meta Muse's guidance reads), else
+# ${HTTPS_PROXY:-$https_proxy}, so a URL with credentials is never traded for
+# one without (pilotctl uses the same command). It is saved as the daemon's
+# proxy_cmd further down, and pcurl uses it here to retry a download once
+# after the credentials rotated mid-install.
+# shellcheck disable=SC2016 # literal: the fresh bash expands it, not this shell
+SANDBOX_PROXY_CMD='bash -c '\''case $https_proxy in *@*) printf %s "$https_proxy";; *) printf %s "${HTTPS_PROXY:-$https_proxy}";; esac'\'''
+# An explicit PILOT_PROXY is left alone, as pilotctl leaves it: pilot-daemon
+# runs a proxy command in place of the URL it would use, so the sandbox
+# command would replace that URL with the environment's proxy.
+PROXY_REFRESH_CMD="${PILOT_PROXY_CMD:-}"
+if [ -z "$PROXY_REFRESH_CMD" ] && [ "$SANDBOX_HOST" = true ] \
+   && [ "$ENV_PROXY_CREDS" = true ] && command -v bash >/dev/null 2>&1; then
+    case "${PILOT_PROXY:-}" in
+        ""|auto|AUTO|Auto) PROXY_REFRESH_CMD="$SANDBOX_PROXY_CMD" ;;
+    esac
+fi
+
+# proxy_refresh — run PROXY_REFRESH_CMD (at most 10s where `timeout` exists)
+# and, when it prints an http(s):// URL different from the current one, use
+# that for the rest of this run. The URL is never printed; only this process's
+# environment changes. Returns 0 when the proxy URL changed.
+proxy_refresh() {
+    [ -n "$PROXY_REFRESH_CMD" ] || return 1
+    if command -v timeout >/dev/null 2>&1; then
+        _pr_url=$(timeout 10 sh -c "$PROXY_REFRESH_CMD" 2>/dev/null </dev/null | head -n 1 | tr -d '[:space:]') || _pr_url=""
+    else
+        _pr_url=$(sh -c "$PROXY_REFRESH_CMD" 2>/dev/null </dev/null | head -n 1 | tr -d '[:space:]') || _pr_url=""
+    fi
+    case "$_pr_url" in
+        http://*|https://*|HTTP://*|HTTPS://*) ;;
+        *) _pr_url=""; return 1 ;;
+    esac
+    if [ "$_pr_url" = "${https_proxy:-${HTTPS_PROXY:-}}" ]; then
+        _pr_url=""
+        return 1
+    fi
+    https_proxy="$_pr_url"
+    HTTPS_PROXY="$_pr_url"
+    export https_proxy HTTPS_PROXY
+    PILOT_PROXY_URL="$_pr_url"
+    _pr_url=""
+    return 0
+}
+
+# pcurl ARGS... — curl, retried once when it failed and proxy_refresh found
+# new proxy credentials (the old ones rotated while this script ran).
+pcurl() {
+    curl "$@" && return 0
+    _pc_rc=$?
+    proxy_refresh || return "$_pc_rc"
+    curl "$@"
+}
+
+# redact_proxy URL — print URL with any "user:pass@" replaced by "***@".
+redact_proxy() {
+    case "$1" in
+        *@*)
+            _rp_scheme=""
+            case "$1" in *://*) _rp_scheme="${1%%://*}://" ;; esac
+            printf '%s***@%s\n' "$_rp_scheme" "${1##*@}" ;;
+        *)
+            printf '%s\n' "$1" ;;
+    esac
+}
+
+# net_hint — after a failed download, say what to check. Behind an egress
+# proxy the usual cause is the proxy refusing the CONNECT (407: bad
+# credentials, 403: host not allowed), not a missing release.
+net_hint() {
+    if [ -n "$PILOT_PROXY_URL" ]; then
+        echo "  Note: downloads go through the proxy $(redact_proxy "$PILOT_PROXY_URL")." >&2
+        echo "        Check that it accepts CONNECT to pilotprotocol.network:443, github.com:443" >&2
+        echo "        and *.githubusercontent.com:443, and that its credentials are right." >&2
+    else
+        echo "  Note: check outbound HTTPS to pilotprotocol.network and github.com. If this host" >&2
+        echo "        can only reach the internet through a proxy, export HTTPS_PROXY and re-run." >&2
+    fi
+}
 
 # --- Manifest + version helpers ---
 
@@ -198,7 +555,7 @@ fi
 # Soft-fails (returns 1) so callers fall back to the GitHub-redirect path
 # when the manifest host is unreachable.
 fetch_manifest() {
-    curl -fsSL --max-time 10 "$MANIFEST_URL" -o "$1" 2>/dev/null
+    pcurl -fsSL --max-time 10 "$MANIFEST_URL" -o "$1" 2>/dev/null
 }
 
 # manifest_field "<path>" "<file>" extracts a string field. Supports nested
@@ -228,10 +585,34 @@ manifest_field() {
 # independent integrity anchor (served from pilotprotocol.network) alongside the
 # release's checksums.txt (served from GitHub).
 manifest_platform_sha256() {
-    _mp_plat="$1"; _mp_file="$2"
-    sed -n "/\"${_mp_plat}\"[[:space:]]*:[[:space:]]*{/,/}/p" "$_mp_file" \
-      | grep '"sha256"' | head -1 \
-      | sed -E 's/.*"sha256"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'
+    manifest_platform_field "$1" sha256 "$2"
+}
+
+# manifest_platform_field "<os>-<arch>" "<field>" "<file>" extracts one string
+# field (sha256, url) of that platform's object; empty when absent.
+manifest_platform_field() {
+    _mp_plat="$1"; _mp_key="$2"; _mp_file="$3"
+    # The authority is free to emit compact JSON. A line-range parser sees all
+    # platform objects on that one line and a greedy replacement can therefore
+    # return the final platform's hash. Collapse whitespace deliberately, then
+    # constrain the match to this platform's first closing brace.
+    tr -d '\r\n' < "$_mp_file" \
+      | sed -n -E "s/.*\"${_mp_plat}\"[[:space:]]*:[[:space:]]*\\{[^}]*\"${_mp_key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\"[^}]*\\}.*/\\1/p" \
+      | head -1
+}
+
+# manifest_describes_tag "<tag>" "<os>-<arch>" "<file>" — whether the
+# manifest's per-platform entry is the archive of <tag>. The manifest carries
+# hashes for one release only: the platform url names it
+# (…/releases/download/<tag>/…), and a manifest without urls (the managed
+# runtime's) describes its latest_stable. Any other tag — a --version pin, the
+# beta channel — has no second anchor, so its hash must not be compared.
+manifest_describes_tag() {
+    [ "$1" = "$(manifest_field "latest_stable" "$3")" ] && return 0
+    case "$(manifest_platform_field "$2" url "$3")" in
+        */download/"$1"/*) return 0 ;;
+    esac
+    return 1
 }
 
 # version_compare a b emits -1 / 0 / 1 for a<b / a==b / a>b.
@@ -386,8 +767,19 @@ echo "  Pilot Protocol"
 echo "  The network stack for AI agents."
 echo ""
 echo "  Platform:   ${OS}/${ARCH}"
-echo "  Registry:   ${REGISTRY}"
-echo "  Beacon:     ${BEACON}"
+# auto is not announced here: whether the release being installed has it is
+# known only after the download (releases before it run udp). The summary at
+# the end states the transport the installed daemon will actually use.
+case "$EFFECTIVE_TRANSPORT" in
+    compat)
+        echo "  Transport:  compat (TLS + WSS over TCP 443 only)" ;;
+    udp)
+        echo "  Registry:   ${REGISTRY}"
+        echo "  Beacon:     ${BEACON}" ;;
+esac
+if [ -n "$PILOT_PROXY_URL" ]; then
+    echo "  Proxy:      $(redact_proxy "$PILOT_PROXY_URL") (from environment)"
+fi
 echo ""
 
 # --- Resolve email ---
@@ -497,6 +889,11 @@ HAVE_MANIFEST=0
 if fetch_manifest "$MANIFEST_FILE"; then
     HAVE_MANIFEST=1
 fi
+if [ "$PILOT_MANAGED_MODE" = "1" ] && [ "$HAVE_MANIFEST" != "1" ]; then
+    echo "Error: the management authority did not publish a managed-runtime manifest." >&2
+    echo "       No binary or enrollment state was changed." >&2
+    exit 1
+fi
 
 if [ -n "$PILOT_REQUESTED_VERSION" ]; then
     TAG="$PILOT_REQUESTED_VERSION"
@@ -525,10 +922,20 @@ elif [ "${PILOT_RC:-}" = "1" ]; then
 elif [ "$HAVE_MANIFEST" = "1" ]; then
     TAG=$(manifest_field "latest_stable" "$MANIFEST_FILE")
 else
-    TAG=$(curl -fsSI "https://github.com/${REPO}/releases/latest/download/${ARCHIVE}" 2>/dev/null \
+    TAG=$(pcurl -fsSI "https://github.com/${REPO}/releases/latest/download/${ARCHIVE}" 2>/dev/null \
         | grep -i '^location:' \
         | sed -n 's|.*/releases/download/\([^/]*\)/.*|\1|p' \
         | tr -d '\r' | head -1)
+fi
+
+if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+    case "$TAG" in
+        managed-runtime-v[0-9]*.[0-9]*.[0-9]*) ;;
+        *)
+            echo "Error: the management authority published an invalid managed-runtime version." >&2
+            exit 1 ;;
+    esac
+    validate_safe "managed runtime version" "$TAG" ".-"
 fi
 
 # Fail loudly if the user explicitly asked for a released version/channel but it
@@ -548,11 +955,13 @@ if [ -z "$TAG" ]; then
     if [ -n "$PILOT_REQUESTED_CHANNEL" ]; then
         echo "Error: channel '$PILOT_REQUESTED_CHANNEL' resolved to no release (manifest reachable: $HAVE_MANIFEST)." >&2
         echo "       Refusing to fall back to an unverified source build for an explicit channel request." >&2
+        [ "$HAVE_MANIFEST" = "1" ] || net_hint
         exit 1
     fi
     if [ "${PILOT_RC:-}" = "1" ]; then
         echo "Error: the beta/prerelease channel resolved to no release." >&2
         echo "       Refusing to fall back to an unverified source build for an explicit channel request." >&2
+        [ "$HAVE_MANIFEST" = "1" ] || net_hint
         exit 1
     fi
 fi
@@ -587,7 +996,7 @@ if [ -n "$TAG" ]; then
     URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}"
     CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${TAG}/checksums.txt"
     echo "Downloading ${TAG}..."
-    if curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE" 2>/dev/null; then
+    if pcurl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE" 2>/dev/null; then
         # --- Verify SHA-256 (fail closed) ---
         # This block NEVER extracts an archive it could not verify. Two
         # independent anchors are used:
@@ -601,11 +1010,14 @@ if [ -n "$TAG" ]; then
         # archive line, or the absence of shasum/sha256sum silently extracted
         # the archive UNVERIFIED.)
         EXPECTED_CKS=""
-        if curl -fsSL "$CHECKSUMS_URL" -o "$TMPDIR/checksums.txt" 2>/dev/null; then
+        if pcurl -fsSL "$CHECKSUMS_URL" -o "$TMPDIR/checksums.txt" 2>/dev/null; then
             EXPECTED_CKS=$(grep " ${ARCHIVE}\$" "$TMPDIR/checksums.txt" | awk '{print $1}')
         fi
+        # The manifest hashes only the release it describes (see
+        # manifest_describes_tag): for any other tag it is no anchor at all.
         EXPECTED_MAN=""
-        if [ "$HAVE_MANIFEST" = "1" ]; then
+        if [ "$HAVE_MANIFEST" = "1" ] \
+           && manifest_describes_tag "$TAG" "${OS}-${ARCH}" "$MANIFEST_FILE"; then
             EXPECTED_MAN=$(manifest_platform_sha256 "${OS}-${ARCH}" "$MANIFEST_FILE")
         fi
 
@@ -659,14 +1071,21 @@ if [ -n "$TAG" ]; then
         fi
         tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" --strip-components=1
     else
+        if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+            echo "Error: managed runtime ${TAG} could not be downloaded." >&2
+            echo "       Refusing to fall back to an unmanaged build." >&2
+            exit 1
+        fi
         # Archive download failed. Only the automatic default path may fall
         # back to a source build; an explicit request already hard-failed
         # above, so reaching here means no version/channel was pinned.
+        echo "  Could not download ${URL}" >&2
         TAG=""
     fi
 fi
 
 if [ -z "$TAG" ]; then
+    net_hint
     echo "No release available. Building from source..."
     if ! command -v go >/dev/null 2>&1; then
         echo "Error: Go is required to build from source."
@@ -723,6 +1142,17 @@ if [ -z "$STAGED_DAEMON" ] || [ -z "$STAGED_CTL" ]; then
     echo "       Nothing was replaced — your existing install is untouched." >&2
     exit 1
 fi
+if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+    _managed_probe=$(PILOT_ENROLLMENT_TOKEN='' "$STAGED_CTL" --json enterprise adopt --endpoint "$PILOT_MANAGEMENT_URL" 2>&1 || true)
+    case "$_managed_probe" in
+        *PILOT_ENROLLMENT_TOKEN*) ;;
+        *)
+            echo "Error: ${TAG} does not contain core managed-adoption support." >&2
+            echo "       Nothing was replaced and the enrollment token was not consumed." >&2
+            exit 1 ;;
+    esac
+    _managed_probe=""
+fi
 # gateway is optional: extracted to a sibling repo, no longer ships in
 # release tarballs (release.yml BINS=daemon/pilotctl/updater) and the
 # source build only runs when ./cmd/gateway is present in the checkout.
@@ -777,7 +1207,10 @@ if [ "$OS" = "linux" ] && [ "$CAN_PRIV" = true ] \
                 fi ;;
         esac
         if [ -n "$_want" ]; then
-            RESTART_SYSTEMD="${RESTART_SYSTEMD}${RESTART_SYSTEMD:+ }${_svc}"
+            if { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$PILOT_MANAGED_NO_START" != "1" ]; } \
+               && { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$_svc" != "pilot-updater" ]; }; then
+                RESTART_SYSTEMD="${RESTART_SYSTEMD}${RESTART_SYSTEMD:+ }${_svc}"
+            fi
             # shellcheck disable=SC2086 # $PILOT_SUDO is "" or "sudo" — intentional split
             $PILOT_SUDO systemctl stop "$_svc" 2>/dev/null || true
             echo "  Stopped ${_svc} (will restart after upgrade)"
@@ -788,7 +1221,10 @@ if [ "$OS" = "darwin" ]; then
     for _label in network.pilotprotocol.pilot-daemon network.pilotprotocol.pilot-updater; do
         _lp="$HOME/Library/LaunchAgents/${_label}.plist"
         if [ -f "$_lp" ] && launchctl list 2>/dev/null | grep -q "$_label"; then
-            RESTART_LAUNCHD="${RESTART_LAUNCHD}${RESTART_LAUNCHD:+ }${_label}"
+            if { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$PILOT_MANAGED_NO_START" != "1" ]; } \
+               && { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$_label" != "network.pilotprotocol.pilot-updater" ]; }; then
+                RESTART_LAUNCHD="${RESTART_LAUNCHD}${RESTART_LAUNCHD:+ }${_label}"
+            fi
             launchctl unload "$_lp" 2>/dev/null || true
             echo "  Unloaded ${_label} (will reload after upgrade)"
         fi
@@ -813,6 +1249,32 @@ install_bin "$STAGED_DAEMON" "$BIN_DIR/pilot-daemon"
 install_bin "$STAGED_CTL" "$BIN_DIR/pilotctl"
 [ -n "$STAGED_GATEWAY" ] && install_bin "$STAGED_GATEWAY" "$BIN_DIR/pilot-gateway"
 [ -n "$STAGED_UPDATER" ] && install_bin "$STAGED_UPDATER" "$BIN_DIR/pilot-updater"
+
+# --- Optional hosted adoption (core Pilot, not MCP) ---
+#
+# The one-time token is exposed only to this process. pilotctl validates the
+# delegated key, root pin, trust bundle, bootstrap policy, authority origins,
+# and owner-only output before atomically installing ~/.pilot/managed.
+MANAGED_ADOPTED=0
+if [ "$PILOT_MANAGED_MODE" = "1" ] && [ ! -e "$MANAGED_CONTROL_PATH" ]; then
+    if ! _managed_result=$(PILOT_ENROLLMENT_TOKEN="$MANAGED_TOKEN" "$BIN_DIR/pilotctl" --json enterprise adopt --endpoint "$PILOT_MANAGEMENT_URL" 2>&1); then
+        MANAGED_TOKEN=""
+        unset MANAGED_TOKEN
+        echo "Error: the hosted authority did not complete managed adoption." >&2
+        printf '%s\n' "$_managed_result" >&2
+        exit 1
+    fi
+    MANAGED_TOKEN=""
+    unset MANAGED_TOKEN
+    _managed_result=""
+    if [ -L "$MANAGED_CONTROL_PATH" ] || [ ! -f "$MANAGED_CONTROL_PATH" ]; then
+        echo "Error: managed adoption returned without installing the verified control attachment." >&2
+        exit 1
+    fi
+    MANAGED_ADOPTED=1
+fi
+MANAGED_TOKEN=""
+unset MANAGED_TOKEN
 
 # --- Symlink into /usr/local/bin so NON-INTERACTIVE shells can find pilotctl ---
 #
@@ -854,7 +1316,7 @@ if [ "$LINK_OK" = true ]; then
         # shellcheck disable=SC2086
         $LINK_SUDO ln -sf "$BIN_DIR/pilot-gateway" "$LINK_DIR/pilot-gateway" 2>/dev/null || true
     fi
-    if [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
         # shellcheck disable=SC2086
         $LINK_SUDO ln -sf "$BIN_DIR/pilot-updater" "$LINK_DIR/pilot-updater" 2>/dev/null || true
     fi
@@ -867,6 +1329,113 @@ if [ "$LINK_OK" = true ]; then
         echo "  Symlinked to ${LINK_DIR}"
     fi
     echo "  pilotctl now resolves in non-interactive shells (bash -c, cron, CI, agents)"
+fi
+
+# --- What the installed binaries support ---
+#
+# pilot_config_set merges one key into config.json through pilotctl (atomic
+# write, 0600, every other key kept) instead of rewriting the file, so a
+# hand-edited config survives a re-run. PILOT_HOME is blanked so the write
+# lands in THIS install's $HOME/.pilot, which is also the file pilot-daemon
+# auto-loads. An empty value removes the key (used only with a pilotctl whose
+# daemon supports transport auto, which clears keys that way).
+pilot_config_set() {
+    PILOT_HOME='' "$BIN_DIR/pilotctl" config --set "$1" >/dev/null 2>&1
+}
+
+# The probes are local (no network).
+DAEMON_HAS_TRANSPORT=false
+DAEMON_HAS_PROXY=false
+DAEMON_HAS_AUTO=false
+_daemon_help=$("$BIN_DIR/pilot-daemon" -help 2>&1 || true)
+if printf '%s\n' "$_daemon_help" | grep -qE '^[[:space:]]+-transport([[:space:]]|$)'; then
+    DAEMON_HAS_TRANSPORT=true
+    # -transport=auto: its usage line names 'auto'.
+    if printf '%s\n' "$_daemon_help" | sed -n '/^[[:space:]]*-transport/,/^[[:space:]]*-[a-z]/p' | grep -q "'auto'"; then
+        DAEMON_HAS_AUTO=true
+    fi
+fi
+if printf '%s\n' "$_daemon_help" | grep -qE '^[[:space:]]+-proxy([[:space:]]|$)'; then
+    DAEMON_HAS_PROXY=true
+fi
+DAEMON_HAS_PROXY_CMD=false
+if printf '%s\n' "$_daemon_help" | grep -qE '^[[:space:]]+-proxy-cmd([[:space:]]|$)'; then
+    DAEMON_HAS_PROXY_CMD=true
+fi
+
+# --- Transport: auto, udp or compat ---
+#
+# auto is never saved in config.json. It is already the default wherever
+# this install starts the daemon — `pilotctl daemon start` asks a daemon
+# that supports it for auto, and the service units below set
+# PILOT_TRANSPORT_DEFAULT=auto — while a pilot-daemon that predates auto
+# (reinstalled with --version, or `pilotctl update --pin`) refuses to start
+# with "transport":"auto" in config.json. udp and compat are saved.
+TRANSPORT_TO_SAVE=""
+TRANSPORT_CLEAR=false
+case "$TRANSPORT" in
+    udp|compat)
+        TRANSPORT_TO_SAVE="$TRANSPORT" ;;
+    auto)
+        if [ "$DAEMON_HAS_AUTO" = true ]; then
+            if [ -n "$CONFIG_TRANSPORT" ]; then TRANSPORT_CLEAR=true; fi
+        else
+            # Nothing is saved or removed: this release has no auto to go
+            # back to, and what it runs is what config.json already says.
+            case "$CONFIG_TRANSPORT" in
+                compat|udp)
+                    echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto; it keeps the"
+                    echo "        transport saved in config.json (${CONFIG_TRANSPORT}). Switch with --transport udp or"
+                    echo "        --transport compat." ;;
+                *)
+                    echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto; it keeps its default (udp)." ;;
+            esac
+        fi ;;
+esac
+if [ "$CONFIG_TRANSPORT" = "auto" ] && [ "$DAEMON_HAS_AUTO" != true ] && [ -z "$TRANSPORT_TO_SAVE" ]; then
+    # Downgrade: this daemon would exit with "invalid -transport auto".
+    TRANSPORT_TO_SAVE="udp"
+    echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto, which config.json"
+    echo "        selects; switching it to udp (the daemon's default) so the daemon still starts."
+fi
+
+# What the daemon will run: the saved transport, else auto where the
+# daemon supports it, else its default (udp).
+if [ -n "$TRANSPORT_TO_SAVE" ]; then
+    EFFECTIVE_TRANSPORT="$TRANSPORT_TO_SAVE"
+elif [ "$TRANSPORT_CLEAR" != true ] && [ -n "$CONFIG_TRANSPORT" ] && [ "$CONFIG_TRANSPORT" != "auto" ]; then
+    EFFECTIVE_TRANSPORT="$CONFIG_TRANSPORT"
+elif [ "$DAEMON_HAS_AUTO" = true ]; then
+    EFFECTIVE_TRANSPORT="auto"
+else
+    EFFECTIVE_TRANSPORT="udp"
+fi
+
+# pilotctl releases before `daemon start --transport` pass config.json's
+# registry (else the raw-TCP default) to the daemon verbatim, and a daemon
+# given the raw-TCP registry explicitly stays on it even in compat mode.
+# Probed only for compat, and only with a daemon that has -transport (v1.11+):
+# every pilotctl since v1.10 prints help for `daemon start --help` instead of
+# starting a daemon.
+PILOTCTL_HAS_TRANSPORT=false
+if [ "$EFFECTIVE_TRANSPORT" = "compat" ] && [ "$DAEMON_HAS_TRANSPORT" = true ] \
+   && "$BIN_DIR/pilotctl" daemon start --help 2>&1 | grep -q -- '--transport'; then
+    PILOTCTL_HAS_TRANSPORT=true
+fi
+
+# The stock raw-TCP registry (34.71.57.205:9000) and UDP beacon are left out
+# of what this installer writes when the node runs compat, or auto behind a
+# proxy: the daemon then applies the endpoints that fit the transport it
+# runs (registry.pilotprotocol.network:443 over TLS in compat mode or through
+# a proxy), and an address that a 443-only network or HTTPS proxy never
+# carries is not pinned anywhere. Custom PILOT_REGISTRY / PILOT_BEACON values
+# are always kept.
+STOCK_ENDPOINTS=true
+if [ "$DAEMON_HAS_TRANSPORT" = true ]; then
+    case "$EFFECTIVE_TRANSPORT" in
+        compat) STOCK_ENDPOINTS=false ;;
+        auto) if [ -n "$PILOT_PROXY_URL" ]; then STOCK_ENDPOINTS=false; fi ;;
+    esac
 fi
 
 # --- Fresh install: write config ---
@@ -886,13 +1455,34 @@ fi
 # erased by this write, and the erase happened before the first skills pass
 # further below. Guarding on the file itself makes the documented opt-outs
 # reachable at install time instead of only after the fact. Defaults are
-# unchanged — a host with no config still gets the standard one.
+# unchanged — a host with no config still gets the standard one (without the
+# stock endpoints in compat mode or behind a proxy, see STOCK_ENDPOINTS).
 if [ "$UPDATING" != true ] && [ ! -f "$PILOT_DIR/config.json" ]; then
+    CONF_REGISTRY="$REGISTRY"
+    CONF_BEACON="$BEACON"
+    if [ "$STOCK_ENDPOINTS" != true ]; then
+        if [ "$REGISTRY" = "$DEFAULT_REGISTRY" ]; then
+            CONF_REGISTRY=""
+            # A pilotctl that predates --transport would pass the raw
+            # default instead: name the compat TLS registry explicitly.
+            if [ "$EFFECTIVE_TRANSPORT" = "compat" ] && [ "$PILOTCTL_HAS_TRANSPORT" != true ]; then
+                CONF_REGISTRY="$COMPAT_REGISTRY"
+            fi
+        fi
+        if [ "$BEACON" = "$DEFAULT_BEACON" ]; then CONF_BEACON=""; fi
+    fi
+    CONF_NET=""
+    if [ -n "$CONF_REGISTRY" ]; then
+        CONF_NET="${CONF_NET}  \"registry\": \"${CONF_REGISTRY}\",
+"
+    fi
+    if [ -n "$CONF_BEACON" ]; then
+        CONF_NET="${CONF_NET}  \"beacon\": \"${CONF_BEACON}\",
+"
+    fi
     cat > "$PILOT_DIR/config.json" <<CONF
 {
-  "registry": "${REGISTRY}",
-  "beacon": "${BEACON}",
-  "socket": "/tmp/pilot.sock",
+${CONF_NET}  "socket": "/tmp/pilot.sock",
   "encrypt": true,
   "identity": "${PILOT_DIR}/identity.json",
   "email": "${EMAIL}"
@@ -901,6 +1491,220 @@ CONF
     echo "Config written to ${PILOT_DIR}/config.json"
 fi
 
+if [ -n "$TRANSPORT_TO_SAVE" ]; then
+    if pilot_config_set "transport=$TRANSPORT_TO_SAVE"; then
+        echo "Transport set to ${TRANSPORT_TO_SAVE} in ${PILOT_DIR}/config.json"
+    else
+        echo "  Note: could not save transport=${TRANSPORT_TO_SAVE} — run: pilotctl config --set transport=${TRANSPORT_TO_SAVE}"
+    fi
+elif [ "$TRANSPORT_CLEAR" = true ]; then
+    if pilot_config_set "transport="; then
+        echo "Transport: auto (the default; removed \"transport\" from ${PILOT_DIR}/config.json)"
+    fi
+fi
+
+# --- Rotating proxy credentials: proxy_cmd ---
+#
+# A long-running daemon keeps its launch-time proxy credentials; where they
+# rotate (Meta Muse: every few minutes) its new connections start failing
+# with 407. proxy_cmd (see PROXY_REFRESH_CMD above) makes the daemon re-read
+# the proxy URL every 60s and on a 407. Only the command is stored — never a
+# proxy URL or its credentials. $PILOT_PROXY_CMD is saved as given; the
+# sandbox default is saved only where none is saved yet. A daemon that
+# predates -proxy-cmd ignores the key until it is upgraded.
+PROXY_CMD_TO_SAVE=""
+if [ -n "${PILOT_PROXY_CMD:-}" ]; then
+    PROXY_CMD_TO_SAVE="$PILOT_PROXY_CMD"
+elif [ "$PROXY_REFRESH_CMD" = "$SANDBOX_PROXY_CMD" ] \
+     && ! grep -q '"proxy_cmd"' "$PILOT_DIR/config.json" 2>/dev/null; then
+    PROXY_CMD_TO_SAVE="$SANDBOX_PROXY_CMD"
+fi
+if [ -n "$PROXY_CMD_TO_SAVE" ]; then
+    if ! pilot_config_set "proxy_cmd=$PROXY_CMD_TO_SAVE"; then
+        echo "  Note: could not save proxy_cmd in ${PILOT_DIR}/config.json"
+    elif [ "$DAEMON_HAS_PROXY_CMD" = true ]; then
+        echo "Proxy credentials: re-read by the daemon via proxy_cmd (${PILOT_DIR}/config.json stores the command, not the credentials)"
+    else
+        echo "Proxy credentials: proxy_cmd saved in ${PILOT_DIR}/config.json (the command, not the credentials)."
+        if [ "$DAEMON_HAS_PROXY" = true ]; then
+            echo "  This pilot-daemon (${TAG:-source}) predates -proxy-cmd and ignores it until upgraded;"
+            echo "  until then, if the proxy rotates its credentials, restart the daemon from a fresh shell."
+        else
+            echo "  This pilot-daemon (${TAG:-source}) predates -proxy-cmd and ignores it until upgraded."
+        fi
+    fi
+fi
+PROXY_CMD_SAVED=false
+if grep -q '"proxy_cmd"' "$PILOT_DIR/config.json" 2>/dev/null; then
+    PROXY_CMD_SAVED=true
+fi
+
+# --- Registry for the transport ---
+#
+# No "proxy" key is written: the daemon's default, auto, already uses
+# $HTTPS_PROXY / $ALL_PROXY where it needs a proxy, and a saved "auto" would
+# only get in the way of a proxy passed later with --proxy or $PILOT_PROXY.
+CONFIG_REGISTRY=$(sed -n 's/.*"registry"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PILOT_DIR/config.json" 2>/dev/null | head -n 1)
+if [ "$EFFECTIVE_TRANSPORT" = "compat" ]; then
+    if [ "$DAEMON_HAS_TRANSPORT" != true ]; then
+        echo ""
+        echo "  WARNING: this pilot-daemon (${TAG:-source}) predates compat mode (-transport)."
+        echo "           It will keep using UDP. Re-run without --version to get the latest release."
+    fi
+
+    # A pilotctl that predates --transport passes config.json's registry,
+    # else the raw-TCP default, to the daemon verbatim: point it at the
+    # compat TLS registry — only when the file holds the stock default or
+    # no registry at all.
+    if [ "$DAEMON_HAS_TRANSPORT" = true ] && [ "$PILOTCTL_HAS_TRANSPORT" != true ] \
+       && { [ "$CONFIG_REGISTRY" = "$DEFAULT_REGISTRY" ] || [ -z "$CONFIG_REGISTRY" ]; }; then
+        if pilot_config_set "registry=${COMPAT_REGISTRY}"; then
+            echo "  Registry set to ${COMPAT_REGISTRY} for compat mode (this pilotctl"
+            echo "  always passes config.json's registry to the daemon). Switching back to"
+            echo "  UDP later: re-run this installer with --transport udp"
+        fi
+    fi
+elif [ "$CONFIG_REGISTRY" = "$COMPAT_REGISTRY" ]; then
+    # Leaving compat after an install that pointed the registry at the
+    # compat TLS host: a udp daemon needs the raw-TCP registry back.
+    if pilot_config_set "registry=${DEFAULT_REGISTRY}"; then
+        echo "  Registry restored to ${DEFAULT_REGISTRY} for transport ${EFFECTIVE_TRANSPORT}"
+    fi
+fi
+
+# A proxy in the environment that this daemon cannot use: say so, and where
+# the proxy is the only way out, point at the recipe that works with it.
+# Such a daemon dials the registry and beacon directly, around the proxy.
+# PROXY_ONLY: the proxy is known to be the way out — $PILOT_PROXY_CMD is set
+# (rotating credentials), or a credential-bearing proxy in a Linux
+# container/VM without systemd (a hosted agent sandbox such as Meta Muse).
+# There every "start the daemon" instruction below is replaced by the
+# recipe; elsewhere it is kept, with the condition spelled out.
+SANDBOX_RECIPE_URL="https://pilotprotocol.network/learn/install-pilot-skills-in-meta-muse"
+# The recipe needs Linux (root and `unshare -m` for its SNI router): on any
+# other OS the way forward is a release whose pilot-daemon has -proxy.
+if [ "$OS" = "linux" ]; then
+    PROXY_REMEDY="the pilot-sandbox recipe (step 3): ${SANDBOX_RECIPE_URL}"
+else
+    PROXY_REMEDY="re-run this installer once a Pilot release whose pilot-daemon -h lists -proxy is out"
+fi
+PROXY_UNSUPPORTED=false
+PROXY_ONLY=false
+if [ -n "$PILOT_PROXY_URL" ] && [ "$DAEMON_HAS_PROXY" != true ]; then
+    PROXY_UNSUPPORTED=true
+    if [ -n "${PILOT_PROXY_CMD:-}" ]; then
+        PROXY_ONLY=true
+    elif [ "$SANDBOX_HOST" = true ]; then
+        case "${https_proxy:-}${HTTPS_PROXY:-}${PILOT_PROXY_URL}" in
+            *@*) PROXY_ONLY=true ;;
+        esac
+    fi
+    echo ""
+    if [ "$PROXY_ONLY" = true ]; then
+        echo "  WARNING: this host goes out through a proxy ($(redact_proxy "$PILOT_PROXY_URL")), and this"
+        echo "           pilot-daemon (${TAG:-source}) cannot use one: \`pilotctl daemon start\` would dial"
+        echo "           the registry directly, around the proxy, and never come online."
+        echo "           Do not start it here. What brings the node online: ${PROXY_REMEDY}"
+    else
+        echo "  WARNING: a proxy is set ($(redact_proxy "$PILOT_PROXY_URL")), but this pilot-daemon"
+        echo "           (${TAG:-source}) cannot use one: it dials the registry directly. If the"
+        echo "           proxy is this host's only way out (UDP blocked, e.g. an agent sandbox),"
+        echo "           the daemon will not come online with this release. What does then:"
+        echo "           ${PROXY_REMEDY}"
+    fi
+fi
+
+# UDP_ONLY_HINT: the daemon runs udp only because this release predates auto
+# (nothing chose udp), so on a UDP-blocked host it will not fall back to TCP
+# 443 by itself. Said in the summary, with the re-run that selects compat
+# (which also points an older pilotctl at the TLS registry). Not where the
+# proxy warning above already applies: compat would not use the proxy either.
+UDP_ONLY_HINT=false
+if [ "$EFFECTIVE_TRANSPORT" = "udp" ] && [ "$DAEMON_HAS_AUTO" != true ] \
+   && [ "$DAEMON_HAS_TRANSPORT" = true ] && [ "$PROXY_UNSUPPORTED" != true ] \
+   && [ "$TRANSPORT" != "udp" ] && [ "$CONFIG_TRANSPORT" != "udp" ]; then
+    UDP_ONLY_HINT=true
+fi
+
+# start_hint PREFIX COMMAND [NAME [STOP]] — print how to start the daemon:
+# COMMAND, except where this daemon cannot use the proxy (the WARNING above).
+# On a proxy-only host (PROXY_ONLY) COMMAND is not printed as something to
+# run: only that NAME (default: COMMAND) must not be run there, and
+# PROXY_REMEDY. STOP (restart hints) is printed first there: the recipe starts
+# a daemon but never stops one, and two daemons must not share an identity.
+start_hint() {
+    if [ "$PROXY_ONLY" = true ]; then
+        echo "${1}Do not run \`${3:-$2}\` on this host (see the WARNING above)."
+        if [ -n "${4:-}" ]; then
+            echo "${1}Stop the running daemon first: ${4}"
+            echo "${1}then bring it back with ${PROXY_REMEDY}"
+        else
+            echo "${1}What brings the node online: ${PROXY_REMEDY}"
+        fi
+    elif [ "$PROXY_UNSUPPORTED" = true ]; then
+        echo "${1}${2}"
+        echo "${1}(if the proxy is this host's only way out, it will not come online with"
+        echo "${1} this release: see the WARNING above)"
+    else
+        echo "${1}${2}"
+    fi
+}
+
+# Network flags for the service units. The transport itself comes from
+# config.json, which the daemon reads, so `pilotctl config --set transport=`
+# applies to the service too. Where the stock endpoints are left out (compat,
+# or auto behind a proxy; see STOCK_ENDPOINTS) the daemon's built-in defaults
+# apply — the same raw-TCP/UDP endpoints for udp, the TLS registry for
+# compat (an older daemon given -registry explicitly stays pinned to a port
+# no 443-only network or HTTPS proxy will carry); a custom PILOT_REGISTRY /
+# PILOT_BEACON is kept.
+if [ "$STOCK_ENDPOINTS" != true ]; then
+    NET_FLAGS=""
+    if [ "$REGISTRY" != "$DEFAULT_REGISTRY" ]; then NET_FLAGS="$NET_FLAGS -registry $REGISTRY"; fi
+    if [ "$BEACON" != "$DEFAULT_BEACON" ]; then NET_FLAGS="$NET_FLAGS -beacon $BEACON"; fi
+    NET_FLAGS="${NET_FLAGS# }"
+else
+    NET_FLAGS="-registry $REGISTRY -beacon $BEACON"
+fi
+
+# The service units ask for transport auto through PILOT_TRANSPORT_DEFAULT:
+# it applies only when neither -transport, $PILOT_TRANSPORT nor config.json
+# chooses, and a daemon that predates auto ignores it (a -transport auto
+# flag would stop it from starting after a downgrade).
+UNIT_ENV=""
+PLIST_ENV=""
+if [ "$DAEMON_HAS_AUTO" = true ]; then
+    UNIT_ENV="
+Environment=PILOT_TRANSPORT_DEFAULT=auto"
+    PLIST_ENV="    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PILOT_TRANSPORT_DEFAULT</key>
+        <string>auto</string>
+    </dict>
+"
+fi
+
+# service_proxy_note UNIT — a service manager starts the daemon with its own
+# environment, not this shell's, so an HTTPS_PROXY exported here never
+# reaches it. config.json (0600, read by the daemon itself) does.
+# This installer never writes the URL itself: with credentials in it, where
+# to store them is the operator's call.
+service_proxy_note() {
+    if [ "$EFFECTIVE_TRANSPORT" != "udp" ] && [ -n "$PILOT_PROXY_URL" ] \
+       && ! grep -q '"proxy"[[:space:]]*:[[:space:]]*"http' "$PILOT_DIR/config.json" 2>/dev/null; then
+        echo "  Note: $1 does not inherit this shell's HTTPS_PROXY. For the service to use"
+        case "$PILOT_PROXY_URL" in
+            *@*)
+                echo "        the proxy, save it in config.json (0600; this stores its credentials):"
+                echo "          pilotctl config --set proxy='<your HTTPS_PROXY URL>'"
+                echo "        or save a command that prints it: pilotctl config --set proxy_cmd='<command>'" ;;
+            *)
+                echo "        the proxy, save it in config.json:"
+                echo "          pilotctl config --set proxy='${PILOT_PROXY_URL}'" ;;
+        esac
+    fi
+}
+
 # Enable background auto-updates by default (opt-out). The install output and
 # the systemd/launchd units below promise the updater keeps binaries current;
 # the pilot-updater treats a MISSING control file as "disabled", so without
@@ -908,7 +1712,13 @@ fi
 # only when the file is absent so an operator who later runs `pilotctl update
 # disable` is never silently re-enabled. Turn off any time with
 # `pilotctl update disable`.
-if [ "$UPDATING" != true ] && [ ! -f "$PILOT_DIR/auto-update.json" ]; then
+if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+    # Stable-channel updater builds do not yet carry the managed control
+    # client. Pin this authority-selected runtime instead of allowing
+    # a background downgrade to silently remove enforcement.
+    printf '{\n  "enabled": false,\n  "reason": "managed-runtime-pinned-by-authority"\n}\n' > "$PILOT_DIR/auto-update.json"
+    echo "Auto-updates pinned to the management authority runtime channel"
+elif [ "$UPDATING" != true ] && [ ! -f "$PILOT_DIR/auto-update.json" ]; then
     printf '{\n  "enabled": true\n}\n' > "$PILOT_DIR/auto-update.json"
     echo "Auto-updates ENABLED (opt-out) — disable with: pilotctl update disable"
 fi
@@ -918,6 +1728,8 @@ fi
 # The units are (re)generated on EVERY run, fresh install or upgrade. That is
 # what makes re-running the installer a real repair path: a host whose unit was
 # written by an older, buggy installer gets a correct one without uninstalling.
+
+MANAGED_START_STYLE=""
 
 if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     if [ "$CAN_PRIV" = true ]; then
@@ -967,10 +1779,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$(whoami)
+User=$(whoami)${UNIT_ENV}
 ExecStart=${BIN_DIR}/pilot-daemon \\
-  -registry ${REGISTRY} \\
-  -beacon ${BEACON} \\
+  ${NET_FLAGS} \\
   -listen :4000 \\
   -socket /tmp/pilot.sock \\
   -identity ${PILOT_DIR}/identity.json \\
@@ -982,7 +1793,7 @@ RestartSec=5
 WantedBy=multi-user.target
 SVC
     # Auto-updater service
-    if [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
     # shellcheck disable=SC2086
     $PILOT_SUDO tee /etc/systemd/system/pilot-updater.service >/dev/null <<USVC
 [Unit]
@@ -1008,8 +1819,17 @@ USVC
     # under `set -e` — the binaries and skill injection still matter.
     # shellcheck disable=SC2086
     $PILOT_SUDO systemctl daemon-reload || true
+    if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+        # A stale stable-channel updater could replace the authority-pinned
+        # managed runtime with a build that lacks hosted control support.
+        # shellcheck disable=SC2086
+        $PILOT_SUDO systemctl disable --now pilot-updater 2>/dev/null || true
+    fi
     echo "  Service: pilot-daemon.service"
-    echo "  Service: pilot-updater.service (auto-updates)"
+    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+        echo "  Service: pilot-updater.service (auto-updates)"
+    fi
+    service_proxy_note "pilot-daemon.service"
 
     # Auto-enable + start the updater so future releases land without
     # operator action. The unit file alone is not enough — without this,
@@ -1022,7 +1842,7 @@ USVC
     # operator-tunable flags (-public, -hostname, registry overrides) that the
     # operator may want to set before first start; on a re-run anything that
     # was already running is restored below.
-    if [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
         # shellcheck disable=SC2086
         if $PILOT_SUDO systemctl enable --now pilot-updater; then
             echo "  Started: pilot-updater (auto-updates enabled)"
@@ -1043,19 +1863,52 @@ USVC
         fi
     done
 
-    case " $RESTART_SYSTEMD " in
-        *" pilot-daemon "*) ;;
-        *) echo "  Start daemon: sudo systemctl enable --now pilot-daemon" ;;
-    esac
+    if [ "$PILOT_MANAGED_MODE" = "1" ] && [ "$PILOT_MANAGED_NO_START" != "1" ]; then
+        # Managed onboarding promises a live signed check-in, so unlike an
+        # ordinary local install it explicitly enables the daemon now.
+        # shellcheck disable=SC2086
+        $PILOT_SUDO systemctl enable --now pilot-daemon
+        MANAGED_START_STYLE="systemd"
+        echo "  Started: pilot-daemon (managed reporting enabled)"
+    elif [ "$PILOT_MANAGED_MODE" != "1" ]; then
+        case " $RESTART_SYSTEMD " in
+            *" pilot-daemon "*) ;;
+            *)
+                if [ "$PROXY_UNSUPPORTED" = true ]; then
+                    echo "  Start daemon:"
+                    start_hint "    " "sudo systemctl enable --now pilot-daemon"
+                else
+                    echo "  Start daemon: sudo systemctl enable --now pilot-daemon"
+                fi ;;
+        esac
+    fi
     else
     echo "  Skipped systemd setup (run as root or with passwordless sudo to enable)"
+    if [ "$PILOT_MANAGED_MODE" != "1" ]; then
+        if [ "$PROXY_UNSUPPORTED" = true ]; then
+            echo "  Start the daemon without a service manager:"
+            start_hint "    " "pilotctl daemon start"
+        else
+            echo "  Start the daemon without a service manager: pilotctl daemon start"
+        fi
+    fi
     fi
 elif [ "$OS" = "linux" ]; then
-    # systemd is not the init system here (container / WSL / CI runner).
-    # There is no service to install — tell the agent the portable start path
-    # instead of silently leaving it with no daemon.
-    echo "No systemd detected (container / WSL / CI) — start the daemon manually:"
-    echo "  pilotctl daemon start"
+    # systemd is not the init system here (container / WSL / CI runner /
+    # hosted agent sandbox). There is no service to install — tell the agent
+    # the portable start path instead of silently leaving it with no daemon.
+    if [ "$PILOT_MANAGED_MODE" != "1" ]; then
+        if [ "$PROXY_ONLY" = true ]; then
+            echo "No systemd detected (container / WSL / CI / sandbox):"
+        else
+            echo "No systemd detected (container / WSL / CI / sandbox) — start the daemon manually:"
+        fi
+        start_hint "  " "pilotctl daemon start"
+        if [ "$PROXY_UNSUPPORTED" != true ] && [ "$EFFECTIVE_TRANSPORT" != "udp" ]; then
+            echo "  (transport=${EFFECTIVE_TRANSPORT}; start it from a shell that has HTTPS_PROXY"
+            echo "   set if this host reaches the internet only through a proxy)"
+        fi
+    fi
 fi
 
 if [ "$OS" = "darwin" ]; then
@@ -1086,6 +1939,13 @@ if [ "$OS" = "darwin" ]; then
     # empty <string> value passes a blank argv element to the daemon; omitting
     # it lets the daemon do the documented thing instead — fall back to
     # ~/.pilot/account.json, then synthesise a fingerprint identity.
+    # One <string> per word of NET_FLAGS (host:port / flag names only —
+    # validate_safe already rejected anything with spaces or markup).
+    PLIST_NET_ARGS=""
+    for _a in $NET_FLAGS; do
+        PLIST_NET_ARGS="${PLIST_NET_ARGS}        <string>${_a}</string>
+"
+    done
     EXTRA_ARGS=""
     if [ -n "$EMAIL" ]; then
         EXTRA_ARGS="${EXTRA_ARGS}        <string>-email</string>
@@ -1111,11 +1971,7 @@ if [ "$OS" = "darwin" ]; then
     <key>ProgramArguments</key>
     <array>
         <string>${BIN_DIR}/pilot-daemon</string>
-        <string>-registry</string>
-        <string>${REGISTRY}</string>
-        <string>-beacon</string>
-        <string>${BEACON}</string>
-        <string>-listen</string>
+${PLIST_NET_ARGS}        <string>-listen</string>
         <string>:4000</string>
         <string>-socket</string>
         <string>/tmp/pilot.sock</string>
@@ -1123,7 +1979,7 @@ if [ "$OS" = "darwin" ]; then
         <string>${PILOT_DIR}/identity.json</string>
         <string>-encrypt</string>
 ${EXTRA_ARGS}    </array>
-    <key>RunAtLoad</key>
+${PLIST_ENV}    <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <dict>
@@ -1138,7 +1994,7 @@ ${EXTRA_ARGS}    </array>
 </plist>
 PLIST
     # Auto-updater LaunchAgent
-    if [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
         UPLIST="$PLIST_DIR/network.pilotprotocol.pilot-updater.plist"
         cat > "$UPLIST" <<UPLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1167,7 +2023,16 @@ UPLIST
     fi
 
     echo "  Service: network.pilotprotocol.pilot-daemon"
-    echo "  Service: network.pilotprotocol.pilot-updater (auto-updates)"
+    if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+        _managed_updater_plist="$PLIST_DIR/network.pilotprotocol.pilot-updater.plist"
+        if [ -f "$_managed_updater_plist" ]; then
+            launchctl unload -w "$_managed_updater_plist" 2>/dev/null || true
+        fi
+    fi
+    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+        echo "  Service: network.pilotprotocol.pilot-updater (auto-updates)"
+    fi
+    service_proxy_note "the launchd agent"
 
     # Auto-load the updater LaunchAgent so future releases land without
     # operator action. Without this, install.sh writes the plist but leaves
@@ -1179,7 +2044,7 @@ UPLIST
     # idempotent: any stale running agent is replaced cleanly. -w persists
     # the load across reboots. The daemon is left as opt-in for the same
     # reason as the Linux branch.
-    if [ -f "$BIN_DIR/pilot-updater" ] && [ -f "$UPLIST" ]; then
+    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ] && [ -f "$UPLIST" ]; then
         launchctl unload "$UPLIST" 2>/dev/null || true
         launchctl load -w "$UPLIST"
         echo "  Started: pilot-updater (auto-updates enabled)"
@@ -1201,13 +2066,47 @@ UPLIST
         fi
     done
 
-    case " $RESTART_LAUNCHD " in
-        *" network.pilotprotocol.pilot-daemon "*) ;;
-        *)
-            echo "  Start daemon: launchctl load -w $PLIST"
-            echo "  Stop daemon:  launchctl unload $PLIST"
-            ;;
-    esac
+    if [ "$PILOT_MANAGED_MODE" != "1" ]; then
+        case " $RESTART_LAUNCHD " in
+            *" network.pilotprotocol.pilot-daemon "*) ;;
+            *)
+                if [ "$PROXY_UNSUPPORTED" = true ]; then
+                    echo "  Start daemon:"
+                    start_hint "    " "launchctl load -w $PLIST" "launchctl load -w $PLIST"
+                else
+                    echo "  Start daemon: launchctl load -w $PLIST"
+                fi
+                echo "  Stop daemon:  launchctl unload $PLIST"
+                ;;
+        esac
+    fi
+fi
+
+# A managed Connect Agent run is complete only when the newly adopted core
+# daemon is locally responsive. The management console independently waits for
+# the signed remote report, so this check cannot forge onboarding success.
+if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+    if [ "$PILOT_MANAGED_NO_START" = "1" ]; then
+        echo "Managed runtime adopted but not started (--no-start)."
+    elif [ "$MANAGED_START_STYLE" = "systemd" ]; then
+        _managed_wait=0
+        until "$BIN_DIR/pilotctl" daemon status --check >/dev/null 2>&1; do
+            _managed_wait=$((_managed_wait + 1))
+            if [ "$_managed_wait" -ge 30 ]; then
+                echo "Error: the managed daemon did not become ready under systemd." >&2
+                exit 1
+            fi
+            sleep 1
+        done
+    else
+        # Portable and launchd installs need an explicit restart so a daemon
+        # that was already running cannot keep the pre-adoption configuration.
+        if "$BIN_DIR/pilotctl" daemon status --check >/dev/null 2>&1; then
+            "$BIN_DIR/pilotctl" daemon stop >/dev/null
+        fi
+        "$BIN_DIR/pilotctl" daemon start --wait 30s >/dev/null
+        "$BIN_DIR/pilotctl" daemon status --check >/dev/null
+    fi
 fi
 
 # --- Add to PATH ---
@@ -1279,6 +2178,60 @@ fi
 # Write version file for the auto-updater
 [ -n "$TAG" ] && echo "$TAG" > "$BIN_DIR/.pilot-version"
 
+if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+    echo ""
+    echo "Managed Pilot node ready:"
+    echo "  Runtime:    ${TAG}"
+    echo "  Authority:  ${PILOT_MANAGEMENT_URL}"
+    echo "  Control:    ${MANAGED_CONTROL_PATH}"
+    if [ "$MANAGED_ADOPTED" = "1" ]; then
+        echo "  Enrollment: claimed once and installed"
+    else
+        echo "  Enrollment: existing managed identity preserved"
+    fi
+    if [ "$PILOT_MANAGED_NO_START" = "1" ]; then
+        echo "  Daemon:     not started (--no-start)"
+    else
+        echo "  Daemon:     running; signed fleet reporting enabled"
+    fi
+    echo "  MCP:        not installed (optional, separate product)"
+    echo ""
+    echo "Harness interception is a separate optional attachment step."
+    echo "The management console will verify the node's signed report before"
+    echo "it marks onboarding complete."
+    exit 0
+fi
+
+# transport_line — the transport the installed daemon will run, stated once
+# the binaries are known (the banner at the top does not guess), plus what to
+# do on a UDP-blocked host when this release will not fall back by itself.
+transport_line() {
+    case "$EFFECTIVE_TRANSPORT" in
+        compat)
+            if [ "$DAEMON_HAS_TRANSPORT" != true ]; then
+                echo "  Transport: udp (compat is saved, but this pilot-daemon, ${TAG:-source},"
+                echo "             predates it; see the WARNING above)"
+                return 0
+            fi
+            _tl_registry="$COMPAT_REGISTRY"
+            if [ "$REGISTRY" != "$DEFAULT_REGISTRY" ]; then _tl_registry="$REGISTRY"; fi
+            echo "  Transport: compat (registry ${_tl_registry} over TLS, beacon over WSS)" ;;
+        auto)
+            echo "  Transport: auto (UDP when it works, else compat over TCP 443)" ;;
+        *)
+            if [ "$DAEMON_HAS_AUTO" != true ]; then
+                echo "  Transport: udp (this pilot-daemon, ${TAG:-source}, predates auto and never"
+                echo "             falls back to TCP 443 by itself)"
+            else
+                echo "  Transport: udp"
+            fi ;;
+    esac
+    if [ "$UDP_ONLY_HINT" = true ]; then
+        echo "             UDP blocked on this host? Use TLS + WSS over TCP 443 instead:"
+        echo "               curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --transport compat"
+    fi
+}
+
 # --- Upgrade: short summary, skip the first-run onboarding text ---
 #
 # Everything above this point (binary swap, unit/plist regeneration, service
@@ -1292,11 +2245,12 @@ if [ "$UPDATING" = true ]; then
     echo "  pilotctl         ${BIN_DIR}/pilotctl"
     [ -f "$BIN_DIR/pilot-gateway" ] && echo "  pilot-gateway    ${BIN_DIR}/pilot-gateway"
     [ -f "$BIN_DIR/pilot-updater" ] && echo "  pilot-updater    ${BIN_DIR}/pilot-updater"
+    transport_line
     echo ""
     if [ -z "$RESTART_SYSTEMD" ] && [ -z "$RESTART_LAUNCHD" ]; then
         echo "No managed service was running. If you run the daemon yourself,"
         echo "restart it to pick up the new version:"
-        echo "  pilotctl daemon stop && pilotctl daemon start"
+        start_hint "  " "pilotctl daemon stop && pilotctl daemon start" "pilotctl daemon start" "pilotctl daemon stop"
         echo ""
     fi
     exit 0
@@ -1310,11 +2264,34 @@ echo "  pilotctl         ${BIN_DIR}/pilotctl"
 [ -f "$BIN_DIR/pilot-updater" ] && echo "  pilot-updater    ${BIN_DIR}/pilot-updater (auto-updates in background)"
 echo ""
 echo "Config: ${PILOT_DIR}/config.json"
-echo "  Registry: ${REGISTRY}"
-echo "  Beacon:   ${BEACON}"
+transport_line
+case "$EFFECTIVE_TRANSPORT" in
+    compat) ;;
+    auto)
+        if [ "$STOCK_ENDPOINTS" = true ]; then
+            echo "  Registry: ${REGISTRY}"
+            echo "  Beacon:   ${BEACON}"
+        else
+            echo "  Registry: picked by the daemon for its transport (${COMPAT_REGISTRY} over TLS via the proxy)"
+        fi ;;
+    *)
+        echo "  Registry: ${REGISTRY}"
+        echo "  Beacon:   ${BEACON}" ;;
+esac
+if [ "$EFFECTIVE_TRANSPORT" != "udp" ] && [ -n "$PILOT_PROXY_URL" ] && [ "$DAEMON_HAS_PROXY" = true ]; then
+    echo "  Proxy:    auto -> $(redact_proxy "$PILOT_PROXY_URL") (from environment)"
+    if [ "$PROXY_CMD_SAVED" = true ] && [ "$DAEMON_HAS_PROXY_CMD" = true ]; then
+        echo "            credentials re-read by the daemon (proxy_cmd): rotation needs no restart"
+    fi
+fi
 echo "  Socket:   /tmp/pilot.sock"
 echo "  Identity: ${PILOT_DIR}/identity.json"
-echo "  Email:    ${EMAIL}"
+if [ -n "$EMAIL" ]; then
+    echo "  Email:    ${EMAIL}"
+else
+    echo "  Email:    not set (the daemon uses <key fingerprint>@nodes.pilotprotocol.network;"
+    echo "            set a real one any time: pilotctl set-email <addr>)"
+fi
 echo ""
 echo "============================================"
 echo "  GET STARTED"
@@ -1322,21 +2299,35 @@ echo ""
 echo "  0) Put pilotctl on your PATH and bring the node online."
 echo "     ------------------------------------------------------------------"
 echo "     export PATH=\"${BIN_DIR}:\$PATH\"   # only needed in THIS shell, before you open a new one"
+# The start command itself only where this daemon can come online with it
+# (see PROXY_UNSUPPORTED / PROXY_ONLY): a proxy-only host gets the recipe.
+if [ "$PROXY_ONLY" = true ]; then
+    echo "     # Do NOT run \`pilotctl daemon start\` on this host: this pilot-daemon (${TAG:-source})"
+    echo "     # cannot use the proxy and would dial the registry directly. What brings the"
+    echo "     # node online (then check it here):"
+    echo "     #   ${PROXY_REMEDY}"
+elif [ "$PROXY_UNSUPPORTED" = true ]; then
+    echo "     # This pilot-daemon (${TAG:-source}) cannot use the proxy (see the WARNING above). If the"
+    echo "     # proxy is this host's only way out, skip the next line; what works then:"
+    echo "     #   ${PROXY_REMEDY}"
+    echo "     pilotctl daemon start --hostname my-agent         # blocks until registered; email already saved"
+else
+    echo "     pilotctl daemon start --hostname my-agent         # blocks until registered; email already saved"
+fi
 cat <<'PILOT_GET_STARTED'
-     pilotctl daemon start --hostname my-agent         # blocks until registered; email already saved
      pilotctl daemon status                            # confirm it's running
      pilotctl info                                      # node ID, address, peer count, uptime
 
-     Reading any reply is always the same two-step idiom — send with
-     --wait, then print the newest reply. No jq, no extra dependency:
+     Ask with --wait: the reply comes back in the send's own output. If
+     it fails or times out there is no reply to read — do not substitute
+     the newest inbox message, which may answer an older question:
      ------------------------------------------------------------------
      pilotctl send-message <agent> --data '<cmd>' --wait
-     pilotctl inbox --latest              # full body of the newest reply
+     pilotctl --json send-message <agent> --data '<cmd>' --wait   # reply in .data.reply
 
-     # Other ways to read the inbox:
+     # Every reply is also kept in the inbox:
      pilotctl inbox                       # 10 newest, one-line previews
      pilotctl inbox --from pilot-mom --limit 3
-     pilotctl --json inbox --latest       # machine-readable envelope
 
 
   1) MOM (pilot-mom) — your default for anything LIVE or fresh.
@@ -1344,7 +2335,6 @@ cat <<'PILOT_GET_STARTED'
      agents + filters and returns a validated, ready-to-run plan.
      ------------------------------------------------------------------
      pilotctl send-message pilot-mom --data 'current weather and air quality for Berlin' --wait
-     pilotctl inbox --latest
 
      # More examples — hand it the whole sentence, don't hunt for agents yourself:
      pilotctl send-message pilot-mom --data 'summarize this season F1 drivers' --wait
@@ -1359,16 +2349,13 @@ cat <<'PILOT_GET_STARTED'
      ------------------------------------------------------------------
      # Browse the whole live catalogue:
      pilotctl send-message list-agents --data '/data' --wait
-     pilotctl inbox --latest
 
      # Search by keyword:
      pilotctl send-message list-agents --data '/data {"search":"bitcoin","limit":10}' --wait
-     pilotctl inbox --latest
 
      # Learn a specialist's query schema, then query it with filters:
      pilotctl send-message <agent-name> --data '/help' --wait
      pilotctl send-message <agent-name> --data '/data {"<filter>":"<value>"}' --wait
-     pilotctl inbox --latest
 
 
 
@@ -1382,8 +2369,10 @@ cat <<'PILOT_GET_STARTED'
      # See an app's full details (methods, source, permissions, pricing):
      pilotctl appstore view io.pilot.sqlite
 
-     # Install it (daemon auto-spawns it; re-run `list` if state != ready):
-     pilotctl appstore install io.pilot.sqlite --force
+     # Install it once (daemon auto-spawns it; re-run `list` if state != ready).
+     # Do not add --force routinely: it reinstalls over the app and can
+     # delete its saved state (keys).
+     pilotctl appstore install io.pilot.sqlite
      pilotctl appstore list
 
      # ALWAYS call <app>.help first — lists every method, its params,
@@ -1394,13 +2383,13 @@ cat <<'PILOT_GET_STARTED'
      pilotctl appstore call io.pilot.sqlite sqlite.query '{"sql":"select 1"}'
 
      # A few concrete capability examples (install first, then call):
-     pilotctl appstore install io.pilot.smol --force
+     pilotctl appstore install io.pilot.smol
      pilotctl appstore call io.pilot.smol smol.push '{"image":"alpine","net":true}'
 
-     pilotctl appstore install io.pilot.bowmark --force
+     pilotctl appstore install io.pilot.bowmark
      pilotctl appstore call io.pilot.bowmark bowmark.ask '{"site":"amazon.com","task":"search for a product"}'
 
-     pilotctl appstore install io.pilot.orthogonal --force
+     pilotctl appstore install io.pilot.orthogonal
      pilotctl appstore call io.pilot.orthogonal orthogonal.search '{"prompt":"work email for a person given name + company"}'
 
      Cost: most apps run locally and are free. A few (orthogonal, sixtyfour,
@@ -1419,8 +2408,9 @@ cat <<'PILOT_GET_STARTED'
      pilotctl send-message <peer> --data '<message>'            # talk, once trust is mutual
      pilotctl send-file <peer> /path/to/file.tar.gz            # exchange artifacts
 
-  Full operator manual & task→agent/app maps:
-    ~/.claude/skills/pilotctl/SKILL.md
+  Full operator manual & task→agent/app maps: the pilotctl skill
+  (`pilotctl skills` lists where it is installed, e.g.
+  ~/.claude/skills/pilotctl/SKILL.md).
 ============================================
 PILOT_GET_STARTED
 echo ""
@@ -1440,6 +2430,9 @@ echo "  The daemon scans every 15 minutes and injects the Pilot Protocol"
 echo "  skill into installed agent tools. Triggering a first pass right now"
 echo "  so your agents know about Pilot before the daemon is even started:"
 echo ""
+# pilotctl fetches the skills through this process's proxy settings: hand it
+# the current credentials if they rotated since the downloads.
+proxy_refresh || true
 if "${BIN_DIR}/pilotctl" skills check 2>&1 | sed 's/^/    /'; then
     :
 else

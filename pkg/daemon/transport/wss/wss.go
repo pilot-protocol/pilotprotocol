@@ -66,8 +66,8 @@ const DefaultIdlePingInterval = 30 * time.Second
 const DefaultIdlePingTimeout = 10 * time.Second
 
 // DefaultDialTimeout caps the time we spend on a single dial attempt
-// (DNS + TCP + TLS + WS upgrade + auth challenge). Beyond this we
-// fail fast and let the reconnect loop try again.
+// (DNS + TCP + proxy CONNECT + TLS + WS upgrade + auth challenge).
+// Beyond this we fail fast and let the reconnect loop try again.
 const DefaultDialTimeout = 20 * time.Second
 
 // DefaultRecvBuffer is the buffered channel size for inbound frames.
@@ -108,6 +108,15 @@ type Config struct {
 	// a config with RootCAs=nil so Go falls back to the OS trust
 	// store. Always non-nil — the caller picks the policy.
 	TLSConfig *tls.Config
+
+	// DialContext opens the TCP connection to the beacon, e.g. a
+	// netproxy.Dialer that tunnels through an HTTP CONNECT proxy by host
+	// name, so the beacon name is never resolved locally. TLS (TLSConfig,
+	// SNI) then runs end to end with the beacon over that connection;
+	// TLSConfig never applies to the proxy itself — an https:// proxy's
+	// TLS is the dialer's business, so a pinned beacon trust store cannot
+	// reject the operator's proxy certificate. nil dials directly.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Identity provides the Ed25519 keypair used for the auth challenge.
 	Identity *crypto.Identity
@@ -256,6 +265,7 @@ func Dial(ctx context.Context, cfg Config) (*Transport, error) {
 func (t *Transport) dialAndAuth(ctx context.Context) (*websocket.Conn, error) {
 	httpClient := &http.Client{
 		Transport: &http.Transport{
+			DialContext:     t.cfg.DialContext,
 			TLSClientConfig: t.cfg.TLSConfig.Clone(),
 		},
 	}

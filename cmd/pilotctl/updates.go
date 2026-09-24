@@ -616,6 +616,14 @@ func cmdUpdate(args []string) {
 	}
 	restart := checkDaemonRestart(st, wait)
 
+	// A pinned older release may predate settings config.json holds.
+	note := ""
+	if bin := filepath.Join(installDir, "pilot-daemon"); pin != "" {
+		if _, err := os.Stat(bin); err == nil {
+			note = fitTransportToDaemon(bin)
+		}
+	}
+
 	if jsonOutput {
 		out := map[string]interface{}{
 			"install_dir":     installDir,
@@ -631,11 +639,17 @@ func cmdUpdate(args []string) {
 			"daemon_version":  restart.daemonVersion,
 			"status_file":     statusPath,
 		}
+		if note != "" {
+			out["note"] = note
+		}
 		outputOK(out)
 		return
 	}
 	fmt.Printf("Update check complete. Install dir: %s\n", installDir)
 	printUpdateResult(st, restart)
+	if note != "" {
+		fmt.Printf("Note: %s\n", note)
+	}
 
 	// In manual mode (no daemon running), re-run skill install so skills
 	// match the (possibly updated) binaries.
