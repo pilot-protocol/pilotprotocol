@@ -22,7 +22,13 @@ func withTempHomeFull(t *testing.T) string {
 	t.Setenv("PILOT_HOME", "")
 	t.Setenv("PILOT_SOCKET", "")
 	t.Setenv("PILOT_REGISTRY", "")
+	t.Setenv("PILOT_BEACON", "")
 	t.Setenv("PILOT_ADMIN_TOKEN", "")
+	// A developer or CI shell exporting PILOT_TRANSPORT=compat or a proxy
+	// must not change what daemon start / registry dials plan.
+	for _, k := range daemonForwardEnv {
+		t.Setenv(k, "")
+	}
 	return tmp
 }
 

@@ -4,7 +4,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"log/slog"
 	"os"
 	"syscall"
@@ -125,10 +125,12 @@ func shutdown(cause shutdownCause, stopDaemon func(), stopPlugins func(context.C
 // spawned — and since the supervisor respawns on the non-zero exit, a
 // persistent startup failure would leak a fresh set on every attempt.
 func fatalAfterPluginStart(stopPlugins func(context.Context) error, format string, args ...any) {
-	log.Printf(format, args...)
+	// At ERROR, like fatalf: log.Printf reaches slog at INFO, and `pilotctl
+	// daemon start` reports the last ERROR line as the reason a start failed.
+	slog.Error(fmt.Sprintf(format, args...))
 	stopCtx, stopCancel := context.WithTimeout(context.Background(), pluginStopTimeout)
 	if err := stopPlugins(stopCtx); err != nil {
-		log.Printf("plugin shutdown error: %v", err)
+		slog.Warn("plugin shutdown error", "err", err)
 	}
 	stopCancel()
 	os.Exit(1)
