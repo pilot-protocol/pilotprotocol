@@ -1,0 +1,20 @@
+# Temporary: clean-machine onboarding check for a beta-channel release on
+# every supported platform. Lives only on the verify/* branch.
+name: verify-onboarding
+on:
+  push:
+    branches: ['verify/**']
+permissions:
+  contents: read
+jobs:
+  onboard:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, macos-13]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Onboard from the beta channel
+        run: bash .github/verify-onboarding.sh "$(cat .github/verify-version)"
