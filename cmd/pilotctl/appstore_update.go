@@ -98,6 +98,10 @@ type outdatedApp struct {
 	// "rebuilt" (a same-version republish — the catalogue bundle changed under a
 	// version we already have). Both upgrade the same way.
 	Reason string `json:"reason,omitempty"`
+	// RenamedTo is set when the installed id is a rename tombstone. Such an app
+	// is reported but never auto-upgraded: the new id has its own publisher key
+	// and method namespace, so moving to it is the operator's call.
+	RenamedTo string `json:"renamed_to,omitempty"`
 }
 
 // findOutdated cross-references installed apps against the signed catalogue and
@@ -121,6 +125,10 @@ func findOutdated() ([]outdatedApp, error) {
 	for _, a := range installed {
 		e, ok := entries[a.ID]
 		if !ok {
+			continue
+		}
+		if e.RenamedTo != "" {
+			out = append(out, outdatedApp{ID: a.ID, Installed: a.AppVersion, Available: e.RenamedTo, Reason: "renamed", RenamedTo: e.RenamedTo})
 			continue
 		}
 		// resolveBundle picks THIS host's platform bundle, matching what install
@@ -174,14 +182,23 @@ func cmdAppStoreOutdated(_ []string) {
 		return
 	}
 	fmt.Printf("%-32s %-12s %-12s %s\n", "APP", "INSTALLED", "AVAILABLE", "WHY")
+	upgradable := 0
 	for _, o := range out {
+		if o.RenamedTo == "" {
+			upgradable++
+		}
 		why := o.Reason
-		if why == "rebuilt" {
+		switch why {
+		case "rebuilt":
 			why = "rebuilt (same version, new bundle)"
+		case "renamed":
+			why = fmt.Sprintf("renamed: install %s, then uninstall %s", o.RenamedTo, o.ID)
 		}
 		fmt.Printf("%-32s %-12s %-12s %s\n", o.ID, o.Installed, o.Available, why)
 	}
-	fmt.Printf("\nupgrade with: pilotctl appstore upgrade <id>   (or --all)\n")
+	if upgradable > 0 {
+		fmt.Printf("\nupgrade with: pilotctl appstore upgrade <id>   (or --all)\n")
+	}
 }
 
 // cmdAppStoreUpgrade upgrades one app (or --all outdated apps) to the catalogue's
@@ -219,9 +236,24 @@ func cmdAppStoreUpgrade(args []string) {
 
 	var targets []outdatedApp
 	if all {
-		targets = outdated
+		skipped := 0
+		for _, o := range outdated {
+			if o.RenamedTo != "" {
+				// Never migrate across a rename on its own: the hourly updater
+				// runs --all, and the new id has its own publisher key and
+				// method names, so switching is the operator's call.
+				fmt.Printf("skip %s: renamed to %s (install it with `pilotctl appstore install %s`, then `pilotctl appstore uninstall %s --yes`)\n", o.ID, o.RenamedTo, o.RenamedTo, o.ID)
+				skipped++
+				continue
+			}
+			targets = append(targets, o)
+		}
 		if len(targets) == 0 {
-			fmt.Println("all installed apps are up to date")
+			if skipped > 0 {
+				fmt.Println("nothing else to upgrade")
+			} else {
+				fmt.Println("all installed apps are up to date")
+			}
 			return
 		}
 	} else {
@@ -230,6 +262,11 @@ func cmdAppStoreUpgrade(args []string) {
 			// Either not installed, not in the catalogue, or already current.
 			fmt.Printf("%s is already up to date (or not a catalogue app)\n", id)
 			return
+		}
+		if o.RenamedTo != "" {
+			fatalHint("invalid_argument",
+				fmt.Sprintf("install the new id: pilotctl appstore install %s (then: pilotctl appstore uninstall %s --yes)", o.RenamedTo, o.ID),
+				"%s was renamed to %s; upgrade does not switch app ids", o.ID, o.RenamedTo)
 		}
 		targets = []outdatedApp{o}
 	}

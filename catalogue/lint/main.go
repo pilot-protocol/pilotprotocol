@@ -19,7 +19,14 @@
 //     whose id and app_version match the entry and whose binary matches its
 //     pinned sha256, and its binary can run on the platform it is published
 //     for. A legacy single-bundle entry (no `bundles` map) is installed by every
-//     platform, so it must not ship a native binary at all.
+//     platform, so it must not ship a native binary at all. A "cli" bundle's
+//     install.json must carry a native tool for every platform the bundle is
+//     published for; the adapter exits at every start where it has none.
+//
+//  3. Rename tombstones (not overridable), checked on every run: an entry with
+//     no bundle must be a tombstone (renamed_to + hidden + the old publisher
+//     key, no version, no metadata_url) whose renamed_to names an installable
+//     entry.
 //
 // Usage:
 //
@@ -67,12 +74,15 @@ type catalogue struct {
 }
 
 type entry struct {
-	ID        string             `json:"id"`
-	Version   string             `json:"version"`
-	BundleURL string             `json:"bundle_url"`
-	BundleSHA string             `json:"bundle_sha256"`
-	Bundles   map[string]variant `json:"bundles,omitempty"`
-	RenamedTo string             `json:"renamed_to,omitempty"`
+	ID          string             `json:"id"`
+	Version     string             `json:"version"`
+	BundleURL   string             `json:"bundle_url"`
+	BundleSHA   string             `json:"bundle_sha256"`
+	Bundles     map[string]variant `json:"bundles,omitempty"`
+	RenamedTo   string             `json:"renamed_to,omitempty"`
+	Hidden      bool               `json:"hidden,omitempty"`
+	Publisher   string             `json:"publisher,omitempty"`
+	MetadataURL string             `json:"metadata_url,omitempty"`
 }
 
 type variant struct {
@@ -125,7 +135,16 @@ type bundleInfo struct {
 	manifest   *manifest
 	binary     binaryFormat
 	binarySHA  string
+	assets     assetPlatforms
 	fetchError error
+}
+
+// assetPlatforms describes a "cli" bundle's install.json: the native tool the
+// adapter stages at first start and the os/arch it is published for. nil when
+// the bundle has no install.json (or it lists no assets).
+type assetPlatforms struct {
+	Command   string
+	Platforms []string
 }
 
 func main() {
@@ -201,18 +220,25 @@ func (l *linter) lint(base, head *catalogue) []finding {
 	for _, e := range base.Apps {
 		baseByID[e.ID] = e
 	}
+	headByID := map[string]entry{}
+	for _, e := range head.Apps {
+		headByID[e.ID] = e
+	}
 	seen := map[string]bool{}
 	for _, e := range head.Apps {
 		if seen[e.ID] {
 			out = append(out, finding{AppID: e.ID, Title: "duplicate catalogue id", Msg: fmt.Sprintf("%s appears more than once in the catalogue", e.ID)})
 		}
 		seen[e.ID] = true
+		// Checked even when untouched: a rename target can change or go
+		// away in a PR that never edits the tombstone itself.
+		if tombstone(e) || e.RenamedTo != "" {
+			out = append(out, checkTombstone(e, headByID)...)
+			continue // not installable; no bundle to check
+		}
 		old, existed := baseByID[e.ID]
 		if existed && reflect.DeepEqual(old, e) {
 			continue // untouched entry
-		}
-		if tombstone(e) {
-			continue // not installable; nothing to check
 		}
 		out = append(out, l.checkBundles(e)...)
 		if existed {
@@ -226,6 +252,47 @@ func (l *linter) lint(base, head *catalogue) []finding {
 }
 
 func tombstone(e entry) bool { return e.BundleURL == "" && len(e.Bundles) == 0 }
+
+// checkTombstone enforces catalogue/README.md "Renaming an app". An entry with
+// no bundle is only meaningful as a rename tombstone: it keeps the old id's
+// publisher pin (the daemon stops an installed app whose id has no pin) and
+// points pilotctl at the new id. Anything else there is a broken entry that
+// pilotctl reports as a "placeholder sha256" at install time.
+func checkTombstone(e entry, headByID map[string]entry) []finding {
+	var out []finding
+	fail := func(format string, args ...any) {
+		out = append(out, finding{AppID: e.ID, Title: "bad rename tombstone", Msg: e.ID + ": " + fmt.Sprintf(format, args...)})
+	}
+	if e.RenamedTo == "" {
+		fail("the entry has no bundle_url and no bundles, so nothing can install it; publish a bundle, or make it a rename tombstone (renamed_to + hidden, see catalogue/README.md)")
+		return out
+	}
+	if !tombstone(e) {
+		fail("renamed_to is set but the entry still publishes a bundle; a tombstone must drop bundle_url and bundles")
+	}
+	if e.Version != "" {
+		fail("a tombstone has no version (it has no release); older pilotctl compares it against installed copies and tries to upgrade them to it")
+	}
+	if e.MetadataURL != "" {
+		fail("a tombstone has no metadata_url; delete apps/%s/ and the pin", e.ID)
+	}
+	if !e.Hidden {
+		fail("a tombstone must set \"hidden\": true")
+	}
+	if e.Publisher == "" {
+		fail("a tombstone must keep the old publisher key: installed copies are pinned to it, and the daemon stops an installed app whose id has no pin")
+	}
+	to, ok := headByID[e.RenamedTo]
+	switch {
+	case e.RenamedTo == e.ID:
+		fail("renamed_to names the entry itself")
+	case !ok:
+		fail("renamed_to %q is not in the catalogue", e.RenamedTo)
+	case to.RenamedTo != "" || tombstone(to):
+		fail("renamed_to %q is itself a tombstone; renames are one hop", e.RenamedTo)
+	}
+	return out
+}
 
 // resolved mirrors pilotctl's resolveBundle for one platform.
 func resolved(e entry, plat string) variant {
@@ -387,6 +454,19 @@ func (l *linter) checkBundles(e entry) []finding {
 		if info.binarySHA != m.Binary.SHA256 {
 			fail("bundle does not match entry", "%s: binary %s has sha256 %s but the manifest pins %s; pilotctl refuses to install it", where, m.Binary.Path, info.binarySHA, m.Binary.SHA256)
 		}
+		if a := info.assets; len(a.Platforms) > 0 {
+			plats := []string{t.plat}
+			if t.plat == "" {
+				plats = knownPlatforms // a legacy bundle is installed everywhere
+			}
+			for _, p := range plats {
+				if !contains(a.Platforms, p) {
+					fail("no native tool for a published platform",
+						"%s: install.json ships %s only for %s, so the app exits at every start on %s (\"install assets: stage: no asset for %s\") and the supervisor suspends it. Drop %s from `bundles`, or add its asset",
+						where, a.Command, strings.Join(a.Platforms, ", "), p, p, p)
+				}
+			}
+		}
 		bf := info.binary
 		switch {
 		case !bf.Native:
@@ -410,70 +490,107 @@ func (l *linter) inspect(v variant) *bundleInfo {
 		return info
 	}
 	info := &bundleInfo{}
-	info.manifest, info.binary, info.binarySHA, info.fetchError = l.readBundle(v)
+	info.manifest, info.binary, info.binarySHA, info.assets, info.fetchError = l.readBundle(v)
 	l.cache[key] = info
 	return info
 }
 
-func (l *linter) readBundle(v variant) (*manifest, binaryFormat, string, error) {
+func (l *linter) readBundle(v variant) (*manifest, binaryFormat, string, assetPlatforms, error) {
 	var none binaryFormat
 	body, err := l.fetch(v.BundleURL)
 	if err != nil {
-		return nil, none, "", fmt.Errorf("fetch %s: %w", v.BundleURL, err)
+		return nil, none, "", assetPlatforms{}, fmt.Errorf("fetch %s: %w", v.BundleURL, err)
 	}
 	defer body.Close()
 	tmp, err := os.MkdirTemp("", "catalogue-lint-*")
 	if err != nil {
-		return nil, none, "", err
+		return nil, none, "", assetPlatforms{}, err
 	}
 	defer os.RemoveAll(tmp)
 	tarPath := filepath.Join(tmp, "bundle.tar.gz")
 	f, err := os.Create(tarPath) // #nosec G304 -- fixed name in our own temp dir
 	if err != nil {
-		return nil, none, "", err
+		return nil, none, "", assetPlatforms{}, err
 	}
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, maxBundleBytes+1))
 	_ = f.Close()
 	if err != nil {
-		return nil, none, "", fmt.Errorf("download %s: %w", v.BundleURL, err)
+		return nil, none, "", assetPlatforms{}, fmt.Errorf("download %s: %w", v.BundleURL, err)
 	}
 	if n > maxBundleBytes {
-		return nil, none, "", fmt.Errorf("%s is larger than pilotctl's %d-byte download cap", v.BundleURL, maxBundleBytes)
+		return nil, none, "", assetPlatforms{}, fmt.Errorf("%s is larger than pilotctl's %d-byte download cap", v.BundleURL, maxBundleBytes)
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != v.BundleSHA {
-		return nil, none, "", fmt.Errorf("%s has sha256 %s, the catalogue pins %s", v.BundleURL, got, v.BundleSHA)
+		return nil, none, "", assetPlatforms{}, fmt.Errorf("%s has sha256 %s, the catalogue pins %s", v.BundleURL, got, v.BundleSHA)
 	}
 	files, err := extract(tarPath, tmp)
 	if err != nil {
-		return nil, none, "", fmt.Errorf("unpack %s: %w", v.BundleURL, err)
+		return nil, none, "", assetPlatforms{}, fmt.Errorf("unpack %s: %w", v.BundleURL, err)
 	}
 	mfPath, ok := files["manifest.json"]
 	if !ok {
-		return nil, none, "", errors.New("bundle has no top-level manifest.json")
+		return nil, none, "", assetPlatforms{}, errors.New("bundle has no top-level manifest.json")
 	}
 	raw, err := os.ReadFile(mfPath) // #nosec G304 -- a file we extracted into our temp dir
 	if err != nil {
-		return nil, none, "", err
+		return nil, none, "", assetPlatforms{}, err
 	}
 	var m manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, none, "", fmt.Errorf("parse manifest.json: %w", err)
+		return nil, none, "", assetPlatforms{}, fmt.Errorf("parse manifest.json: %w", err)
 	}
 	binPath, ok := files[path.Clean(m.Binary.Path)]
 	if !ok {
-		return nil, none, "", fmt.Errorf("manifest binary %q is not in the bundle", m.Binary.Path)
+		return nil, none, "", assetPlatforms{}, fmt.Errorf("manifest binary %q is not in the bundle", m.Binary.Path)
 	}
 	bin, err := os.ReadFile(binPath) // #nosec G304 -- a file we extracted into our temp dir
 	if err != nil {
-		return nil, none, "", err
+		return nil, none, "", assetPlatforms{}, err
 	}
 	sum := sha256.Sum256(bin)
 	bf, err := detectBinary(binPath)
 	if err != nil {
-		return nil, none, "", err
+		return nil, none, "", assetPlatforms{}, err
 	}
-	return &m, bf, hex.EncodeToString(sum[:]), nil
+	var assets assetPlatforms
+	if p, ok := files["install.json"]; ok {
+		if assets, err = readAssetPlatforms(p); err != nil {
+			return nil, none, "", assetPlatforms{}, err
+		}
+	}
+	return &m, bf, hex.EncodeToString(sum[:]), assets, nil
+}
+
+// readAssetPlatforms reads a bundle's install.json. It mirrors the adapter's
+// StageAssets (app-template internal/scaffold/templates/stage.go.tmpl), which
+// picks the assets whose os and arch equal the host's.
+func readAssetPlatforms(p string) (assetPlatforms, error) {
+	raw, err := os.ReadFile(p) // #nosec G304 -- a file we extracted into our temp dir
+	if err != nil {
+		return assetPlatforms{}, err
+	}
+	var spec struct {
+		Command string `json:"command"`
+		Assets  []struct {
+			OS   string `json:"os"`
+			Arch string `json:"arch"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return assetPlatforms{}, fmt.Errorf("parse install.json: %w", err)
+	}
+	out := assetPlatforms{Command: spec.Command}
+	for _, a := range spec.Assets {
+		if p := a.OS + "/" + a.Arch; !contains(out.Platforms, p) {
+			out.Platforms = append(out.Platforms, p)
+		}
+	}
+	sort.Strings(out.Platforms)
+	if out.Command == "" {
+		out.Command = "its native tool"
+	}
+	return out, nil
 }
 
 // extract writes each regular file of the gzipped tar at tarPath into dir under

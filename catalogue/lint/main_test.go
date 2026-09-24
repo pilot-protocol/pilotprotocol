@@ -79,6 +79,13 @@ func newBundleServer(t *testing.T) *bundleServer {
 // manifest pins instead of the binary's real sha.
 func (b *bundleServer) publish(id, version string, caps []string, bin []byte, binSHAOverride string) variant {
 	b.t.Helper()
+	return b.publishWith(id, version, caps, bin, binSHAOverride, nil)
+}
+
+// publishWith is publish with extra top-level files in the bundle (a cli
+// app's install.json).
+func (b *bundleServer) publishWith(id, version string, caps []string, bin []byte, binSHAOverride string, extra map[string][]byte) variant {
+	b.t.Helper()
 	sum := sha256.Sum256(bin)
 	binSHA := hex.EncodeToString(sum[:])
 	if binSHAOverride != "" {
@@ -96,10 +103,15 @@ func (b *bundleServer) publish(id, version string, caps []string, bin []byte, bi
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
-	for _, f := range []struct {
+	type file struct {
 		name string
 		body []byte
-	}{{"./manifest.json", mf}, {"bin/app", bin}} {
+	}
+	files := []file{{"./manifest.json", mf}, {"bin/app", bin}}
+	for name, body := range extra {
+		files = append(files, file{name, body})
+	}
+	for _, f := range files {
 		if err := tw.WriteHeader(&tar.Header{Name: f.name, Size: int64(len(f.body)), Typeflag: tar.TypeReg, Mode: 0o755}); err != nil {
 			b.t.Fatal(err)
 		}
@@ -355,5 +367,62 @@ func TestLoadCatalogueOptionalBase(t *testing.T) {
 	}
 	if c, err := loadCatalogue(p, true); err != nil || len(c.Apps) != 0 {
 		t.Fatalf("empty base file: %v %v", c, err)
+	}
+}
+
+// A bundle-less entry must be a well-formed rename tombstone, checked even
+// when the PR does not touch it.
+func TestTombstonesMustBeWellFormed(t *testing.T) {
+	s := newBundleServer(t)
+	target := legacy("io.test.new", "1.0.0", s.publish("io.test.new", "1.0.0", nil, scriptBin, ""))
+	good := entry{ID: "io.test.old", RenamedTo: "io.test.new", Hidden: true, Publisher: "ed25519:old"}
+	if got := testLinter(policy{}, false).lint(&catalogue{}, &catalogue{Apps: []entry{good, target}}); len(got) != 0 {
+		t.Fatalf("valid tombstone: %+v", got)
+	}
+	for name, tc := range map[string]struct {
+		apps []entry
+		want string
+	}{
+		"no bundle, no rename": {[]entry{{ID: "io.test.old", Publisher: "ed25519:old"}}, "nothing can install it"},
+		"target missing":       {[]entry{good}, `renamed_to "io.test.new" is not in the catalogue`},
+		"chained":              {[]entry{good, {ID: "io.test.new", RenamedTo: "io.test.newer", Hidden: true, Publisher: "ed25519:x"}}, "renames are one hop"},
+		"self":                 {[]entry{{ID: "io.test.old", RenamedTo: "io.test.old", Hidden: true, Publisher: "ed25519:old"}}, "names the entry itself"},
+		"version":              {[]entry{{ID: "io.test.old", RenamedTo: "io.test.new", Hidden: true, Publisher: "ed25519:old", Version: "1.2.0"}, target}, "has no version"},
+		"metadata":             {[]entry{{ID: "io.test.old", RenamedTo: "io.test.new", Hidden: true, Publisher: "ed25519:old", MetadataURL: "https://x/m.json"}, target}, "no metadata_url"},
+		"not hidden":           {[]entry{{ID: "io.test.old", RenamedTo: "io.test.new", Publisher: "ed25519:old"}, target}, `"hidden": true`},
+		"no publisher":         {[]entry{{ID: "io.test.old", RenamedTo: "io.test.new", Hidden: true}, target}, "keep the old publisher key"},
+		"still has a bundle":   {[]entry{{ID: "io.test.old", RenamedTo: "io.test.new", Hidden: true, Publisher: "ed25519:old", BundleURL: target.BundleURL, BundleSHA: target.BundleSHA}, target}, "still publishes a bundle"},
+	} {
+		head := &catalogue{Apps: tc.apps}
+		// base == head: the tombstone itself is untouched and still checked.
+		if got := testLinter(policy{}, false).lint(head, head); !hasFinding(got, false, "bad rename tombstone", tc.want) {
+			t.Errorf("%s: want a finding containing %q, got %+v", name, tc.want, got)
+		}
+	}
+}
+
+// A cli bundle published for a platform its install.json has no native tool
+// for exits at every start there. io.pilot.smolmachines 1.2.0 shipped a
+// darwin/amd64 bundle like that (upstream smolvm has no macOS x86_64 build).
+func TestCLIBundleNeedsANativeToolForEachPublishedPlatform(t *testing.T) {
+	s := newBundleServer(t)
+	const id = "io.test.vm"
+	installJSON := []byte(`{"schema":1,"app":"io.test.vm","version":"1.0.0","command":"smolvm","assets":[
+		{"os":"darwin","arch":"arm64"},{"os":"linux","arch":"amd64"},{"os":"linux","arch":"arm64"}]}`)
+	extra := map[string][]byte{"install.json": installJSON}
+	e := entry{ID: id, Version: "1.0.0", Bundles: map[string]variant{
+		"darwin/arm64": s.publishWith(id, "1.0.0", nil, machArm64, "", extra),
+		"darwin/amd64": s.publishWith(id, "1.0.0", nil, machHeader(macho.CpuAmd64), "", extra),
+		"linux/amd64":  s.publishWith(id, "1.0.0", nil, elfAmd64, "", extra),
+		"linux/arm64":  s.publishWith(id, "1.0.0", nil, elfArm64, "", extra),
+	}}
+	e.BundleURL, e.BundleSHA = e.Bundles["linux/amd64"].BundleURL, e.Bundles["linux/amd64"].BundleSHA
+	got := testLinter(policy{}, false).lint(&catalogue{}, &catalogue{Apps: []entry{e}})
+	if len(errorsOf(got)) != 1 || !hasFinding(got, false, "no native tool", "darwin/amd64: install.json ships smolvm only for darwin/arm64, linux/amd64, linux/arm64") {
+		t.Fatalf("got %+v", got)
+	}
+	delete(e.Bundles, "darwin/amd64")
+	if got := testLinter(policy{}, false).lint(&catalogue{}, &catalogue{Apps: []entry{e}}); len(got) != 0 {
+		t.Fatalf("every published platform has its tool: %+v", got)
 	}
 }

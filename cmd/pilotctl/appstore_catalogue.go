@@ -118,6 +118,50 @@ type catalogueEntry struct {
 	// manifest.
 	MetadataURL string `json:"metadata_url,omitempty"`
 	MetadataSHA string `json:"metadata_sha256,omitempty"`
+
+	// --- rename tombstone (catalogue/README.md "Renaming an app") ---
+	// RenamedTo marks a tombstone: the app now lives under this id. The entry
+	// is kept only so installed copies keep their publisher pin (the daemon
+	// fail-closes an installed app with no pin). It is never listed and never
+	// installed itself; install/view/call of the old id point at RenamedTo.
+	// One hop only: a RenamedTo that names another tombstone is rejected.
+	RenamedTo string `json:"renamed_to,omitempty"`
+	// Hidden omits the entry from `catalogue`; it stays resolvable by id.
+	Hidden bool `json:"hidden,omitempty"`
+}
+
+// listed reports whether the entry belongs in the `catalogue` listing.
+func (e catalogueEntry) listed() bool { return !e.Hidden && e.RenamedTo == "" }
+
+// findEntry returns the entry with this id, or nil.
+func (c *catalogue) findEntry(id string) *catalogueEntry {
+	for i := range c.Apps {
+		if c.Apps[i].ID == id {
+			return &c.Apps[i]
+		}
+	}
+	return nil
+}
+
+// resolveRenamed maps id to the entry to install. A plain id returns its own
+// entry (nil if absent). A tombstone warns on stderr and returns the canonical
+// entry; a missing canonical entry, or one that is itself a tombstone, is an
+// error rather than a silent fallback.
+func resolveRenamed(c *catalogue, id string) (*catalogueEntry, error) {
+	e := c.findEntry(id)
+	if e == nil || e.RenamedTo == "" {
+		return e, nil
+	}
+	to := c.findEntry(e.RenamedTo)
+	if to == nil {
+		return nil, fmt.Errorf("app %q was renamed to %q, but %q is not in the catalogue", id, e.RenamedTo, e.RenamedTo)
+	}
+	if to.RenamedTo != "" {
+		return nil, fmt.Errorf("app %q was renamed to %q, which is itself a tombstone (catalogue bug; renames are one hop)", id, e.RenamedTo)
+	}
+	fmt.Fprintf(os.Stderr, "warn: app %q was renamed to %q; installing %q instead. Its methods have new names (`pilotctl appstore view %s`).\n", id, to.ID, to.ID, to.ID)
+	fmt.Fprintf(os.Stderr, "      The old id gets no further updates; if it is installed here, remove it once %s works: pilotctl appstore uninstall %s --yes\n", to.ID, id)
+	return to, nil
 }
 
 // bundleVariant is one platform's downloadable tarball + its pinned sha256.
@@ -307,15 +351,21 @@ func cmdAppStoreCatalogue(_ []string) {
 			"check $PILOT_APPSTORE_CATALOG_URL (currently: "+catalogueURL()+")",
 			"%v", err)
 	}
+	visible := make([]catalogueEntry, 0, len(c.Apps))
+	for _, e := range c.Apps {
+		if e.listed() {
+			visible = append(visible, e)
+		}
+	}
 	if jsonOutput {
-		_ = json.NewEncoder(os.Stdout).Encode(c.Apps)
+		_ = json.NewEncoder(os.Stdout).Encode(visible)
 		return
 	}
-	if len(c.Apps) == 0 {
+	if len(visible) == 0 {
 		fmt.Println("catalogue is empty")
 		return
 	}
-	for _, e := range c.Apps {
+	for _, e := range visible {
 		headline := e.DisplayName
 		if headline == "" {
 			headline = e.Description
@@ -363,14 +413,21 @@ func resolveInstallTargetVersion(target, wantVersion string) (string, installSou
 	}
 	c, err := loadCatalogue()
 	if err == nil {
-		for _, e := range c.Apps {
-			if target != e.ID {
-				continue
-			}
+		e := c.findEntry(target)
+		if e != nil && e.RenamedTo != "" {
+			// A pin names a release of one app. The old id has no releases,
+			// and following the rename would install a different app id (with
+			// its own publisher key) than the one the caller checks for
+			// afterwards — the managed-fleet reconcile would reinstall it
+			// every cycle. Fail closed and name the new id instead.
+			return "", installSourceCatalogue, fmt.Errorf("%w: %s was renamed to %s and has no releases of its own; pin %s instead",
+				ErrCatalogueVersionUnavailable, target, e.RenamedTo, e.RenamedTo)
+		}
+		if e != nil {
 			if e.Version != wantVersion {
 				return "", installSourceCatalogue, fmt.Errorf("%w: %s offers %q, not %q", ErrCatalogueVersionUnavailable, e.ID, e.Version, wantVersion)
 			}
-			dir, fetchErr := fetchAndUnpackBundle(e)
+			dir, fetchErr := fetchAndUnpackBundle(*e)
 			return dir, installSourceCatalogue, fetchErr
 		}
 	}
@@ -388,11 +445,13 @@ func resolveInstallTarget(target string) (string, installSource, error) {
 		// the user knows their URL or env override might be the issue.
 		fmt.Fprintf(os.Stderr, "warn: catalogue lookup failed (%v); proceeding with local-path interpretation\n", err)
 	} else {
-		for _, e := range c.Apps {
-			if target == e.ID {
-				dir, err := fetchAndUnpackBundle(e)
-				return dir, installSourceCatalogue, err
-			}
+		e, rerr := resolveRenamed(c, target)
+		if rerr != nil {
+			return "", installSourceCatalogue, rerr
+		}
+		if e != nil {
+			dir, err := fetchAndUnpackBundle(*e)
+			return dir, installSourceCatalogue, err
 		}
 	}
 	info, err := os.Stat(target)
