@@ -130,6 +130,9 @@ func main() {
 	} else {
 		slog.Info("app auto-upgrade opted out (PILOT_APP_UPDATE_OPT_OUT); apps stay at their installed versions, pilot binaries still update")
 	}
+	// Remove abandoned bundle downloads from the temp dir (tmpsweep.go).
+	stopSweep := make(chan struct{})
+	go tempSweepLoop(*interval, stopSweep)
 	if *pin != "" {
 		slog.Info("version pinned", "tag", *pin)
 	}
@@ -142,6 +145,7 @@ func main() {
 	<-sig
 
 	slog.Info("shutting down")
+	close(stopSweep)
 	u.Stop()
 }
 
