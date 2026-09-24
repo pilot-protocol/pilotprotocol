@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
+	"github.com/pilot-protocol/common/netproxy"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
 )
 
@@ -201,36 +201,43 @@ func TestResolveAutoTransport(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	var got []daemon.AutoTransportProbe
-	autoProbe = func(ctx context.Context, p daemon.AutoTransportProbe) (string, string) {
+	autoProbe = func(ctx context.Context, p daemon.AutoTransportProbe) (string, string, error) {
 		got = append(got, p)
-		return daemon.TransportCompat, "stub"
+		return daemon.TransportCompat, "stub", nil
 	}
 	t.Cleanup(func() { autoProbe = daemon.SelectTransport })
 	std := registrySettings{Addr: defaultRegistryAddr, AddrExplicit: true}
-	spec := func(s string) func(string) (*proxyconf.Policy, error) {
-		return func(transport string) (*proxyconf.Policy, error) { return resolveProxyPolicy(s, "", transport) }
+	spec := func(s string) func(string) (*netproxy.Resolver, error) {
+		return func(transport string) (*netproxy.Resolver, error) { return resolveProxy(s, "", transport) }
 	}
+	const beaconTarget = "beacon.pilotprotocol.network:443"
 
-	mode, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto"))
+	mode, _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto"))
 	if err != nil || mode != daemon.TransportCompat || len(got) != 1 {
 		t.Fatalf("auto = (%q, %v), probes %d", mode, err, len(got))
 	}
 	if got[0].Dial != nil || got[0].BeaconAddr != defaultBeaconAddr || got[0].CompatBeaconURL != defaultCompatBeacon {
 		t.Errorf("probe without a proxy = %+v, want a direct check of the production beacons", got[0])
 	}
+	if via := got[0].ProxyFor(beaconTarget); via != "" {
+		t.Errorf("probe without a proxy reports the proxy %q", via)
+	}
 
 	t.Setenv("HTTPS_PROXY", "http://muse:s3cret@egress.test:3128")
-	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto")); err != nil || got[1].Dial == nil {
+	if _, _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto")); err != nil || got[1].Dial == nil {
 		t.Errorf("with HTTPS_PROXY the compat check does not use the proxy (err %v)", err)
 	}
-	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("off")); err != nil || got[2].Dial != nil {
+	if via := got[1].ProxyFor(beaconTarget); via != "http://***@egress.test:3128" {
+		t.Errorf("ProxyFor(beacon) = %q, want the redacted HTTPS_PROXY", via)
+	}
+	if _, _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("off")); err != nil || got[2].Dial != nil {
 		t.Errorf("-proxy=off still proxies the compat check (err %v)", err)
 	}
-	if _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("ftp://x")); err == nil {
+	if _, _, _, err := resolveAutoTransport(std, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("ftp://x")); err == nil {
 		t.Error("malformed -proxy accepted")
 	}
 
-	mode, reason, err := resolveAutoTransport(registrySettings{Addr: "10.0.0.5:9000", AddrExplicit: true}, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto"))
+	mode, reason, _, err := resolveAutoTransport(registrySettings{Addr: "10.0.0.5:9000", AddrExplicit: true}, defaultBeaconAddr, true, defaultCompatBeacon, false, spec("auto"))
 	if err != nil || mode != daemon.TransportUDP || len(got) != 3 {
 		t.Errorf("private registry: (%q, %q, %v), probes %d — want udp without probing", mode, reason, err, len(got))
 	}
@@ -393,6 +400,48 @@ func TestAutoTransportFallsBackToCompatThroughProxy(t *testing.T) {
 		}
 	}
 	t.Logf("auto → compat → registry CONNECT in %s", time.Since(start))
+}
+
+// E2E product gap (wrong or stale proxy password, plain `pilotctl daemon
+// start` = -transport=auto): UDP gets no answer and the proxy answers the
+// compat check with 407. The daemon must not settle on udp and dial the
+// raw registry directly (bypass traffic a proxy-only sandbox kills): it
+// stays on compat, logs the proxy error at WARN with a hint, and keeps
+// dialing the registry through the proxy, naming the 407.
+func TestAutoTransportProxyRefusalStaysCompat(t *testing.T) {
+	proxy := newRefusingProxy(t, "muse", "right-pass")
+	proxy.rotate("muse", "right-pass") // anything else gets 407
+	targets, logs := runDaemon(t, proxy, daemonRun{
+		args: []string{
+			"--registry", defaultRegistryAddr,
+			"--beacon", silentUDP(t),
+			"-compat-beacon", defaultCompatBeacon,
+			"-transport=auto",
+			"-registry-fingerprint=" + strings.Repeat("00", 32),
+		},
+		env:   []string{"HTTPS_PROXY=" + fmt.Sprintf("http://muse:wrong-pass@%s", proxy.ln.Addr())},
+		await: "CONNECT registry.pilotprotocol.network:443",
+	})
+	if !strings.Contains(logs, `level=WARN msg="transport auto-selected" transport=compat`) {
+		t.Errorf("auto did not stay on compat with a WARN:\n%s", logs)
+	}
+	if !strings.Contains(logs, "407 Proxy Authentication Required") || !strings.Contains(logs, "proxy-cmd") {
+		t.Errorf("the 407 and its hint are not logged:\n%s", logs)
+	}
+	if !contains(targets, "CONNECT beacon.pilotprotocol.network:443") {
+		t.Errorf("compat check did not go through the proxy: %q", targets)
+	}
+	for _, target := range targets {
+		if strings.Contains(target, "34.71.57.205") {
+			t.Errorf("proxy was asked for the raw-TCP registry: %q", target)
+		}
+	}
+	if strings.Contains(logs, "34.71.57.205:9000") {
+		t.Errorf("the daemon dialed the raw registry directly:\n%s", logs)
+	}
+	if strings.Contains(logs, "wrong-pass") {
+		t.Errorf("daemon output leaks the proxy password:\n%s", logs)
+	}
 }
 
 // auto never moves a private deployment onto the public compat beacon.

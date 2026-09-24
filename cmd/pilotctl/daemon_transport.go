@@ -258,25 +258,35 @@ var (
 // It does not depend on the installer having saved proxy_cmd, so a node
 // installed by an older installer gets it too.
 func sandboxProxyCmdFor(bin string, plan daemonLaunchPlan, flags map[string]string) string {
-	if hostGOOS != "linux" || systemdRunning() {
+	if sandboxRefreshCmd() == "" {
 		return ""
 	}
 	if plan.Proxy != "" && plan.Proxy != proxyconf.Auto {
 		return ""
 	}
-	if !proxyHasCredentials(os.Getenv("HTTPS_PROXY")) && !proxyHasCredentials(os.Getenv("https_proxy")) {
-		return ""
-	}
-	if strings.TrimSpace(os.Getenv("PILOT_PROXY_CMD")) != "" {
+	if plan.ProxyCmd != "" || strings.TrimSpace(os.Getenv(proxyconf.EnvRefreshCommand)) != "" {
 		return ""
 	}
 	if configuredProxyCmd(loadConfig()) != "" || configuredProxyCmd(daemonConfigFile(flags)) != "" {
 		return ""
 	}
-	if !bashAvailable() {
+	if f := daemonFlags(bin); !f["proxy-cmd"] {
 		return ""
 	}
-	if f := daemonFlags(bin); !f["proxy-cmd"] {
+	return sandboxProxyCmd
+}
+
+// sandboxRefreshCmd is sandboxProxyCmd on a host that looks like a hosted
+// agent sandbox — Linux without systemd, $HTTPS_PROXY or $https_proxy
+// carrying credentials, bash installed — and "" anywhere else.
+func sandboxRefreshCmd() string {
+	if hostGOOS != "linux" || systemdRunning() {
+		return ""
+	}
+	if !proxyHasCredentials(os.Getenv("HTTPS_PROXY")) && !proxyHasCredentials(os.Getenv("https_proxy")) {
+		return ""
+	}
+	if !bashAvailable() {
 		return ""
 	}
 	return sandboxProxyCmd
@@ -512,7 +522,7 @@ var daemonLogTransportRe = regexp.MustCompile(`outbound network"?[ ,]+"?transpor
 // startup ("" if unknown) — the only place the outcome of -transport=auto
 // is visible to pilotctl.
 func transportFromDaemonLog(path string) string {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) // #nosec G304 G703 -- the per-PID daemon log daemon start itself created under the config dir
 	if err != nil {
 		return ""
 	}

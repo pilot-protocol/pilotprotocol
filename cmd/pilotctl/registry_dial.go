@@ -71,17 +71,7 @@ func (r registryRoute) proxyFor(target string) string {
 }
 
 func proxyFor(p *netproxy.Resolver, target string) string {
-	if !p.Enabled() {
-		return ""
-	}
-	if host, _, err := net.SplitHostPort(target); err == nil && proxyconf.IsLoopbackHost(host) {
-		return ""
-	}
-	u, err := p.ProxyForAddr(target)
-	if err != nil || u == nil {
-		return ""
-	}
-	return netproxy.Redact(u)
+	return proxyconf.ProxyFor(p, target)
 }
 
 // pilotctlProxySpec is the proxy setting for pilotctl's own connections:
@@ -94,6 +84,35 @@ func pilotctlProxySpec(cfg map[string]interface{}) string {
 		return s
 	}
 	return proxyconf.Auto
+}
+
+// pilotctlProxyCmd is the command whose output is the current proxy URL,
+// for pilotctl's own connections through a proxy that rotates its
+// credentials: $PILOT_PROXY_CMD, then config.json "proxy_cmd", then — in a
+// sandbox where `daemon start` hands the daemon one (see sandboxRefreshCmd)
+// — the same sandbox command. "" when none applies.
+func pilotctlProxyCmd(cfg map[string]interface{}) string {
+	if v := strings.TrimSpace(os.Getenv(proxyconf.EnvRefreshCommand)); v != "" {
+		return v
+	}
+	if v := configuredProxyCmd(cfg); v != "" {
+		return v
+	}
+	return sandboxRefreshCmd()
+}
+
+// proxyResolver builds the resolver for a normalized proxy setting. With a
+// refresh command (pilotctlProxyCmd) the command supplies the proxy URL —
+// run once now, and again when the proxy answers 407, after which the dial
+// is retried once (netproxy) — so a stale $HTTPS_PROXY in pilotctl's own
+// environment does not fail its registry commands. A failing command
+// leaves the environment's (or the explicit) proxy in use.
+func proxyResolver(spec, command string) (*netproxy.Resolver, error) {
+	var opts []netproxy.Option
+	if command != "" && spec != proxyconf.Off {
+		opts = append(opts, netproxy.WithRefreshCommand(command))
+	}
+	return proxyconf.Resolve(spec, opts...)
 }
 
 // configuredTransport is $PILOT_TRANSPORT, else config.json "transport",
@@ -193,7 +212,7 @@ func planRegistryRoutes(addr string) ([]registryRoute, error) {
 		transport = configuredTransport(cfg)
 	case proxyconf.Auto:
 		env, envErr := netproxy.FromEnvironment()
-		if envErr == nil && !env.Enabled() {
+		if envErr == nil && !env.Enabled() && pilotctlProxyCmd(cfg) == "" {
 			// No proxy in the environment: nothing to decide.
 			transport = configuredTransport(cfg)
 			break
@@ -207,6 +226,13 @@ func planRegistryRoutes(addr string) ([]registryRoute, error) {
 		}
 		if envErr != nil {
 			return nil, envErr
+		}
+		if cmd := pilotctlProxyCmd(cfg); cmd != "" {
+			// The proxy's credentials rotate: take the current URL from
+			// the command (and again on a 407), not only the environment.
+			if env, envErr = proxyResolver(proxyconf.Auto, cmd); envErr != nil {
+				return nil, envErr
+			}
 		}
 		if transport == "compat" {
 			policy = env
@@ -227,7 +253,7 @@ func planRegistryRoutes(addr string) ([]registryRoute, error) {
 		raw.Probe = true
 		return []registryRoute{tlsRoute, raw}, nil
 	default:
-		explicit, err := proxyconf.Resolve(spec)
+		explicit, err := proxyResolver(spec, pilotctlProxyCmd(cfg))
 		if err != nil {
 			return nil, err
 		}
@@ -280,7 +306,7 @@ func probedDirectDial(ctx context.Context, network, addr string) (net.Conn, erro
 		return nil, err
 	}
 	if err := c.SetReadDeadline(time.Now().Add(guardProbeWait)); err != nil {
-		c.Close()
+		_ = c.Close()
 		return nil, err
 	}
 	var b [1]byte
@@ -288,12 +314,12 @@ func probedDirectDial(ctx context.Context, network, addr string) (net.Conn, erro
 	var ne net.Error
 	if n == 0 && errors.As(err, &ne) && ne.Timeout() {
 		if err := c.SetReadDeadline(time.Time{}); err != nil {
-			c.Close()
+			_ = c.Close()
 			return nil, err
 		}
 		return c, nil
 	}
-	c.Close()
+	_ = c.Close()
 	if n > 0 {
 		return nil, fmt.Errorf("%w at %s: it sent data before any request (a network guard?)", errNotRegistry, addr)
 	}
@@ -344,7 +370,7 @@ func dialRegistry(addr string) (*registry.Client, registryRoute, error) {
 // registryDialHint says what to check after a failed registry dial.
 func registryDialHint(route registryRoute) string {
 	if p := route.proxyFor(route.Addr); p != "" {
-		return fmt.Sprintf("the registry %s is reached through the proxy %s: check that it allows CONNECT to %s and that its credentials are right; if this host can reach the registry directly, set PILOT_PROXY=off (or pilotctl config --set proxy=off)",
+		return fmt.Sprintf("the registry %s is reached through the proxy %s: check that it allows CONNECT to %s and that its credentials are right (if they rotate, set PILOT_PROXY_CMD or pilotctl config --set proxy_cmd=<command printing the current proxy URL>); if this host can reach the registry directly, set PILOT_PROXY=off (or pilotctl config --set proxy=off)",
 			route.Addr, p, route.Addr)
 	}
 	if route.TLS {

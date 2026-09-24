@@ -45,15 +45,12 @@ func TestProxyCmdFollowsCredentialRotation(t *testing.T) {
 	})
 	d.stop()
 	logs := d.out.String()
-	if !strings.Contains(logs, "proxy rejected the credentials; retrying with refreshed ones") {
-		t.Errorf("no 407 retry logged:\n%s", logs)
-	}
 	for _, secret := range []string{"old-pass", "new-pass"} {
 		if strings.Contains(logs, secret) {
 			t.Errorf("daemon output leaks %q:\n%s", secret, logs)
 		}
 	}
-	if !strings.Contains(logs, "refreshed from the proxy command") {
+	if !strings.Contains(logs, "credentials refreshed by command") {
 		t.Errorf("startup line does not mention the proxy command:\n%s", logs)
 	}
 }
@@ -73,7 +70,7 @@ func TestProxyCmdFailureFallsBackToEnvironment(t *testing.T) {
 	if proxy.accepted("muse", "s3cret") == 0 {
 		t.Error("launch-environment proxy not used after the proxy command failed")
 	}
-	if !strings.Contains(logs, "-proxy-cmd failed; using the launch-time proxy") {
+	if !strings.Contains(logs, "-proxy-cmd failed; keeping the last good proxy URL") {
 		t.Errorf("proxy command failure not logged:\n%s", logs)
 	}
 }

@@ -5,11 +5,13 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"strings"
 
+	"github.com/pilot-protocol/common/netproxy"
 	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
 )
@@ -198,26 +200,37 @@ var autoProbe = daemon.SelectTransport
 // resolveAutoTransport decides -transport=auto (see daemon.SelectTransport)
 // for this configuration: compat is only considered when it would reach
 // the same network (autoCompatBlocker), and its beacon check runs through
-// the proxy compat mode would use (policyFor(compat): -proxy / -proxy-cmd,
-// auto = the environment's). The error is a malformed -proxy.
-func resolveAutoTransport(reg registrySettings, beacon string, beaconExplicit bool, compatBeacon string, compatBeaconExplicit bool, policyFor func(transport string) (*proxyconf.Policy, error)) (mode, reason string, err error) {
+// the proxy compat mode would use (proxyFor(compat): -proxy / -proxy-cmd,
+// auto = the environment's). proxyErr is the proxy error that kept auto on
+// compat (the proxy refused the check); err is a malformed -proxy.
+func resolveAutoTransport(reg registrySettings, beacon string, beaconExplicit bool, compatBeacon string, compatBeaconExplicit bool, proxyFor func(transport string) (*netproxy.Resolver, error)) (mode, reason string, proxyErr, err error) {
 	if why := autoCompatBlocker(reg, beacon, beaconExplicit, compatBeaconExplicit); why != "" {
-		return daemon.TransportUDP, why + "; auto stays on udp (pass -transport=compat to force compat)", nil
+		return daemon.TransportUDP, why + "; auto stays on udp (pass -transport=compat to force compat)", nil, nil
 	}
-	policy, err := policyFor(daemon.TransportCompat)
+	r, err := proxyFor(daemon.TransportCompat)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
-	if policy.Enabled() {
-		dial = policy.DialContext(nil)
+	if r.Enabled() {
+		dial = proxyconf.DialContext(r, nil)
 	}
-	mode, reason = autoProbe(context.Background(), daemon.AutoTransportProbe{
+	mode, reason, proxyErr = autoProbe(context.Background(), daemon.AutoTransportProbe{
 		BeaconAddr:      beacon,
 		CompatBeaconURL: compatBeacon,
 		Dial:            dial,
+		ProxyFor:        func(addr string) string { return proxyconf.ProxyFor(r, addr) },
 	})
-	return mode, reason, nil
+	return mode, reason, proxyErr, nil
+}
+
+// proxyErrorHint says what to check when the proxy failed the compat
+// check.
+func proxyErrorHint(err error) string {
+	if hint := daemon.ProxyRefusalHint(err); hint != "" {
+		return hint
+	}
+	return "the proxy could not be reached or its answer could not be read: check HTTPS_PROXY / -proxy, or pass -transport=udp to bypass it"
 }
 
 // transportDefaultEnv names the transport a daemon uses when neither
@@ -240,4 +253,13 @@ func defaultTransport() string {
 		return daemon.TransportUDP
 	}
 	return t
+}
+
+// fatalf logs the message at ERROR and exits 1. log.Fatalf goes through
+// slog's default logger at INFO, so a fatal proxy or registry error looked
+// like routine output to `pilotctl daemon start`, supervisors and log
+// filters.
+func fatalf(format string, args ...any) {
+	slog.Error(fmt.Sprintf(format, args...))
+	os.Exit(1)
 }

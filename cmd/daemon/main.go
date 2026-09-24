@@ -22,6 +22,7 @@ import (
 	"github.com/pilot-protocol/common/config"
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/logging"
+	"github.com/pilot-protocol/common/netproxy"
 	"github.com/pilot-protocol/pilotprotocol/internal/enterprisecontrol"
 	"github.com/pilot-protocol/pilotprotocol/internal/managedsdk/authority"
 	"github.com/pilot-protocol/pilotprotocol/internal/motd"
@@ -115,7 +116,7 @@ func main() {
 	// credentials.
 	transportMode := flag.String("transport", "", "tunnel transport: 'udp' (the default), 'compat' (registry over TLS and beacon over WSS, TCP 443 only, for UDP-blocked or proxy-only hosts) or 'auto' (udp when the beacon answers over UDP, otherwise compat when TCP 443 is reachable, through the proxy if there is one). Precedence: this flag, $PILOT_TRANSPORT, config.json \"transport\", udp.")
 	proxySpec := flag.String("proxy", "", "outbound proxy for registry, beacon and HTTP connections: 'auto' (the default: with compat, HTTPS_PROXY/ALL_PROXY from the environment, honoring NO_PROXY; nothing with udp), 'off' (also none, no, false, direct), or an http:// or https:// proxy URL, http://[user:pass@]host:port, used for every connection except loopback. Precedence: this flag, $PILOT_PROXY, config.json \"proxy\", auto.")
-	proxyCmd := flag.String("proxy-cmd", "", "command (run with /bin/sh -c) whose output is the current proxy URL, for egress proxies that rotate their credentials: it supplies the URL -proxy would use (the explicit URL, or with auto the environment's proxy) and is re-run every 60s and whenever the proxy answers 407, so new connections always carry fresh credentials. Example: bash -c 'printf %s \"$https_proxy\"'. Precedence: this flag, $PILOT_PROXY_CMD, config.json \"proxy_cmd\".")
+	proxyCmd := flag.String("proxy-cmd", "", "command (run with sh -c) whose output is the current proxy URL, for egress proxies that rotate their credentials: it supplies the URL -proxy would use (the explicit URL, or with auto and compat the environment's proxy) and is re-run once 60s have passed and whenever the proxy answers 407, after which that connection is retried once, so new connections always carry fresh credentials. Example: bash -c 'printf %s \"$https_proxy\"'. Precedence: this flag, $PILOT_PROXY_CMD, config.json \"proxy_cmd\".")
 	compatBeacon := flag.String("compat-beacon", defaultCompatBeacon, "beacon WSS URL for -transport=compat")
 	tlsTrust := flag.String("tls-trust", "system", "TLS trust store for -transport=compat: 'system' (OS trust store; current default while compat mode uses Let's Encrypt certs on beacon.pilotprotocol.network — on a host without a CA bundle set SSL_CERT_FILE or SSL_CERT_DIR) or 'pinned' (Pilot CA root embedded in the daemon binary; will become the default in a future release once production root ships)")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -204,7 +205,7 @@ func main() {
 		transport, err = daemon.NormalizeTransport(configTransport)
 	}
 	if err != nil {
-		log.Fatalf("-transport: %v", err)
+		fatalf("-transport: %v", err)
 	}
 	if transport == "" {
 		// Nothing chosen: $PILOT_TRANSPORT_DEFAULT (auto in the service
@@ -215,21 +216,21 @@ func main() {
 		}
 	}
 	if _, err := proxyconf.Normalize(*proxySpec); err != nil {
-		log.Fatalf("-proxy: %v", err)
+		fatalf("-proxy: %v", err)
 	}
-	// The proxy policy depends on the transport only; each is resolved
+	// The proxy resolver depends on the transport only; each is resolved
 	// once (running -proxy-cmd once) and shared by the auto probe and the
-	// daemon.
-	proxyPolicies := map[string]*proxyconf.Policy{}
-	policyFor := func(transport string) (*proxyconf.Policy, error) {
-		if p, ok := proxyPolicies[transport]; ok {
-			return p, nil
+	// daemon, so the credentials it refreshes stay in one place.
+	proxyResolvers := map[string]*netproxy.Resolver{}
+	proxyFor := func(transport string) (*netproxy.Resolver, error) {
+		if r, ok := proxyResolvers[transport]; ok {
+			return r, nil
 		}
-		p, err := resolveProxyPolicy(*proxySpec, *proxyCmd, transport)
+		r, err := resolveProxy(*proxySpec, *proxyCmd, transport)
 		if err == nil {
-			proxyPolicies[transport] = p
+			proxyResolvers[transport] = r
 		}
-		return p, err
+		return r, err
 	}
 
 	reg := registrySettings{
@@ -244,23 +245,28 @@ func main() {
 
 	// -transport=auto: probe once, before anything depends on the mode.
 	if transport == daemon.TransportAuto {
-		mode, reason, err := resolveAutoTransport(reg, *beaconAddr, sources.explicit("beacon") || beaconFromEnv,
-			*compatBeacon, sources.explicit("compat-beacon"), policyFor)
+		mode, reason, proxyErr, err := resolveAutoTransport(reg, *beaconAddr, sources.explicit("beacon") || beaconFromEnv,
+			*compatBeacon, sources.explicit("compat-beacon"), proxyFor)
 		if err != nil {
-			log.Fatalf("-proxy: %v", err)
+			fatalf("-proxy: %v", err)
 		}
-		slog.Info("transport auto-selected", "transport", mode, "reason", reason)
+		if proxyErr != nil {
+			slog.Warn("transport auto-selected", "transport", mode, "reason", reason,
+				"hint", proxyErrorHint(proxyErr))
+		} else {
+			slog.Info("transport auto-selected", "transport", mode, "reason", reason)
+		}
 		transport = mode
 	}
 	*transportMode = transport
 
 	// Outbound proxy: resolved once, after -transport is final, and shared
 	// by everything that dials out — the registry client, the compat WSS
-	// beacon, pkg/daemon's own HTTP fetches (via daemon.Config.ProxyPolicy)
-	// and every plugin HTTP client (via http.DefaultTransport).
-	proxyPolicy, err := policyFor(transport)
+	// beacon, pkg/daemon's own HTTP fetches (via daemon.Config.Proxy) and
+	// every plugin HTTP client (via http.DefaultTransport).
+	proxyResolver, err := proxyFor(transport)
 	if err != nil {
-		log.Fatalf("-proxy: %v", err)
+		fatalf("-proxy: %v", err)
 	}
 
 	// Registry defaults for the transport and proxy (see
@@ -271,7 +277,7 @@ func main() {
 	// -registry-tls=false (the TCP/9000 fallback), is kept. -beacon needs
 	// no such rule: in compat mode the UDP beacon address is only the
 	// relay-wrap destination on the WSS pipe and is never dialed.
-	final := applyRegistryDefaults(transport, reg, proxyPolicy.Proxies)
+	final := applyRegistryDefaults(transport, reg, func(addr string) bool { return proxyconf.Proxies(proxyResolver, addr) })
 	if final.Addr != reg.Addr {
 		registryFromEnv = false
 	}
@@ -307,8 +313,8 @@ func main() {
 	*noSkillinject = profileOptions.DisableSkillinject
 	*motdFeedURL = profileOptions.MOTDFeedURL
 
-	installDefaultTransportProxy(proxyPolicy)
-	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyPolicy),
+	installDefaultTransportProxy(proxyResolver)
+	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyResolver),
 		"transport_from", transportSrc, "registry", *registryAddr, "registry_tls", *registryTLS)
 
 	// Sandbox: validate all configured file paths are under the confinement
@@ -404,7 +410,7 @@ func main() {
 		TransportMode:         *transportMode,
 		CompatBeaconURL:       *compatBeacon,
 		CompatTLSTrust:        *tlsTrust,
-		ProxyPolicy:           proxyPolicy,
+		Proxy:                 proxyResolver,
 		MOTDFeedURL:           *motdFeedURL,
 		MOTDInterval:          *motdInterval,
 		TelemetryURL:          *telemetryURL,
@@ -604,7 +610,7 @@ func main() {
 	applyNodeIDWhitelist("rekey", *rekeyWhitelist, "PILOT_REKEY_WHITELIST", d.SetRekeyWhitelist, d.SetRekeyWhitelistMatchAll)
 
 	if err := d.Start(); err != nil {
-		log.Fatalf("daemon start: %v", err)
+		fatalf("daemon start: %v", err)
 	}
 
 	rolloutRefreshCtx, rolloutRefreshCancel := context.WithCancel(context.Background())

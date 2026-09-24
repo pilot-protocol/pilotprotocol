@@ -1171,9 +1171,10 @@ func (tm *TunnelManager) Listen(addr string) error {
 type ConnectCompatConfig struct {
 	BeaconURL string
 	TLSConfig *tls.Config
-	// DialContext opens the TCP connection for the WSS dial (see
-	// wss.Config.DialContext), e.g. through the proxy policy. nil dials
-	// the beacon directly.
+	// DialContext opens the TCP connection for the WSS dial and every
+	// reconnect (see wss.Config.DialContext), e.g. through the proxy
+	// resolver, which refreshes rotated credentials on a 407 and retries.
+	// nil dials the beacon directly.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	Identity    *crypto.Identity
 	NodeID      uint32

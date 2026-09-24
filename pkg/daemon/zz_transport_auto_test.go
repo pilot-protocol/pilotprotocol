@@ -16,6 +16,7 @@ import (
 
 	"github.com/pilot-protocol/common/netproxy"
 	"github.com/pilot-protocol/common/protocol"
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 )
 
 // udpBeacon answers BeaconMsgDiscover like a real beacon when answer is
@@ -88,7 +89,7 @@ func TestSelectTransportUDPWorks(t *testing.T) {
 	beacon := udpBeacon(t, true)
 	dialed := false
 	start := time.Now()
-	mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+	mode, reason, _ := SelectTransport(context.Background(), AutoTransportProbe{
 		BeaconAddr:      beacon,
 		CompatBeaconURL: "wss://beacon.pilot.invalid/v1/compat",
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -114,7 +115,7 @@ func TestSelectTransportUDPBlockedFallsBackToCompat(t *testing.T) {
 	beacon := udpBeacon(t, false)
 	compat := compatBeaconStub(t, http.StatusUpgradeRequired)
 	start := time.Now()
-	mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+	mode, reason, _ := SelectTransport(context.Background(), AutoTransportProbe{
 		BeaconAddr:      beacon,
 		CompatBeaconURL: "wss://" + compat + "/v1/compat",
 		UDPTimeout:      300 * time.Millisecond,
@@ -142,7 +143,7 @@ func TestSelectTransportNothingReachableStaysUDP(t *testing.T) {
 	}
 	refused := ln.Addr().String()
 	ln.Close()
-	mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+	mode, reason, _ := SelectTransport(context.Background(), AutoTransportProbe{
 		BeaconAddr:      beacon,
 		CompatBeaconURL: "wss://" + refused + "/v1/compat",
 		UDPTimeout:      200 * time.Millisecond,
@@ -156,7 +157,7 @@ func TestSelectTransportNothingReachableStaysUDP(t *testing.T) {
 		{beacon, ""},
 		{beacon, "ftp://beacon.pilot.invalid"},
 	} {
-		if mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+		if mode, reason, _ := SelectTransport(context.Background(), AutoTransportProbe{
 			BeaconAddr: tc.beacon, CompatBeaconURL: tc.compat, UDPTimeout: 100 * time.Millisecond,
 		}); mode != TransportUDP {
 			t.Errorf("SelectTransport(%q, %q) = %q (%s), want udp", tc.beacon, tc.compat, mode, reason)
@@ -176,7 +177,7 @@ func TestSelectTransportFrontUpBeaconDownStaysUDP(t *testing.T) {
 		"TLS front, 502":       compatBeaconStub(t, http.StatusBadGateway),
 		"TLS front, 503":       compatBeaconStub(t, http.StatusServiceUnavailable),
 	} {
-		mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+		mode, reason, _ := SelectTransport(context.Background(), AutoTransportProbe{
 			BeaconAddr:      beacon,
 			CompatBeaconURL: "wss://" + compat + "/v1/compat",
 			UDPTimeout:      100 * time.Millisecond,
@@ -201,7 +202,7 @@ func TestSelectTransportCompatCheckUsesProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := New(Config{Proxy: policy})
-	mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+	mode, reason, _ := SelectTransport(context.Background(), AutoTransportProbe{
 		BeaconAddr:      beacon,
 		CompatBeaconURL: "wss://beacon.pilot.invalid:" + port + "/v1/compat",
 		Dial:            d.proxyDialer(),
@@ -212,6 +213,101 @@ func TestSelectTransportCompatCheckUsesProxy(t *testing.T) {
 	}
 	if got := proxy.counts()["beacon.pilot.invalid:"+port]; got != 1 {
 		t.Fatalf("proxy CONNECTs = %v, want one for beacon.pilot.invalid:%s", proxy.counts(), port)
+	}
+}
+
+// E2E product gap (Muse, wrong or stale proxy password): UDP gets no
+// answer and the proxy refuses the compat check. auto must not settle on
+// udp — a udp daemon dials the raw registry directly, past the proxy,
+// which a proxy-only sandbox kills — but stay on compat, report the proxy
+// error, and let the registry dial (with refreshed credentials) fail or
+// recover through the proxy.
+func TestSelectTransportProxyRefusalStaysCompat(t *testing.T) {
+	clearProxyEnv(t)
+	beacon := udpBeacon(t, false)
+	target := compatBeaconStub(t, http.StatusUpgradeRequired)
+	_, port, _ := net.SplitHostPort(target)
+	compatURL := "wss://beacon.pilot.invalid:" + port + "/v1/compat"
+
+	proxy := newProxyTestConnect(t, "muse", "right")
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadProxy := "http://muse:s3cret@" + closed.Addr().String()
+	closed.Close()
+
+	for _, tc := range []struct {
+		name, proxyURL, compatURL string
+		wantStatus                int // 0: not a ConnectError
+	}{
+		{"407 wrong password", proxy.url("muse", "s3cret"), compatURL, http.StatusProxyAuthRequired},
+		{"403 forbidden target", proxy.url("muse", "right"), "wss://beacon.example.test:" + port + "/v1/compat", http.StatusForbidden},
+		{"proxy unreachable", deadProxy, compatURL, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := ResolveProxy(tc.proxyURL, TransportCompat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := New(Config{Proxy: r})
+			mode, reason, proxyErr := SelectTransport(context.Background(), AutoTransportProbe{
+				BeaconAddr:      beacon,
+				CompatBeaconURL: tc.compatURL,
+				Dial:            d.proxyDialer(),
+				ProxyFor:        func(addr string) string { return proxyconf.ProxyFor(r, addr) },
+				UDPTimeout:      200 * time.Millisecond,
+				TCPTimeout:      3 * time.Second,
+			})
+			if mode != TransportCompat || proxyErr == nil {
+				t.Fatalf("SelectTransport = (%q, %q, %v), want compat with the proxy error", mode, reason, proxyErr)
+			}
+			if strings.Contains(reason, "s3cret") || strings.Contains(proxyErr.Error(), "s3cret") {
+				t.Fatalf("reason or error leaks the proxy password: %q / %v", reason, proxyErr)
+			}
+			if !strings.Contains(reason, "***@") {
+				t.Errorf("reason %q does not name the (redacted) proxy", reason)
+			}
+			var ce *netproxy.ConnectError
+			if tc.wantStatus != 0 {
+				if !errors.As(proxyErr, &ce) || ce.StatusCode != tc.wantStatus {
+					t.Fatalf("proxyErr = %v, want a %d ConnectError", proxyErr, tc.wantStatus)
+				}
+				if hint := ProxyRefusalHint(proxyErr); hint == "" {
+					t.Errorf("no hint for %v", proxyErr)
+				}
+			}
+		})
+	}
+
+	// Without a proxy the same failure (nothing reachable) stays on udp,
+	// as before.
+	mode, reason, proxyErr := SelectTransport(context.Background(), AutoTransportProbe{
+		BeaconAddr:      beacon,
+		CompatBeaconURL: "wss://" + closed.Addr().String() + "/v1/compat",
+		UDPTimeout:      100 * time.Millisecond,
+		TCPTimeout:      time.Second,
+	})
+	if mode != TransportUDP || proxyErr != nil {
+		t.Fatalf("direct, nothing reachable = (%q, %q, %v), want udp", mode, reason, proxyErr)
+	}
+
+	// A proxy that tunnels fine to a front whose beacon is down is not a
+	// proxy error: udp, as before.
+	front := compatBeaconStub(t, http.StatusBadGateway)
+	_, frontPort, _ := net.SplitHostPort(front)
+	r, _ := ResolveProxy(proxy.url("muse", "right"), TransportCompat)
+	d := New(Config{Proxy: r})
+	mode, reason, proxyErr = SelectTransport(context.Background(), AutoTransportProbe{
+		BeaconAddr:      beacon,
+		CompatBeaconURL: "wss://beacon.pilot.invalid:" + frontPort + "/v1/compat",
+		Dial:            d.proxyDialer(),
+		ProxyFor:        func(addr string) string { return proxyconf.ProxyFor(r, addr) },
+		UDPTimeout:      100 * time.Millisecond,
+		TCPTimeout:      3 * time.Second,
+	})
+	if mode != TransportUDP || proxyErr != nil {
+		t.Fatalf("proxied, beacon down = (%q, %q, %v), want udp", mode, reason, proxyErr)
 	}
 }
 
@@ -267,7 +363,7 @@ func TestExplicitProxyNeverTakesLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := New(Config{Proxy: policy})
-	pf := d.httpProxyFunc()
+	pf := proxyconf.RequestProxy(d.config.Proxy)
 	for _, target := range []string{"http://127.0.0.1:8080/hook", "http://localhost:5002/analyze"} {
 		u, err := pf(&http.Request{URL: mustURL(t, target)})
 		if err != nil || u != nil {

@@ -612,32 +612,44 @@ func TestDialRegistryClientPinnedThroughExplicitProxy(t *testing.T) {
 	}
 }
 
-// Without a policy nothing changes: no dialer option, no HTTP proxy
-// override, and the MOTD client stays on http.DefaultTransport.
+// Without a proxy resolver nothing changes: no dialer option and the MOTD
+// client stays on http.DefaultTransport (net/http's own proxy environment
+// handling).
 func TestNoProxyPolicyKeepsHistoricalDialing(t *testing.T) {
-	t.Parallel()
+	t.Setenv("HTTPS_PROXY", "http://env-proxy.test:3128")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
 	d := New(Config{})
 	if opts := d.registryDialOptions(); opts != nil {
-		t.Fatalf("registryDialOptions without a policy = %d options, want none", len(opts))
-	}
-	if d.httpProxyFunc() != nil {
-		t.Fatal("httpProxyFunc without a policy is non-nil")
+		t.Fatalf("registryDialOptions without a proxy = %d options, want none", len(opts))
 	}
 	if c := d.newHTTPClient(time.Second); c.Transport != nil {
 		t.Fatalf("HTTP client transport = %T, want nil (http.DefaultTransport)", c.Transport)
 	}
 
+	// -proxy=off: no registry dialer, and daemon HTTP fetches stop
+	// following the proxy environment.
+	var sawProxy atomic.Bool
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawProxy.Store(true) // an HTTP request here means it went via the "proxy"
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(front.Close)
+	t.Setenv("HTTP_PROXY", front.URL)
+	t.Setenv("http_proxy", front.URL)
 	off := New(Config{Proxy: netproxy.Off()})
 	if opts := off.registryDialOptions(); opts != nil {
 		t.Fatal("-proxy=off still installs a registry dialer")
 	}
-	c := off.newHTTPClient(time.Second)
-	tr, ok := c.Transport.(*http.Transport)
-	if !ok || tr.Proxy == nil {
-		t.Fatalf("-proxy=off HTTP client transport = %T, want an *http.Transport with the policy's Proxy", c.Transport)
+	c := off.newHTTPClient(2 * time.Second)
+	if c.Transport == nil {
+		t.Fatal("-proxy=off HTTP client uses http.DefaultTransport, which follows the proxy environment")
 	}
-	u, err := tr.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "raw.githubusercontent.com"}})
-	if err != nil || u != nil {
-		t.Fatalf("-proxy=off HTTP proxy = (%v, %v), want direct", u, err)
+	resp, err := c.Get("http://unreachable.pilot.invalid/")
+	if err == nil {
+		resp.Body.Close()
+	}
+	if sawProxy.Load() {
+		t.Fatal("-proxy=off HTTP client went through the environment's proxy")
 	}
 }

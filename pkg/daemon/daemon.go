@@ -36,6 +36,7 @@ import (
 	registrywire "github.com/pilot-protocol/common/registry/wire"
 	"github.com/pilot-protocol/pilotprotocol/internal/account"
 	"github.com/pilot-protocol/pilotprotocol/internal/motd"
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/internal/transport/compat"
 	"github.com/pilot-protocol/pilotprotocol/internal/validate"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon/routing"
@@ -214,23 +215,19 @@ type Config struct {
 	// behind TLS-intercepting corp proxies).
 	CompatTLSTrust string
 
-	// Proxy is the outbound proxy policy, normally built by ResolveProxy
-	// from -proxy and the transport mode. When non-nil it governs every
-	// TCP/HTTP connection the daemon opens itself: the registry (primary,
-	// pool and every reconnect), the compat-mode WSS beacon and the MOTD
-	// fetch. Targets stay host names end to end — the proxy is asked to
-	// CONNECT by name and TLS runs through the tunnel to the real server.
-	// nil keeps the historical behaviour: registry and beacon are dialed
-	// directly and HTTP fetches follow net/http's proxy environment.
+	// Proxy is the outbound proxy, normally built by ResolveProxy from
+	// -proxy, -proxy-cmd and the transport mode. When non-nil it governs
+	// every TCP/HTTP connection the daemon opens itself: the registry
+	// (primary, pool and every reconnect), the compat-mode WSS beacon (and
+	// its reconnects) and the MOTD fetch. Targets stay host names end to
+	// end — the proxy is asked to CONNECT by name and TLS runs through the
+	// tunnel to the real server. A resolver built with
+	// netproxy.WithRefreshCommand follows rotating proxy credentials: every
+	// new connection uses its current settings, and a CONNECT the proxy
+	// answers with 407 refreshes them and is retried once. nil keeps the
+	// historical behaviour: registry and beacon are dialed directly and
+	// HTTP fetches follow net/http's proxy environment.
 	Proxy *netproxy.Resolver
-
-	// ProxyPolicy, when non-nil, replaces Proxy with a policy that can
-	// change while the daemon runs — NewCommandProxyPolicy re-reads the
-	// proxy URL from a command, for egress proxies that rotate their
-	// credentials. Start keeps it refreshed every ProxyRefreshInterval
-	// (0 = 60s) until Stop.
-	ProxyPolicy          *ProxyPolicy
-	ProxyRefreshInterval time.Duration
 
 	// systemRoots replaces the OS trust store behind the "system" trust
 	// settings (RegistryTrust, CompatTLSTrust). Test seam only: it is
@@ -887,31 +884,39 @@ func (d *Daemon) Start() error {
 			}
 		default:
 			// Compat would use the environment's proxy (-proxy=auto)
-			// unless the embedder set a policy; check reachability the
-			// same way.
-			policy := d.proxyPolicy()
-			if policy == nil {
+			// unless the embedder set one; check reachability the same
+			// way.
+			proxy := d.config.Proxy
+			if proxy == nil {
 				if p, err := ResolveProxy(proxyAutoSpec, TransportCompat); err == nil {
-					policy = StaticProxyPolicy(p)
+					proxy = p
 				} else {
 					slog.Warn("proxy environment unusable; compat check dials directly", "error", err)
 				}
 			}
-			mode, reason := SelectTransport(context.Background(), AutoTransportProbe{
+			mode, reason, proxyErr := SelectTransport(context.Background(), AutoTransportProbe{
 				BeaconAddr:      stunBeacon,
 				CompatBeaconURL: d.config.CompatBeaconURL,
-				Dial:            d.dialerFor(policy),
+				Dial:            d.dialerFor(proxy),
+				ProxyFor:        func(addr string) string { return proxyconf.ProxyFor(proxy, addr) },
 			})
 			if mode == TransportCompat {
 				d.config.TransportMode = TransportCompat
-				if d.config.ProxyPolicy == nil && d.config.Proxy == nil {
-					d.config.ProxyPolicy = policy
+				if d.config.Proxy == nil {
+					d.config.Proxy = proxy
 				}
-				slog.Warn("UDP probe to beacon failed — auto-falling back to compat mode (WSS/443)",
-					"beacon", stunBeacon,
-					"compat_beacon", d.config.CompatBeaconURL,
-					"reason", reason,
-					"hint", "set PILOT_TRANSPORT=udp to force UDP")
+				if proxyErr != nil {
+					slog.Warn("UDP probe to beacon failed and the proxy refused the compat check — staying on compat (WSS/443) so nothing bypasses the proxy",
+						"beacon", stunBeacon,
+						"compat_beacon", d.config.CompatBeaconURL,
+						"proxy_error", proxyErr)
+				} else {
+					slog.Warn("UDP probe to beacon failed — auto-falling back to compat mode (WSS/443)",
+						"beacon", stunBeacon,
+						"compat_beacon", d.config.CompatBeaconURL,
+						"reason", reason,
+						"hint", "set PILOT_TRANSPORT=udp to force UDP")
+				}
 			} else {
 				slog.Info("transport auto-selected", "transport", TransportUDP, "reason", reason)
 			}
@@ -933,11 +938,6 @@ func (d *Daemon) Start() error {
 	default:
 		return fmt.Errorf("invalid -transport %q: must be 'udp' or 'compat'", d.config.TransportMode)
 	}
-
-	// A command-backed proxy policy (rotating proxy credentials) stays
-	// current for the daemon's lifetime: registry redials, WSS reconnects
-	// and HTTP fetches always see the latest proxy URL.
-	d.startProxyRefresh()
 
 	var registrationAddr string
 	if d.config.TransportMode == "compat" {
@@ -1129,6 +1129,9 @@ func (d *Daemon) Start() error {
 			NodeID:      d.nodeID,
 		}); cerr != nil {
 			if hint := tlsTrustHint(cerr, "beacon"); hint != "" && d.config.CompatTLSTrust == "system" {
+				return fmt.Errorf("compat connect: %w; %s", cerr, hint)
+			}
+			if hint := ProxyRefusalHint(cerr); hint != "" {
 				return fmt.Errorf("compat connect: %w; %s", cerr, hint)
 			}
 			return fmt.Errorf("compat connect: %w", cerr)
@@ -2321,6 +2324,9 @@ func (d *Daemon) dialRegistryClient() (*registry.Client, error) {
 		}
 		if attempt == maxRegistryDialAttempts {
 			if hint := tlsTrustHint(err, "registry"); hint != "" {
+				return nil, fmt.Errorf("registry dial (after %d attempts): %w; %s", attempt, err, hint)
+			}
+			if hint := ProxyRefusalHint(err); hint != "" {
 				return nil, fmt.Errorf("registry dial (after %d attempts): %w; %s", attempt, err, hint)
 			}
 			return nil, fmt.Errorf("registry dial (after %d attempts): %w", attempt, err)

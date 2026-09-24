@@ -40,54 +40,73 @@ var proxyEnvVars = []string{
 	"HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "REQUEST_METHOD",
 }
 
-func TestResolveProxyPolicy(t *testing.T) {
+func TestResolveProxy(t *testing.T) {
 	for _, k := range proxyEnvVars {
 		t.Setenv(k, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://muse:s3cret@egress.test:3128")
 
-	p, err := resolveProxyPolicy("auto", "", "udp")
-	if err != nil || p != nil {
-		t.Fatalf("auto/udp = (%v, %v), want (nil, nil)", p, err)
+	r, err := resolveProxy("auto", "", "udp")
+	if err != nil || r != nil {
+		t.Fatalf("auto/udp = (%v, %v), want (nil, nil)", r, err)
 	}
-	if got := describeProxy("auto", "udp", p); got != "none (-proxy=auto applies to -transport=compat only)" {
+	if got := describeProxy("auto", "udp", r); got != "none (-proxy=auto applies to -transport=compat only)" {
 		t.Errorf("describeProxy(auto/udp) = %q", got)
 	}
 
-	p, err = resolveProxyPolicy("auto", "", "compat")
-	if err != nil || p == nil || p.Mode() != netproxy.ModeAuto || !p.Enabled() {
-		t.Fatalf("auto/compat = (%v, %v), want an enabled auto policy", p, err)
+	r, err = resolveProxy("auto", "", "compat")
+	if err != nil || r == nil || r.Mode() != netproxy.ModeAuto || !r.Enabled() {
+		t.Fatalf("auto/compat = (%v, %v), want an enabled auto resolver", r, err)
 	}
-	if got := describeProxy("auto", "compat", p); got != "auto: http://***@egress.test:3128" {
+	if got := describeProxy("auto", "compat", r); got != "auto: http://***@egress.test:3128" {
 		t.Errorf("describeProxy(auto/compat) = %q", got)
 	}
 
-	p, err = resolveProxyPolicy("http://ops:hunter2@flag.test:8080", "", "udp")
-	if err != nil || p == nil || p.Mode() != netproxy.ModeExplicit {
-		t.Fatalf("explicit/udp = (%v, %v), want an explicit policy", p, err)
+	r, err = resolveProxy("http://ops:hunter2@flag.test:8080", "", "udp")
+	if err != nil || r == nil || r.Mode() != netproxy.ModeExplicit {
+		t.Fatalf("explicit/udp = (%v, %v), want an explicit resolver", r, err)
 	}
-	if got := describeProxy("http://ops:hunter2@flag.test:8080", "udp", p); got != "http://***@flag.test:8080" {
+	if got := describeProxy("http://ops:hunter2@flag.test:8080", "udp", r); got != "http://***@flag.test:8080" {
 		t.Errorf("describeProxy(explicit) = %q", got)
 	}
 
-	p, err = resolveProxyPolicy("off", "", "compat")
-	if err != nil || p == nil || p.Mode() != netproxy.ModeOff {
-		t.Fatalf("off/compat = (%v, %v), want an off policy", p, err)
+	r, err = resolveProxy("off", "", "compat")
+	if err != nil || r == nil || r.Mode() != netproxy.ModeOff {
+		t.Fatalf("off/compat = (%v, %v), want an off resolver", r, err)
+	}
+
+	// -proxy-cmd supplies the URL (netproxy.WithRefreshCommand) ...
+	r, err = resolveProxy("auto", "echo http://muse:cmdpw9@cmd.test:3128", "compat")
+	if err != nil || r == nil || r.Mode() != netproxy.ModeAuto {
+		t.Fatalf("auto+cmd/compat = (%v, %v)", r, err)
+	}
+	if u, _ := r.ProxyForAddr("registry.pilotprotocol.network:443"); u == nil || u.Host != "cmd.test:3128" {
+		t.Errorf("auto+cmd proxy = %v, want the command's cmd.test:3128", u)
+	}
+	if got := describeProxy("auto", "compat", r); strings.Contains(got, "cmdpw9") || !strings.Contains(got, "credentials refreshed by command") {
+		t.Errorf("describeProxy(auto+cmd) = %q", got)
+	}
+	// ... but not with -proxy=off, nor with auto on udp.
+	if r, err = resolveProxy("off", "echo http://muse:cmdpw9@cmd.test:3128", "compat"); err != nil || r.Mode() != netproxy.ModeOff {
+		t.Errorf("off+cmd = (%v, %v), want off", r, err)
+	}
+	if r, err = resolveProxy("auto", "echo http://muse:cmdpw9@cmd.test:3128", "udp"); err != nil || r != nil {
+		t.Errorf("auto+cmd/udp = (%v, %v), want no proxy", r, err)
 	}
 
 	// A malformed -proxy URL is fatal (operator typo) ...
-	if _, err := resolveProxyPolicy("ftp://ops:hunter2@flag.test", "", "compat"); err == nil {
+	if _, err := resolveProxy("ftp://ops:hunter2@flag.test", "", "compat"); err == nil {
 		t.Fatal("malformed -proxy URL accepted")
 	} else if strings.Contains(err.Error(), "hunter2") {
 		t.Fatalf("error leaks credentials: %v", err)
 	}
 	// ... but a malformed environment under auto only costs the proxy.
 	t.Setenv("HTTPS_PROXY", "ftp://muse:s3cret@egress.test")
-	p, err = resolveProxyPolicy("auto", "", "compat")
-	if err != nil || p != nil {
-		t.Fatalf("auto/compat with malformed env = (%v, %v), want (nil, nil)", p, err)
+	r, err = resolveProxy("auto", "", "compat")
+	if err != nil || r != nil {
+		t.Fatalf("auto/compat with malformed env = (%v, %v), want (nil, nil)", r, err)
 	}
-	if got := describeProxy("auto", "compat", p); got != "none" {
+	if got := describeProxy("auto", "compat", r); got != "none" {
 		t.Errorf("describeProxy(auto/compat, malformed env) = %q, want none", got)
 	}
 }

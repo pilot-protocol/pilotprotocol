@@ -17,6 +17,13 @@
 // Anything else — a bare word such as "proxy", a host:port without a
 // scheme, or another scheme — is rejected, so a typo can never turn into a
 // proxy host name. Errors and display strings never contain credentials.
+//
+// Rotating credentials are netproxy's business: a Resolver built with
+// netproxy.WithRefreshCommand (the -proxy-cmd / $PILOT_PROXY_CMD /
+// config.json proxy_cmd setting) re-reads the proxy URL every
+// netproxy.DefaultRefreshInterval and whenever a proxy answers 407, and
+// netproxy's Dialer and RefreshingTransport retry that connection once with
+// the new credentials. This package only adds the loopback rule on top.
 package proxyconf
 
 import (
@@ -37,6 +44,10 @@ const (
 	Auto = netproxy.ModeAuto
 	Off  = netproxy.ModeOff
 )
+
+// EnvRefreshCommand is the environment variable holding the proxy refresh
+// command (netproxy.EnvRefreshCommand, "PILOT_PROXY_CMD").
+const EnvRefreshCommand = netproxy.EnvRefreshCommand
 
 // offAliases are accepted, case-insensitively, as "off". "none" is what the
 // daemon's startup log prints when nothing is proxied, so operators copy it.
@@ -71,20 +82,16 @@ func Normalize(spec string) (string, error) {
 }
 
 // Resolve builds the resolver for a proxy setting (see Normalize): Auto
-// reads the environment now, Off never proxies, a URL proxies everything.
-// It applies no transport policy.
-func Resolve(spec string) (*netproxy.Resolver, error) {
+// reads the environment, Off never proxies, a URL proxies everything. It
+// applies no transport policy. opts are netproxy's (for example
+// netproxy.WithRefreshCommand for rotating credentials); they do not apply
+// to Off. With a refresh command, Resolve runs it once before returning.
+func Resolve(spec string, opts ...netproxy.Option) (*netproxy.Resolver, error) {
 	s, err := Normalize(spec)
 	if err != nil {
 		return nil, err
 	}
-	switch s {
-	case Auto:
-		return netproxy.FromEnvironment()
-	case Off:
-		return netproxy.Off(), nil
-	}
-	return netproxy.Explicit(s)
+	return netproxy.NewResolver(s, opts...)
 }
 
 // HasCredentials reports whether an explicit proxy setting carries userinfo.
@@ -136,23 +143,158 @@ func IsLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// RequestProxy returns an http.Transport.Proxy function that follows r but
-// never proxies loopback targets. nil for a nil resolver (net/http's own
-// environment handling then applies wherever the caller leaves Proxy
-// unset). It is Static(r).RequestProxy().
+// loopbackAddr reports whether addr ("host:port") is on this machine.
+func loopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	return err == nil && IsLoopbackHost(host)
+}
+
+// ProxyFor returns the proxy (redacted, for logs and hints) a TCP dial of
+// addr goes through, "" for a direct dial: loopback targets always, and
+// targets r does not proxy (nil r, Off, NO_PROXY under auto). It reads r's
+// current settings and never waits for a refresh.
+func ProxyFor(r *netproxy.Resolver, addr string) string {
+	if !r.Enabled() || loopbackAddr(addr) {
+		return ""
+	}
+	u, err := r.ProxyForAddr(addr)
+	if err != nil || u == nil {
+		return ""
+	}
+	return netproxy.Redact(u)
+}
+
+// Proxies reports whether a TCP dial of addr goes through a proxy (see
+// ProxyFor).
+func Proxies(r *netproxy.Resolver, addr string) bool {
+	return ProxyFor(r, addr) != ""
+}
+
+// RequestProxy returns an http.Transport.Proxy function that follows r
+// (its current, refreshed settings) but never proxies loopback targets.
+// nil for a nil resolver (net/http's own environment handling then applies
+// wherever the caller leaves Proxy unset).
 func RequestProxy(r *netproxy.Resolver) func(*http.Request) (*url.URL, error) {
-	return Static(r).RequestProxy()
+	if r == nil {
+		return nil
+	}
+	return func(req *http.Request) (*url.URL, error) {
+		if req == nil || req.URL == nil || IsLoopbackHost(req.URL.Hostname()) {
+			return nil, nil
+		}
+		return r.ProxyForRequest(req)
+	}
 }
 
 // DialContext returns a dial function that tunnels through the proxy r
 // picks for each target (CONNECT by host name, never resolved locally) and
-// dials loopback targets, and targets r does not proxy, directly.
-// proxyTLS configures the TLS session with an https:// proxy — never the
-// target's TLS, which the caller runs end to end over the returned conn;
-// nil verifies the proxy against the system roots. It is
-// Static(r).DialContext(proxyTLS).
+// dials loopback targets, and targets r does not proxy, directly. It is a
+// netproxy.Dialer: when the proxy rejects the credentials (407), r
+// refreshes (re-running its refresh command, if any) and the dial is
+// retried once when that produced different credentials. proxyTLS
+// configures the TLS session with an https:// proxy — never the target's
+// TLS, which the caller runs end to end over the returned conn; nil
+// verifies the proxy against the system roots.
 func DialContext(r *netproxy.Resolver, proxyTLS *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	return Static(r).DialContext(proxyTLS)
+	d := &netproxy.Dialer{Resolver: r, TLSConfig: proxyTLS}
+	var direct net.Dialer
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if loopbackAddr(addr) {
+			return direct.DialContext(ctx, network, addr)
+		}
+		return d.DialContext(ctx, network, addr)
+	}
+}
+
+// RoundTripper returns the transport for an HTTP client that follows r: a
+// netproxy.RefreshingTransport over a copy of base (http.DefaultTransport's
+// settings when nil), so new connections always carry r's current
+// credentials and a request whose CONNECT got 407 is retried once after
+// the refresh, plus the loopback rule: requests to this machine use a
+// direct copy of base. base's own Proxy and OnProxyConnectResponse are
+// replaced. A nil r returns base (nil: http.DefaultTransport).
+func RoundTripper(r *netproxy.Resolver, base *http.Transport) http.RoundTripper {
+	if r == nil {
+		if base == nil {
+			return http.DefaultTransport
+		}
+		return base
+	}
+	if base == nil {
+		if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+			base = dt
+		} else {
+			base = &http.Transport{}
+		}
+	}
+	// Drop what ConfigureTransport may have installed on base (the daemon
+	// configures http.DefaultTransport in place): RefreshingTransport sets
+	// its own Proxy, and a CONNECT hook that already turns a 407 into an
+	// error would hide the rejection from RefreshingTransport's retry.
+	base = base.Clone()
+	base.Proxy = nil
+	base.OnProxyConnectResponse = nil
+	direct := base.Clone()
+	return &loopbackSplit{direct: direct, proxied: netproxy.RefreshingTransport(base, r)}
+}
+
+// loopbackSplit sends loopback requests direct and everything else through
+// the refreshing proxy transport.
+type loopbackSplit struct {
+	direct  *http.Transport
+	proxied http.RoundTripper
+}
+
+func (t *loopbackSplit) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL != nil && IsLoopbackHost(req.URL.Hostname()) {
+		return t.direct.RoundTrip(req)
+	}
+	return t.proxied.RoundTrip(req)
+}
+
+// CloseIdleConnections closes both transports' idle connections.
+func (t *loopbackSplit) CloseIdleConnections() {
+	t.direct.CloseIdleConnections()
+	if c, ok := t.proxied.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
+// ConfigureTransport routes tr (in place) through r, for transports that
+// cannot be wrapped — http.DefaultTransport, which plugin HTTP clients use
+// or clone: tr.Proxy follows r's current settings (loopback always
+// direct), and a 407 answer to a CONNECT refreshes r before the request
+// fails, so the next request carries the new credentials. (Wrapped clients,
+// see RoundTripper, also retry the failed request.) Every refused CONNECT
+// fails with a *netproxy.ConnectError, whose message never quotes the
+// proxy's reason phrase. A nil r leaves tr alone.
+func ConfigureTransport(tr *http.Transport, r *netproxy.Resolver) {
+	if tr == nil || r == nil {
+		return
+	}
+	tr.Proxy = RequestProxy(r)
+	next := tr.OnProxyConnectResponse
+	tr.OnProxyConnectResponse = func(ctx context.Context, proxyURL *url.URL, connectReq *http.Request, res *http.Response) error {
+		if next != nil {
+			if err := next(ctx, proxyURL, connectReq, res); err != nil {
+				return err
+			}
+		}
+		if res.StatusCode == http.StatusOK {
+			return nil
+		}
+		if res.StatusCode == http.StatusProxyAuthRequired {
+			_ = r.Refresh(ctx) // failures keep the last good settings; netproxy reports them
+		}
+		return &netproxy.ConnectError{Target: connectReq.Host, StatusCode: res.StatusCode}
+	}
+}
+
+// AuthRejected reports whether err is a proxy's refusal of the credentials
+// (407 Proxy Authentication Required on CONNECT).
+func AuthRejected(err error) bool {
+	var ce *netproxy.ConnectError
+	return errors.As(err, &ce) && ce.StatusCode == http.StatusProxyAuthRequired
 }
 
 // unwrapNetproxy drops netproxy's "netproxy: " prefix for messages that

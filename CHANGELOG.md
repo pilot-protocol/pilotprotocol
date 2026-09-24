@@ -29,24 +29,37 @@ Detailed per-release notes are on the
   word is an error instead of a proxy host name. Proxy credentials never
   appear in logs, errors or `-help`.
 - **Rotating proxy credentials: `-proxy-cmd` / `$PILOT_PROXY_CMD` /
-  config.json `proxy_cmd`.** A command whose output is the current proxy URL
-  (e.g. `bash -c 'printf %s "$https_proxy"'`); the daemon re-runs it every
-  60s and whenever the proxy answers a CONNECT with 407, and retries that
-  connection once with the new credentials. Registry redials, WSS beacon
-  reconnects and every HTTP client (plugins included) follow it, so a sandbox
-  that rotates its proxy credentials every few minutes (Meta Muse) no longer
+  config.json `proxy_cmd`** (`pilotctl daemon start --proxy-cmd`, passed as
+  `$PILOT_PROXY_CMD`, never on argv). A command whose output is the current
+  proxy URL (e.g. `bash -c 'printf %s "$https_proxy"'`). It is common
+  v0.5.15's netproxy refresh (`netproxy.WithRefreshCommand`): the command
+  runs at startup, again once 60s have passed, and whenever the proxy answers
+  a CONNECT with 407, after which that connection is retried once with the
+  new credentials (`netproxy.Dialer` for the registry — primary, pool and
+  every redial — and the compat WSS beacon and its reconnects;
+  `netproxy.RefreshingTransport` for the daemon's own HTTP clients; plugin
+  clients on `http.DefaultTransport` pick up the new credentials on their
+  next request). Tunnels already open are never touched. A sandbox that
+  rotates its proxy credentials every few minutes (Meta Muse) no longer
   leaves a node "online with all apps broken" until a restart. In a Linux
   container/VM without systemd whose `HTTPS_PROXY` carries credentials,
   `pilotctl daemon start` hands the daemon `PILOT_PROXY_CMD=bash -c 'printf
   %s "${https_proxy:-$HTTPS_PROXY}"'` itself when no `proxy_cmd` is
   configured (so a node set up by any installer gets it), and the installer
-  saves the same command. The command's output is never logged.
+  saves the same command; pilotctl's own registry commands use the same
+  command. The command's output is never logged, and a failing command keeps
+  the last good proxy URL (at first, the launch environment's).
 - **`-transport=auto`.** UDP when the beacon answers a UDP discover (one round
   trip), otherwise compat when the compat beacon itself answers over TCP 443
   (through the proxy, if any: a TLS GET of the beacon path must return `426
   Upgrade Required` — a front that accepts TCP while the beacon is down does
-  not count), otherwise udp as before; the decision is logged once
-  (`transport auto-selected`). It never moves a node with a private registry
+  not count), otherwise compat too when a proxy is configured and it refuses
+  the check (407 wrong or stale credentials, 403, a garbled answer, or the
+  proxy cannot be reached) — udp would dial the registry directly, past the
+  proxy, which proxy-only sandboxes kill; compat keeps every connection on
+  the proxy, refreshes the credentials on a 407 and fails naming the proxy's
+  answer — otherwise udp as before; the decision is logged once
+  (`transport auto-selected`, at WARN with a hint when the proxy refused). It never moves a node with a private registry
   or beacon onto the public compat beacon. pilot-daemon's own default stays
   `udp` (or `$PILOT_TRANSPORT_DEFAULT`, which applies only when nothing else
   chooses); `pilotctl daemon start` asks for `auto` whenever no transport is
@@ -87,6 +100,15 @@ Detailed per-release notes are on the
   direct connection whose peer talks or hangs up before the first request (a
   sandbox's network guard) is not used, so the proxy's error is reported
   instead of a broken pipe. `proxy=off` restores direct dials.
+- **`pilotctl daemon start` says why a start failed.** It notices a daemon
+  that exits during startup at once instead of polling its socket until the
+  deadline, and both then and on a timeout it prints the daemon's last error
+  and its last proxy error from the log (for example `last proxy error: proxy
+  CONNECT registry.pilotprotocol.network:443: 407 Proxy Authentication
+  Required`), with a hint for it (wrong or rotated credentials → `proxy_cmd`),
+  instead of only "did not become ready". pilot-daemon logs its fatal
+  startup errors at ERROR (they came out at INFO), and a registry or compat
+  beacon dial the proxy refused ends with a hint naming the fix.
 - **`daemon start` forwards the proxy/TLS environment** (`HTTPS_PROXY`,
   `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` in both cases, `PILOT_PROXY`,
   `PILOT_TRANSPORT`, `PILOT_REGISTRY_TRUST`, `PILOT_REGISTRY_FINGERPRINT`,
