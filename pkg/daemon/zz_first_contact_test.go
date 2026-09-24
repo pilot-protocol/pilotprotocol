@@ -62,6 +62,14 @@ func newKXProxy(t *testing.T, service *net.UDPAddr) *kxProxy {
 
 func (p *kxProxy) addr() *net.UDPAddr { return p.conn.LocalAddr().(*net.UDPAddr) }
 
+// setDropFirstPILA arms dropping the service's next PILA. The run
+// goroutine reads the flag under mu, so tests must set it through here.
+func (p *kxProxy) setDropFirstPILA(v bool) {
+	p.mu.Lock()
+	p.dropFirstPILA = v
+	p.mu.Unlock()
+}
+
 func (p *kxProxy) run() {
 	buf := make([]byte, 65535)
 	for {
@@ -144,7 +152,7 @@ func TestFirstContactLostKeyReplyRecoversWithKeyRequest(t *testing.T) {
 	const clientID, serviceID = uint32(0x0C01), uint32(0x0C02)
 	client, service, proxy := newFirstContactPair(t, Config{}, Config{Public: true}, clientID, serviceID)
 	a, b := client.tunnels, service.tunnels
-	proxy.dropFirstPILA = true
+	proxy.setDropFirstPILA(true)
 
 	a.AddPeer(serviceID, proxy.addr())
 	waitUntil(t, "service installs our key", func() bool { return b.HasCrypto(clientID) })
