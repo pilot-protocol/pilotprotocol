@@ -204,6 +204,13 @@ type TunnelManager struct {
 	// for key exchange. Exposed so operators can tell a congested overlay
 	// apart from a silent crypto stall.
 	PendingDrops uint64
+
+	// keyViaRelay records, per peer, whether the installed session key
+	// arrived in a relay-delivered key exchange (nodeID -> bool). With no
+	// direct decrypt since (routing.LastDirectRecv), the relay is the
+	// only path this peer has proven, so a dial starts there instead of
+	// spending its direct retries on an address that never answered.
+	keyViaRelay sync.Map
 }
 
 type IncomingPacket struct {
@@ -628,6 +635,12 @@ func (tm *TunnelManager) maybeRequestRekey(peerNodeID uint32, from *net.UDPAddr)
 		}
 	}
 
+	// The peer is sending us encrypted frames, so it holds a session for
+	// us. If we hold none, a same-key PILA alone is answered as a
+	// keepalive and never repairs that; ask for the peer's key as well.
+	if !tm.envelope.Has(peerNodeID) {
+		tm.kx.MarkKeyRequestDue(peerNodeID)
+	}
 	tm.sendKeyExchangeToNode(peerNodeID)
 	return true
 }
@@ -1454,6 +1467,9 @@ func (tm *TunnelManager) onKeyInstalled(ev keyexchange.PostInstallEvent) {
 	// and the per-peer 1s reply cooldown holds the ping-pong back but
 	// never lets the staleness flag clear.
 	tm.recordInboundDecrypt(peerNodeID)
+	if !ev.HadCrypto || ev.KeyChanged {
+		tm.keyViaRelay.Store(peerNodeID, fromRelay)
+	}
 
 	tm.mu.Lock()
 	if !fromRelay {
@@ -1750,7 +1766,7 @@ func (tm *TunnelManager) deriveSecret(peerPubKeyBytes []byte) (*peerCrypto, erro
 // keyexchange.Manager.SendKeyExchangeToNode (which carries the
 // BOOTSTRAP-EXCEPTION marker — moved with the function).
 func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32) {
-	tm.kx.SendKeyExchangeToNode(peerNodeID)
+	keyRequest := tm.kx.SendKeyExchangeToNode(peerNodeID)
 
 	// Dual-NAT convergence fix: when a peer is not (yet) relay-flagged but
 	// a beacon is available, ALSO push the key-exchange via relay. For two
@@ -1777,6 +1793,15 @@ func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32) {
 	}
 	if err := tm.routing.SendRelayFrame(peerNodeID, frame); err != nil {
 		slog.Debug("kx relay-copy send failed", "peer_node_id", peerNodeID, "error", err)
+	}
+	// The key request (see keyexchange.KeyRequestAfterSends) gets the same
+	// relay copy: the peer answers on whichever path it recorded for us.
+	if keyRequest {
+		if req := tm.kx.BuildUnauthFrame(); req != nil {
+			if err := tm.routing.SendRelayFrame(peerNodeID, req); err != nil {
+				slog.Debug("key request relay-copy send failed", "peer_node_id", peerNodeID, "error", err)
+			}
+		}
 	}
 }
 
@@ -2179,6 +2204,20 @@ func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 
 	// L5-owned per-peer state (peerPubKeys, pendingRekey, lastInboundDecrypt).
 	tm.kx.RemovePeer(nodeID)
+	tm.keyViaRelay.Delete(nodeID)
+}
+
+// KeyArrivedViaRelayOnly reports whether the peer's session key was
+// installed from a relay-delivered key exchange and nothing has been
+// decrypted from the peer's direct path since: the relay is the only
+// path the peer has proven to work.
+func (tm *TunnelManager) KeyArrivedViaRelayOnly(nodeID uint32) bool {
+	v, ok := tm.keyViaRelay.Load(nodeID)
+	if !ok {
+		return false
+	}
+	viaRelay, _ := v.(bool)
+	return viaRelay && tm.routing.LastDirectRecv(nodeID).IsZero()
 }
 
 // HasPeer checks if we have a tunnel to a node.

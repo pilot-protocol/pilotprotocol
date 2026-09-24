@@ -1108,6 +1108,20 @@ func (s *IPCServer) handleBroadcast(conn *ipcConn, reqID uint64, payload []byte)
 	}
 }
 
+// daemonFeatures lists behaviours a client can rely on from this daemon,
+// reported in the info reply so a newer pilotctl can adapt to an older
+// daemon (and the reverse) without comparing version strings:
+//
+//   - reply_window: a private node admits a dial-back reply (SYN to port
+//     1001 or 444) from a peer it contacted in the last few minutes, so
+//     request/reply no longer needs a trust handshake first.
+//   - dial_awaits_key: a dial to a peer with no session key yet waits for
+//     the key exchange before spending its SYN retries, and reports
+//     "key exchange with peer did not complete" when it never finishes.
+//   - key_request: an unanswered first-contact key exchange also sends a
+//     key request that every released daemon answers.
+var daemonFeatures = []string{"reply_window", "dial_awaits_key", "key_request"}
+
 func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 	info := s.daemon.Info()
 
@@ -1186,6 +1200,7 @@ func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 		"relay_peer_count":          info.RelayPeerCount,
 		"beacon_addr":               info.BeaconAddr,
 		"motd":                      info.MOTD,
+		"features":                  daemonFeatures,
 	})
 	if err != nil {
 		s.sendError(conn, reqID, fmt.Sprintf("info marshal: %v", err))

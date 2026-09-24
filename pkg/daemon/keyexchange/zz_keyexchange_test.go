@@ -512,13 +512,20 @@ func TestRekeyRetransmitRetransmits(t *testing.T) {
 	t.Parallel()
 
 	p := newPeer(t, 7)
-	var sends atomic.Int32
+	var sends, keyRequests atomic.Int32
 	p.mgr.SetSender(func(peer uint32, _ *net.UDPAddr, frame []byte) error {
 		if peer != 50 {
 			t.Errorf("retransmit dest: got %d want 50", peer)
 		}
 		if len(frame) == 0 {
 			t.Errorf("retransmit frame is empty")
+		}
+		// No session key is installed for peer 50, so the retransmit
+		// also carries a key request (PILK) next to the PILA; count the
+		// PILA retransmits on their own.
+		if bytes.Equal(frame[0:4], protocol.TunnelMagicKeyEx[:]) {
+			keyRequests.Add(1)
+			return nil
 		}
 		sends.Add(1)
 		return nil
@@ -535,6 +542,9 @@ func TestRekeyRetransmitRetransmits(t *testing.T) {
 
 	if got := sends.Load(); got != 1 {
 		t.Fatalf("retransmit send count: got %d want 1", got)
+	}
+	if got := keyRequests.Load(); got != 1 {
+		t.Fatalf("key requests with the retransmit: got %d want 1", got)
 	}
 	if attempts := p.mgr.PendingRekeyAttempts(50); attempts != 3 {
 		t.Fatalf("after retransmit Attempts=%d want 3", attempts)

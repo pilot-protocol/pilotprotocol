@@ -262,6 +262,16 @@ const (
 	MaxRetxAttempts      = 8                      // abandon connection after this many retransmissions
 	HeartbeatReregThresh = 3                      // heartbeat failures before re-registration
 	SYNBucketAge         = 10 * time.Second       // stale per-source SYN bucket reap threshold
+	// DialKeyExchangeWait bounds how long a dial to a peer we hold no
+	// session key for waits for the first-contact key exchange before it
+	// starts spending its SYN retry budget. Until the key is installed the
+	// SYN sits in the tunnel's pending queue (flushed the moment the key
+	// arrives), so retransmitting it only queued duplicates and burned
+	// retries: a key exchange that took 5-20 s against a busy service left
+	// the SYN phase too little time for the SYN-ACK. The wait plus the
+	// full retry budget (17.25 s) stays under the SDK's 30 s dial timeout
+	// for a normally reachable registry.
+	DialKeyExchangeWait = 10 * time.Second
 )
 
 // Zero-window probe constants.
@@ -384,6 +394,11 @@ type Daemon struct {
 	// auto-spawn path, so explicit user-initiated `pilotctl handshake`
 	// IPC calls are NOT throttled.
 	autoHandshakeLastAttempt sync.Map
+
+	// outbound records the peers this node recently dialed or sent a
+	// trust handshake to, so the private-node SYN gate can admit their
+	// dial-back replies (see replywindow.go).
+	outbound outboundContacts
 
 	// network.* bus subscriber for daemon-internal reactions (managed
 	// engines + member-tag cache). Wired by subscribeNetworkInternalToBus
@@ -604,7 +619,16 @@ func New(cfg Config) *Daemon {
 	// machinery gives up on it (see onRekeyGaveUp / pathwatch.go).
 	d.tunnels.SetRekeyGaveUpHook(d.onRekeyGaveUp)
 	d.tunnels.SetTrustGate(d.admitDataPlanePeer)
-	d.tunnels.SetPeerTrustFn(d.isTrustedPeer)
+	// The key-exchange path asks this only to decide whether a
+	// tunnel.established event may name the peer. Local trust answers
+	// that without a registry round trip: isTrustedPeer's CheckTrust ran
+	// synchronously on the tunnel read loop for every new peer's PILA,
+	// delaying the key install hook (and the flush of the SYN queued
+	// behind it) by a registry RTT, seconds when the registry is shedding
+	// connections, and stalling every other inbound packet meanwhile. A
+	// peer trusted only through the registry now gets the redacted event,
+	// which is the conservative side.
+	d.tunnels.SetPeerTrustFn(d.handshakeTrusts)
 	d.ipc = NewIPCServer(cfg.SocketPath, d)
 	// HandshakeService is wired post-construction by the composition
 	// root via RegisterHandshakeService (T3.3 — handshake plugin moved
@@ -2170,6 +2194,8 @@ func (d *Daemon) HandshakeSendRequest(nodeID uint32, reason string) error {
 	if d.handshakes == nil {
 		return fmt.Errorf("handshake service not registered")
 	}
+	// The accept comes back as a dial to our port 444; open its window.
+	d.noteOutboundContact(nodeID)
 	if _, loaded := d.handshakeInFlight.LoadOrStore(nodeID, struct{}{}); loaded {
 		return ErrHandshakeInFlight
 	}
@@ -3152,6 +3178,12 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		if !d.config.Public {
 			srcNode := pkt.Src.Node
 			trusted := d.handshakeTrusts(srcNode)
+			if !trusted && d.replyWindowAdmits(srcNode, pkt.DstPort) {
+				// A reply to a request we sent (replywindow.go). Admitted
+				// without the synchronous registry trust check.
+				trusted = true
+				slog.Debug("SYN admitted: reply from a peer we contacted", "src_node", srcNode, "dst_port", pkt.DstPort)
+			}
 			if !trusted && d.reg() != nil {
 				// Fall back to registry trust check (covers admin-set trust pairs + shared networks)
 				var err error
@@ -3725,6 +3757,9 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 	if err := d.ensureTunnel(dstAddr.Node); err != nil {
 		return nil, err
 	}
+	// Open the reply window before the first SYN: a fast service can dial
+	// its answer back before our dial even returns.
+	d.noteOutboundContact(dstAddr.Node)
 
 	// Compat mode: the daemon has no public UDP socket, so any direct
 	// SYN we send out can't reach the peer. Pre-flip the routing
@@ -3818,18 +3853,32 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 		Window:   conn.RecvWindow(),
 	}
 
+	// keyPending reports whether the tunnel still has no session key for
+	// the peer, i.e. every SYN we hand it is queued, not sent.
+	keyPending := func() bool {
+		return d.config.Encrypt && !d.tunnels.IsEncrypted(dstAddr.Node)
+	}
+	keyWaitUntil := time.Now().Add(DialKeyExchangeWait)
+	// synQueued is true while a copy of the SYN sits in the pending queue
+	// waiting for the key; retransmitting then would only queue duplicates
+	// that are all flushed at once when the key arrives.
+	synQueued := false
+
 	if err := d.tunnels.Send(dstAddr.Node, syn); err != nil {
-		// ErrPendingDropped means the SYN itself IS queued; only an older
-		// packet was dropped to make room. The tunnel is mid-handshake.
-		// Don't abort the dial — the SYN will go out as soon as the key
-		// exchange completes, and if not, the retry loop below will
-		// retransmit. Aborting here turns a transient handshake-startup
-		// condition into a hard "dial failed" for the user.
+		// ErrPendingDropped means the queue was full and this SYN was NOT
+		// queued. The tunnel is mid-handshake. Don't abort the dial — the
+		// retry loop below retransmits once the queue drains. Aborting
+		// here turns a transient handshake-startup condition into a hard
+		// "dial failed" for the user.
 		if !errors.Is(err, ErrPendingDropped) {
 			d.ports.RemoveConnection(conn.ID)
 			return nil, fmt.Errorf("send SYN: %w", err)
 		}
-		slog.Debug("dial: SYN queued during tunnel handshake (will retransmit)",
+		slog.Debug("dial: SYN not queued during tunnel handshake (will retransmit)",
+			"peer_node_id", dstAddr.Node, "dst_port", dstPort)
+	} else if keyPending() {
+		synQueued = true
+		slog.Debug("dial: SYN queued until the key exchange completes",
 			"peer_node_id", dstAddr.Node, "dst_port", dstPort)
 	}
 	conn.Mu.Lock()
@@ -3915,6 +3964,35 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 				return nil, protocol.ErrConnRefused
 			}
 		case <-timer.C:
+			if keyPending() {
+				// First contact: the key exchange is still running. Don't
+				// spend the retry budget (or queue duplicate SYNs) while
+				// no SYN can leave this node; the queued one goes out the
+				// moment the key is installed. Past DialKeyExchangeWait the
+				// dial counts retries as before, so it still ends.
+				if time.Now().Before(keyWaitUntil) {
+					if !synQueued {
+						synQueued = d.tunnels.Send(dstAddr.Node, syn) == nil
+					}
+					timer.Reset(rto)
+					continue
+				}
+			} else if !relayActive && retries < directRetries &&
+				d.config.BeaconAddr != "" && d.tunnels.KeyArrivedViaRelayOnly(dstAddr.Node) {
+				// The key came in over the relay and nothing has ever been
+				// decrypted from the peer's direct address: the relay is the
+				// only path it has proven. Start there instead of spending
+				// 1.75 s of direct retries on an address that never answered
+				// (e.g. a stale registry endpoint). relayProbeLoop keeps
+				// trying to upgrade the peer to direct in the background.
+				slog.Debug("dial: key arrived via relay only, dialing via relay",
+					"peer_node_id", dstAddr.Node, "dst_port", dstPort)
+				d.tunnels.SetRelayPeer(dstAddr.Node, true)
+				relayActive = true
+				relayActivatedHere = true
+				directRetries = 0
+				rto = DialInitialRTO
+			}
 			retries++
 
 			// Switch to relay mode after direct retries exhaust. Use
@@ -3931,6 +4009,7 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 			}
 
 			if retries > maxRetries {
+				keyMissing := keyPending()
 				d.ports.RemoveConnection(conn.ID)
 				// v1.9.1: a peer that didn't respond to the full retry
 				// budget (direct + relay) is reachably dead. Invalidate
@@ -3951,13 +4030,23 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 				// Feeds the rx-watchdog's partial-wedge detector: a run of
 				// these to distinct peers means our outbound is wedged.
 				d.consecutiveDialTimeouts.Add(1)
+				if keyMissing {
+					// Not one SYN left this node: the peer never completed
+					// the key exchange. Say so, so callers can tell "busy
+					// or unreachable peer" from "peer refused the port".
+					return nil, ErrDialKeyExchange
+				}
 				return nil, protocol.ErrDialTimeout
 			}
-			// Resend SYN (uses relay if relayActive)
+			// Resend SYN (uses relay if relayActive). While the key is
+			// still missing, one queued copy is enough.
 			conn.Mu.Lock()
 			syn.Seq = conn.SendSeq - 1
 			conn.Mu.Unlock()
-			d.tunnels.Send(dstAddr.Node, syn)
+			if !keyPending() || !synQueued {
+				err := d.tunnels.Send(dstAddr.Node, syn)
+				synQueued = err == nil && keyPending()
+			}
 			rto = rto * 2 // exponential backoff
 			if rto > DialMaxRTO {
 				rto = DialMaxRTO
@@ -3966,6 +4055,12 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 		}
 	}
 }
+
+// ErrDialKeyExchange is returned by a dial whose peer never completed the
+// tunnel key exchange, so no SYN could be sent at all. It wraps
+// protocol.ErrDialTimeout: callers that only check for a dial timeout
+// keep working, and the message names the actual cause.
+var ErrDialKeyExchange = fmt.Errorf("%w: key exchange with peer did not complete", protocol.ErrDialTimeout)
 
 // NagleTimeout is the maximum time to buffer small writes before flushing.
 const NagleTimeout = 40 * time.Millisecond
@@ -5525,6 +5620,9 @@ func (d *Daemon) idleSweepLoop() {
 
 			// Reap stale per-source SYN rate limit buckets
 			d.reapPerSrcSYN()
+
+			// Forget reply windows that have expired.
+			d.outbound.prune(time.Now())
 
 			// Reap stale "queue full" log-throttle entries so
 			// lastPendDropLog doesn't accumulate one slot per
