@@ -380,7 +380,13 @@ func TestConfigureTransportViaRelayHandlesGarbledRejection(t *testing.T) {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // #nosec G402 -- test server
 	ConfigureTransport(tr, r, relay.URL())
 	clone := tr.Clone() // a plugin that cloned DefaultTransport
-	for name, rt := range map[string]*http.Transport{"configured": tr, "clone": clone} {
+	// A fixed order: the credentials restored below are the last ones
+	// rotated in here (map order would make that random).
+	for _, c := range []struct {
+		name string
+		rt   *http.Transport
+	}{{"configured", tr}, {"clone", clone}} {
+		name, rt := c.name, c.rt
 		client := &http.Client{Transport: rt, Timeout: 20 * time.Second}
 		get := func() error {
 			req, _ := http.NewRequest(http.MethodGet, "https://plugin.pilot.invalid/x", nil)
