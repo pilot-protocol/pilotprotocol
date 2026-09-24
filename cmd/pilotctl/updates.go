@@ -91,6 +91,7 @@ func readUpdateStatus() (st updater.Status, ok bool, err error) {
 func cmdAutoUpdateStatus() {
 	on := autoUpdateEnabled()
 	st, recorded, readErr := readUpdateStatus()
+	restart := checkDaemonRestart(st, 0)
 	if jsonOutput {
 		out := map[string]interface{}{
 			"auto_update":     on,
@@ -99,11 +100,16 @@ func cmdAutoUpdateStatus() {
 			"status_file":     updateStatusPath(),
 			// Promoted from update_state so scripts can check them without
 			// walking the record. restart_error is "" when the daemon runs
-			// the installed binaries (or no update was recorded).
-			"last_result":   st.LastResult,
-			"last_error":    st.LastError,
-			"restart_error": st.RestartError,
-			"update_state":  nil,
+			// the installed binaries (or no update was recorded), even if
+			// update_state still carries an out-of-date one; restart_needed
+			// is true only when the daemon answers with another version.
+			"last_result":    st.LastResult,
+			"last_error":     st.LastError,
+			"restart_error":  restart.restartError(),
+			"restart_needed": restart.needed(),
+			"daemon_running": restart.running,
+			"daemon_version": restart.daemonVersion,
+			"update_state":   nil,
 		}
 		if recorded {
 			out["update_state"] = st
@@ -129,7 +135,7 @@ func cmdAutoUpdateStatus() {
 	case !recorded:
 		fmt.Println("Last check:        none recorded yet")
 	default:
-		printUpdateState(st)
+		printUpdateState(st, restart)
 	}
 	if on {
 		fmt.Println("\nTurn off with:  pilotctl update disable")
@@ -140,7 +146,8 @@ func cmdAutoUpdateStatus() {
 }
 
 // printUpdateState renders the recorded updater status for `update status`.
-func printUpdateState(st updater.Status) {
+// restart is the recorded restart_error checked against the running daemon.
+func printUpdateState(st updater.Status, restart daemonRestart) {
 	when := "unknown"
 	if !st.LastCheckAt.IsZero() {
 		when = formatUpdateTime(st.LastCheckAt)
@@ -180,9 +187,151 @@ func printUpdateState(st updater.Status) {
 		}
 		fmt.Printf("Last update:       %s%s\n", st.LastUpdateVersion, at)
 	}
-	if st.RestartError != "" {
-		fmt.Println("Daemon restart:    NEEDED — the daemon is not running the installed binaries")
-		fmt.Printf("                   %s\n", st.RestartError)
+	const indent = "                   "
+	switch {
+	case restart.recorded == "":
+	case restart.resolved():
+		fmt.Printf("Daemon restart:    not needed — the daemon runs the installed %s\n", restart.daemonVersion)
+		fmt.Printf("%s(the recorded restart error is out of date: %s)\n", indent, restart.recorded)
+	case restart.daemonDown():
+		fmt.Printf("Daemon restart:    daemon not running — %s runs when it starts\n", orDash(restart.installed))
+		fmt.Printf("%slast restart attempt: %s\n", indent, restart.recorded)
+		if hint := restart.hint(); hint != "" {
+			fmt.Printf("%sstart it with: %s\n", indent, hint)
+		}
+	default:
+		fmt.Printf("Daemon restart:    NEEDED — the daemon runs %s, installed is %s\n",
+			orUnknown(restart.daemonVersion), orDash(restart.installed))
+		fmt.Printf("%s%s\n", indent, restart.recorded)
+		if hint := restart.hint(); hint != "" {
+			fmt.Printf("%srestart it with: %s\n", indent, hint)
+		}
+	}
+}
+
+// daemonRestart is the updater's recorded restart_error checked against the
+// running daemon. The record alone can be out of date: updater v0.2.5 keeps
+// an earlier restart_error after a manual run that restarted the daemon when
+// the release also replaced pilot-updater (every release does), and a later
+// check clears it only on Linux, where /proc shows which binary the daemon
+// runs. On macOS it stays until the next release, even once the daemon was
+// restarted by hand. So pilotctl asks the daemon which version it runs
+// before it reports a restart as needed.
+type daemonRestart struct {
+	recorded      string // Status.RestartError
+	installed     string // Status.CurrentVersion
+	running       bool   // the daemon answered on its socket
+	daemonVersion string // the version it reported ("" = not running or unknown)
+}
+
+// resolved: a restart_error is recorded, but the daemon reports the
+// installed version, so the record is out of date.
+func (r daemonRestart) resolved() bool {
+	return r.recorded != "" && r.running && sameRelease(r.daemonVersion, r.installed)
+}
+
+// needed: a restart_error is recorded and the daemon answers with another
+// (or an unknown) version: it still runs the old binaries.
+func (r daemonRestart) needed() bool {
+	return r.recorded != "" && r.running && !sameRelease(r.daemonVersion, r.installed)
+}
+
+// daemonDown: a restart_error is recorded and no daemon answers. Nothing
+// runs the old binaries; the installed version runs when the daemon starts.
+func (r daemonRestart) daemonDown() bool {
+	return r.recorded != "" && !r.running
+}
+
+// restartError is the recorded restart_error unless the daemon showed it is
+// out of date.
+func (r daemonRestart) restartError() string {
+	if r.resolved() {
+		return ""
+	}
+	return r.recorded
+}
+
+// hint is the command that (re)starts the daemon onto the installed
+// binaries, when the updater's message does not already name one. Its Linux
+// messages end with "restart it with: …" or "start it with: …"; its macOS
+// message only names the launchctl call that failed.
+func (r daemonRestart) hint() string {
+	if strings.Contains(r.recorded, "start it with") {
+		return ""
+	}
+	if r.daemonDown() {
+		return "pilotctl daemon start"
+	}
+	return "pilotctl daemon stop && pilotctl daemon start"
+}
+
+// sameRelease reports whether two version strings name the same release
+// ("v1.13.9" and "1.13.9" do). A version that does not parse, such as a
+// "dev" build, matches nothing.
+func sameRelease(a, b string) bool {
+	va, errA := updater.ParseSemver(a)
+	vb, errB := updater.ParseSemver(b)
+	return errA == nil && errB == nil && va.Compare(vb) == 0
+}
+
+// restartSettleWait bounds how long `pilotctl update` waits for a daemon it
+// may just have restarted to answer with the installed version (see
+// cmdUpdate). The daemon can take well over 10s to open its socket when it
+// starts installed apps first; `pilotctl daemon start` waits 30s too.
+var restartSettleWait = 30 * time.Second
+
+// daemonProbeInterval is the pause between daemon version probes while
+// waiting.
+var daemonProbeInterval = 250 * time.Millisecond
+
+// checkDaemonRestart asks the daemon which version it runs and checks the
+// recorded restart_error against it. It always probes once. While a
+// restart_error is recorded and the daemon does not yet report the installed
+// version, it keeps probing until wait has passed.
+func checkDaemonRestart(st updater.Status, wait time.Duration) daemonRestart {
+	r := daemonRestart{recorded: st.RestartError, installed: st.CurrentVersion}
+	deadline := time.Now().Add(wait)
+	for {
+		r.daemonVersion, r.running = daemonVersionProbe()
+		if r.recorded == "" || r.resolved() || !time.Now().Before(deadline) {
+			return r
+		}
+		time.Sleep(daemonProbeInterval)
+	}
+}
+
+// daemonProbeTimeout bounds one IPC info call, so a wedged daemon cannot
+// hang `pilotctl update`.
+const daemonProbeTimeout = 3 * time.Second
+
+// daemonVersionProbe reports whether a daemon answers on the socket and the
+// version it reports (IPC info "version"; "" when the info call fails or
+// times out). Tests replace it so they never reach a real daemon.
+var daemonVersionProbe = func() (ver string, running bool) {
+	d, err := driver.Connect(getSocket())
+	if err != nil {
+		return "", false
+	}
+	type result struct {
+		info map[string]interface{}
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		info, err := d.Info()
+		ch <- result{info, err}
+	}()
+	select {
+	case res := <-ch:
+		d.Close()
+		if res.err != nil {
+			return "", true
+		}
+		v, _ := res.info["version"].(string)
+		return v, true
+	case <-time.After(daemonProbeTimeout):
+		d.Close() // unblocks the Info call
+		return "", true
 	}
 }
 
@@ -193,6 +342,13 @@ func formatUpdateTime(t time.Time) string {
 func orDash(s string) string {
 	if s == "" {
 		return "-"
+	}
+	return s
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "an unknown version"
 	}
 	return s
 }
@@ -426,6 +582,9 @@ func cmdUpdate(args []string) {
 	installDir := filepath.Dir(updaterBin)
 
 	statusPath := updateStatusPath()
+	// The record before this run, to tell a restart_error this run recorded
+	// from one an earlier run left behind.
+	before, _, _ := readUpdateStatus()
 	u := newUpdateRunner(updater.Config{
 		CheckInterval: 0, // unused for RunOnce
 		Repo:          repo,
@@ -445,6 +604,18 @@ func cmdUpdate(args []string) {
 	}
 	st := u.LastStatus()
 
+	// LastStatus is merged with the record on disk, so its restart_error
+	// can be one an earlier run left behind (see daemonRestart). When this
+	// run installed a release and the restart_error did not change, the
+	// daemon may just have been restarted: give it time to come up and
+	// report the installed version. A restart_error this run recorded is
+	// checked once, without waiting.
+	wait := time.Duration(0)
+	if st.LastResult == updater.ResultUpdated && st.RestartError != "" && st.RestartError == before.RestartError {
+		wait = restartSettleWait
+	}
+	restart := checkDaemonRestart(st, wait)
+
 	if jsonOutput {
 		out := map[string]interface{}{
 			"install_dir":     installDir,
@@ -454,18 +625,21 @@ func cmdUpdate(args []string) {
 			"updated":         st.LastResult == updater.ResultUpdated,
 			"current_version": st.CurrentVersion,
 			"latest_version":  st.LatestVersion,
-			"restart_error":   st.RestartError,
+			"restart_error":   restart.restartError(),
+			"restart_needed":  restart.needed(),
+			"daemon_running":  restart.running,
+			"daemon_version":  restart.daemonVersion,
 			"status_file":     statusPath,
 		}
 		outputOK(out)
 		return
 	}
 	fmt.Printf("Update check complete. Install dir: %s\n", installDir)
-	printUpdateResult(st)
+	printUpdateResult(st, restart)
 
 	// In manual mode (no daemon running), re-run skill install so skills
 	// match the (possibly updated) binaries.
-	if !daemonRunning() {
+	if !restart.running {
 		report, err := runTick()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: skill install failed: %v\n", err)
@@ -485,10 +659,12 @@ type updateRunner interface {
 // never reaches GitHub or replaces binaries.
 var newUpdateRunner = func(cfg updater.Config) updateRunner { return updater.New(cfg) }
 
-// printUpdateResult reports what a successful `pilotctl update` did. A
-// restart_error means new binaries are installed but the daemon still runs
-// the old ones; the message names the command that restarts it.
-func printUpdateResult(st updater.Status) {
+// printUpdateResult reports what a successful `pilotctl update` did. It
+// warns when the daemon still runs an older version than the one installed,
+// naming the command that restarts it, and when this run installed a release
+// but no daemon is running. A restart_error the daemon shows is out of date
+// is not reported.
+func printUpdateResult(st updater.Status, restart daemonRestart) {
 	switch st.LastResult {
 	case updater.ResultUpdated:
 		fmt.Printf("Updated to %s.\n", orDash(st.CurrentVersion))
@@ -499,20 +675,22 @@ func printUpdateResult(st updater.Status) {
 			fmt.Println("Already up to date.")
 		}
 	}
-	if st.RestartError != "" {
-		fmt.Fprintf(os.Stderr, "warning: new binaries are installed but the daemon is not running them:\n  %s\n", st.RestartError)
+	switch {
+	case restart.needed():
+		fmt.Fprintf(os.Stderr, "warning: new binaries are installed but the daemon is not running them (it runs %s, installed is %s):\n  %s\n",
+			orUnknown(restart.daemonVersion), orDash(restart.installed), restart.recorded)
+		if hint := restart.hint(); hint != "" {
+			fmt.Fprintf(os.Stderr, "  restart it with: %s\n", hint)
+		}
+	case restart.daemonDown() && st.LastResult == updater.ResultUpdated:
+		// Nothing runs the old binaries, but the restart did not leave a
+		// daemon running: it was stopped before, or it did not come back.
+		fmt.Fprintf(os.Stderr, "warning: the daemon is not running; %s runs when it starts.\n  last restart attempt: %s\n",
+			orDash(restart.installed), restart.recorded)
+		if hint := restart.hint(); hint != "" {
+			fmt.Fprintf(os.Stderr, "  start it with: %s\n", hint)
+		}
 	}
-}
-
-// daemonRunning checks whether the daemon socket is reachable.
-func daemonRunning() bool {
-	sock := getSocket()
-	d, err := driver.Connect(sock)
-	if err != nil {
-		return false
-	}
-	d.Close()
-	return true
 }
 
 // fetchChangelogFeed returns the cached feed body if it's fresh (< 5 min)

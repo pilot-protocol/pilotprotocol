@@ -74,8 +74,7 @@ func planTick() (*skillinject.Report, error) {
 // HTTPS) and prints a per-tool summary line (statusDot + what, if anything,
 // the next tick would change). Per-file detail lines are behind --verbose.
 func cmdSkillsStatus(args []string) {
-	flags, _ := parseFlags(args)
-	verbose := flagBool(flags, "verbose")
+	detail := skillsStatusDetail(args)
 	// Read-only: status must not write. Plan reports the true on-disk state
 	// plus the action the next daemon tick would take.
 	report, err := planTick()
@@ -159,7 +158,7 @@ func cmdSkillsStatus(args []string) {
 		}
 		fmt.Printf("%s %s %s\n", statusDot(dot), sBold(tool), sDim(summary))
 
-		if !verbose {
+		if !detail {
 			continue
 		}
 		for _, o := range outs {
@@ -186,12 +185,21 @@ func cmdSkillsStatus(args []string) {
 		fmt.Println()
 	}
 
-	if !verbose {
+	if !detail {
 		fmt.Printf("\n%s\n", sDim("per-file detail: --verbose · paths only: pilotctl skills paths · force a pass: pilotctl skills check"))
 	}
 	if len(report.Skipped) > 0 {
 		fmt.Printf("Not installed (skipped): %s\n", strings.Join(report.Skipped, ", "))
 	}
+}
+
+// skillsStatusDetail reports whether `skills status` prints per-file detail.
+// main() takes --verbose and -v out of the arguments as the global verbose
+// flag before any subcommand sees them, so a --verbose here reaches only the
+// global; --verbose=true stays in args.
+func skillsStatusDetail(args []string) bool {
+	flags, _ := parseFlags(args)
+	return verbose || flagBool(flags, "verbose")
 }
 
 // cmdSkillsPaths prints just the install paths — one per line, no decoration —
@@ -233,12 +241,17 @@ func cmdSkillsCheck(_ []string) {
 
 // skillsReconcileFields is the JSON summary of one reconcile pass, shared by
 // `skills check` and `skills enable`. removes counts retired surfaces (from
-// an older manifest) that the pass deleted or stripped; notes carries every
-// outcome whose state/action alone would mislead (a heartbeat file shared
-// with another tool, a retired plugin neutralized instead of removed).
+// an older manifest) that the pass cleaned up: a helper or plugin file
+// deleted, our marker block stripped from a heartbeat file (the file is
+// kept), or a plugin id dropped from a tool's config (the file is kept).
+// notes carries every outcome whose state/action alone would mislead (a
+// heartbeat file shared with another tool, a retired plugin neutralized
+// instead of removed). disabled is true when skill injection is disabled: the
+// pass installed and updated nothing and only cleaned up retired surfaces.
 func skillsReconcileFields(report *skillinject.Report) map[string]interface{} {
 	c := report.Counts()
 	return map[string]interface{}{
+		"disabled": report.Disabled,
 		"checked":  len(report.Outcomes),
 		"noops":    c[skillinject.ActionNoop],
 		"creates":  c[skillinject.ActionCreate],
@@ -263,13 +276,23 @@ func skillsOutcomeNotes(report *skillinject.Report) []map[string]string {
 }
 
 // printSkillsReconcileSummary is the text summary of one reconcile pass,
-// shared by `skills check` and `skills enable`.
+// shared by `skills check` and `skills enable`. With skill injection
+// disabled the pass installs and updates nothing; it only cleans up retired
+// surfaces, and the summary says so.
 func printSkillsReconcileSummary(report *skillinject.Report) {
 	c := report.Counts()
-	fmt.Printf("Reconcile complete — %d files checked.\n", len(report.Outcomes))
-	fmt.Printf("  noop:      %d\n", c[skillinject.ActionNoop])
-	fmt.Printf("  create:    %d\n", c[skillinject.ActionCreate])
-	fmt.Printf("  rewrite:   %d\n", c[skillinject.ActionRewrite])
+	if report.Disabled {
+		fmt.Println("Skill injection is disabled: nothing was installed or updated.")
+		fmt.Printf("Reconcile complete — retired surfaces only, %d found.\n", len(report.Outcomes))
+		if c[skillinject.ActionRewrite] > 0 {
+			fmt.Printf("  rewrite:   %d\n", c[skillinject.ActionRewrite])
+		}
+	} else {
+		fmt.Printf("Reconcile complete — %d files checked.\n", len(report.Outcomes))
+		fmt.Printf("  noop:      %d\n", c[skillinject.ActionNoop])
+		fmt.Printf("  create:    %d\n", c[skillinject.ActionCreate])
+		fmt.Printf("  rewrite:   %d\n", c[skillinject.ActionRewrite])
+	}
 	if c[skillinject.ActionRemove] > 0 {
 		fmt.Printf("  remove:    %d (retired surfaces from an older manifest)\n", c[skillinject.ActionRemove])
 	}
@@ -277,10 +300,10 @@ func printSkillsReconcileSummary(report *skillinject.Report) {
 		fmt.Printf("  errors:    %d (run `pilotctl skills status` for detail)\n", c[skillinject.ActionError])
 	}
 	if c[skillinject.ActionRemove] > 0 {
-		fmt.Println("Removed:")
+		fmt.Println("Retired surfaces cleaned up:")
 		for _, o := range report.Outcomes {
 			if o.Action == skillinject.ActionRemove {
-				fmt.Printf("  %s — %s\n", o.Path, o.Tool)
+				fmt.Printf("  %s — %s: %s\n", o.Path, o.Tool, retiredRemovalEffect(o.Kind))
 			}
 		}
 	}
@@ -288,6 +311,24 @@ func printSkillsReconcileSummary(report *skillinject.Report) {
 	if len(report.Skipped) > 0 {
 		fmt.Printf("Not installed (skipped): %s\n", strings.Join(report.Skipped, ", "))
 	}
+	if report.Disabled {
+		fmt.Println("Re-enable with: pilotctl skills enable all")
+	}
+}
+
+// retiredRemovalEffect says what cleaning up a retired surface did to the
+// file at its path. skillinject deletes only files it owns (helpers, plugin
+// files); from user-owned files it removes only its own part.
+func retiredRemovalEffect(kind skillinject.FileKind) string {
+	switch kind {
+	case skillinject.KindMarker:
+		return "pilot block stripped, file kept"
+	case skillinject.KindPluginAllowList:
+		return "plugin entry removed, file kept"
+	case skillinject.KindPluginFile, skillinject.KindHelper:
+		return "deleted"
+	}
+	return "removed"
 }
 
 // printSkillsOutcomeNotes prints a "Notes:" block for outcomes with a Note,
@@ -307,6 +348,15 @@ func printSkillsOutcomeNotes(report *skillinject.Report, indent string) {
 // prints after re-running skill install in manual mode.
 func printSkillsUpdateSummary(report *skillinject.Report) {
 	c := report.Counts()
+	if report.Disabled {
+		// Nothing installed or updated; only retired surfaces cleaned up
+		// (a neutralized plugin file is a rewrite).
+		fmt.Printf("Skills: injection disabled — retired surfaces cleaned up: %d, errors: %d\n",
+			c[skillinject.ActionRemove]+c[skillinject.ActionRewrite],
+			c[skillinject.ActionError])
+		printSkillsOutcomeNotes(report, "  ")
+		return
+	}
 	fmt.Printf("Skills: %d files checked (%d up-to-date, %d installed, %d removed, %d errors)\n",
 		len(report.Outcomes),
 		c[skillinject.ActionNoop],

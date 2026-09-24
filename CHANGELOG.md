@@ -47,28 +47,47 @@ Detailed per-release notes are on the
   used to print `Update check complete` (or `{"status":"ok"}`) and exit 0 even
   when the check failed, for example on a GitHub rate limit. It now exits 1
   with code `update_failed` and the updater's error. A successful run says
-  whether it installed a release or found the node up to date. If new binaries
-  were installed but the daemon could not be restarted onto them, it prints a
-  warning with the restart command. `--json` adds `result`, `updated`,
-  `current_version`, `latest_version`, `restart_error` and `status_file`.
-  Manual runs are now recorded in `~/.pilot/update-state.json`, the file the
-  pilot-updater service writes.
+  whether it installed a release or found the node up to date. When the
+  updater has recorded a failed daemon restart (`restart_error`), pilotctl asks
+  the daemon over IPC which version it runs before it says anything. The
+  record alone can be out of date: updater v0.2.5 keeps an earlier
+  `restart_error` after a manual update that restarted the daemon, and on
+  macOS it never clears it on a later check. If the daemon runs another
+  version, pilotctl warns and names the command that restarts it. If an
+  update leaves no daemon running, it says so and how to start it. If the
+  daemon already runs the installed version, it says nothing. `--json` adds
+  `result`, `updated`, `current_version`, `latest_version`, `restart_error`
+  (empty when the daemon runs the installed version), `restart_needed`,
+  `daemon_running`, `daemon_version` and `status_file`. Manual runs are now
+  recorded in `~/.pilot/update-state.json`, the file the pilot-updater service
+  writes.
 - **`pilotctl update status` shows what the updater last did.** Before, it only
   showed whether auto-update was on. It now also shows the last check (time,
   auto or manual, result), the last error, the failure streak, the installed
-  and latest versions, the last update, and `Daemon restart: NEEDED` with the
-  updater's `restart_error` when the daemon is not running the installed
-  binaries. `--json` adds `status_file`, `last_result`, `last_error`,
-  `restart_error` and the full record as `update_state` (null when no check
-  has been recorded).
+  and latest versions and the last update. When a `restart_error` is recorded
+  it checks the daemon too, and shows one of three results.
+  `Daemon restart: NEEDED` means the daemon runs another version.
+  `daemon not running` means it runs the installed version once started.
+  `not needed` means the record is out of date. `--json` adds `status_file`,
+  `last_result`, `last_error`, `restart_error`, `restart_needed`,
+  `daemon_running`, `daemon_version` and the full record as `update_state`
+  (null when no check has been recorded).
 - **`pilotctl skills check`, `skills enable` and the `pilotctl update` skills
   summary now count removals and print notes.** Retired surfaces that
-  skillinject removed are counted (`remove:` and `removes` in `--json`) and
-  listed. Rows that carry a note are printed under `Notes:` and returned as
-  `notes` in `--json`: a heartbeat file shared with another tool, or a retired
-  plugin that was neutralized instead of removed.
-  `skills disable all` counts `neutralized` rows and prints their notes.
-  `skills status --json` includes each row's `note`, and `--verbose` prints it.
+  skillinject cleaned up are counted (`remove:` and `removes` in `--json`) and
+  listed with what happened to each file. A helper or plugin file is
+  `deleted`. From a heartbeat file only the pilot block is stripped, and from
+  `openclaw.json` only the plugin entry is removed; both files are kept. When
+  skill injection is disabled, the summary says so: that pass installs nothing
+  and only cleans up retired surfaces. `--json` adds `disabled`. Rows that
+  carry a note are printed under `Notes:` and returned as `notes` in `--json`:
+  a heartbeat file shared with another tool, or a retired plugin that was
+  neutralized instead of removed. `skills disable all` counts `neutralized`
+  rows and prints their notes. `skills status --json` includes each row's
+  `note`, and `--verbose` prints it.
+- **`pilotctl skills status --verbose` prints per-file detail again.** `main`
+  consumed `--verbose` (and `-v`) as the global flag before the subcommand
+  saw it, so only `--verbose=true` worked.
 - **The `pilotctl skills disable` opt-out now survives updates and explicit
   reconciles.** A forced reconcile — `pilotctl skills check`, `pilotctl update`,
   or an installer re-run — bypassed the disabled flag and re-injected skills a

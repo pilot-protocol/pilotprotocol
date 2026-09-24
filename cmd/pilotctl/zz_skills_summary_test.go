@@ -83,9 +83,9 @@ func TestPrintSkillsReconcileSummary_ShowsRemovesAndNotes(t *testing.T) {
 		"  rewrite:   2",
 		"  remove:    2 (retired surfaces from an older manifest)",
 		"  errors:    1",
-		"Removed:",
-		"  /home/u/.openclaw/workspace/HEARTBEAT.md — openclaw",
-		"  /home/u/.pilot/bin/pilot-ask — pilot-ask",
+		"Retired surfaces cleaned up:",
+		"  /home/u/.openclaw/workspace/HEARTBEAT.md — openclaw: pilot block stripped, file kept",
+		"  /home/u/.pilot/bin/pilot-ask — pilot-ask: deleted",
 		"Notes:",
 		"  goose (/home/u/AGENTS.md): " + testSharedNote,
 		"  pilotprotocol-prompt-injector (/home/u/.openclaw/extensions/pilotprotocol-prompt-injector/index.mjs): " + testNeutralizedNote,
@@ -103,7 +103,7 @@ func TestPrintSkillsReconcileSummary_QuietWithoutRemovesOrNotes(t *testing.T) {
 			{Tool: "claude-code", Action: skillinject.ActionNoop},
 		}})
 	})
-	for _, unwanted := range []string{"remove:", "Removed:", "Notes:", "errors:"} {
+	for _, unwanted := range []string{"remove:", "Retired surfaces", "Notes:", "errors:", "disabled"} {
 		if strings.Contains(out, unwanted) {
 			t.Errorf("summary must not print %q for a clean pass:\n%s", unwanted, out)
 		}
@@ -144,5 +144,108 @@ func TestPrintSkillsRemovalReport_Neutralized(t *testing.T) {
 	}
 	if strings.Contains(out, "[noop]") {
 		t.Errorf("noop rows must not be listed under paths processed:\n%s", out)
+	}
+}
+
+// TestPrintSkillsReconcileSummary_SaysWhatRemovalDid: a retired surface in
+// a user-owned file only loses our part of it. The summary must not list the
+// OpenClaw heartbeat or openclaw.json as if they had been deleted.
+func TestPrintSkillsReconcileSummary_SaysWhatRemovalDid(t *testing.T) {
+	out := captureStdout(t, func() {
+		printSkillsReconcileSummary(&skillinject.Report{Outcomes: []skillinject.Outcome{
+			{Tool: "openclaw", Kind: skillinject.KindMarker, Path: "/home/u/.openclaw/workspace/HEARTBEAT.md", State: skillinject.StateRetired, Action: skillinject.ActionRemove},
+			{Tool: "pilotprotocol-prompt-injector", Kind: skillinject.KindPluginAllowList, Path: "/home/u/.openclaw/openclaw.json", State: skillinject.StateRetired, Action: skillinject.ActionRemove},
+			{Tool: "pilotprotocol-prompt-injector", Kind: skillinject.KindPluginFile, Path: "/home/u/.openclaw/extensions/pilotprotocol-prompt-injector/index.mjs", State: skillinject.StateRetired, Action: skillinject.ActionRemove},
+			{Tool: "pilot-ask", Kind: skillinject.KindHelper, Path: "/home/u/.pilot/bin/pilot-ask", State: skillinject.StateRetired, Action: skillinject.ActionRemove},
+		}})
+	})
+	for _, want := range []string{
+		"  remove:    4 (retired surfaces from an older manifest)",
+		"Retired surfaces cleaned up:",
+		"  /home/u/.openclaw/workspace/HEARTBEAT.md — openclaw: pilot block stripped, file kept",
+		"  /home/u/.openclaw/openclaw.json — pilotprotocol-prompt-injector: plugin entry removed, file kept",
+		"  /home/u/.openclaw/extensions/pilotprotocol-prompt-injector/index.mjs — pilotprotocol-prompt-injector: deleted",
+		"  /home/u/.pilot/bin/pilot-ask — pilot-ask: deleted",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Removed:") {
+		t.Errorf("summary still lists user files under \"Removed:\":\n%s", out)
+	}
+}
+
+// disabledPruneReport is a tick on a host in disabled mode (skillinject
+// v0.2.4): nothing installed, one retired heartbeat block stripped.
+func disabledPruneReport() *skillinject.Report {
+	return &skillinject.Report{Disabled: true, Outcomes: []skillinject.Outcome{
+		{Tool: "openclaw", Kind: skillinject.KindMarker, Path: "/home/u/.openclaw/workspace/HEARTBEAT.md", State: skillinject.StateRetired, Action: skillinject.ActionRemove},
+	}}
+}
+
+// TestSkillsReconcileSummary_Disabled: in disabled mode a tick still prunes
+// retired surfaces. The summary must say that injection is disabled rather
+// than read like a normal reconcile, and --json must carry disabled.
+func TestSkillsReconcileSummary_Disabled(t *testing.T) {
+	out := captureStdout(t, func() { printSkillsReconcileSummary(disabledPruneReport()) })
+	for _, want := range []string{
+		"Skill injection is disabled: nothing was installed or updated.",
+		"Reconcile complete — retired surfaces only, 1 found.",
+		"  remove:    1 (retired surfaces from an older manifest)",
+		"  /home/u/.openclaw/workspace/HEARTBEAT.md — openclaw: pilot block stripped, file kept",
+		"Re-enable with: pilotctl skills enable all",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary missing %q:\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"files checked", "noop:", "create:"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("disabled summary must not print %q:\n%s", unwanted, out)
+		}
+	}
+
+	if got := skillsReconcileFields(disabledPruneReport())["disabled"]; got != true {
+		t.Errorf("disabled = %v, want true", got)
+	}
+	if got := skillsReconcileFields(summaryReport())["disabled"]; got != false {
+		t.Errorf("disabled = %v, want false for an enabled pass", got)
+	}
+
+	line := captureStdout(t, func() { printSkillsUpdateSummary(disabledPruneReport()) })
+	if !strings.Contains(line, "Skills: injection disabled — retired surfaces cleaned up: 1, errors: 0") {
+		t.Errorf("update summary line:\n%s", line)
+	}
+}
+
+// TestSkillsStatusDetail is F4: main() takes --verbose and -v out of the
+// arguments as the global verbose flag before dispatching, so `skills status
+// --verbose` reaches cmdSkillsStatus with no flag left in its args. The
+// per-file detail must follow the global flag too.
+func TestSkillsStatusDetail(t *testing.T) {
+	withTempHomeFull(t)
+	prevVerbose, prevJSON := verbose, jsonOutput
+	t.Cleanup(func() { verbose, jsonOutput = prevVerbose, prevJSON })
+
+	verbose = false
+	if skillsStatusDetail(nil) {
+		t.Error("detail without --verbose")
+	}
+	if !skillsStatusDetail([]string{"--verbose=true"}) {
+		t.Error("--verbose=true stays in args and must give detail")
+	}
+
+	// What main() leaves for `pilotctl --verbose skills status` or
+	// `pilotctl skills status --verbose`: the global set, no flag in args.
+	for _, argv := range [][]string{{"--verbose", "version"}, {"version", "-v"}} {
+		verbose = false
+		withArgs(t, argv, func() { _ = captureStdout(t, main) })
+		if !verbose {
+			t.Fatalf("main(%v) did not set the global verbose flag", argv)
+		}
+		if !skillsStatusDetail(nil) {
+			t.Errorf("after main(%v): skills status ignores the global verbose flag", argv)
+		}
 	}
 }
