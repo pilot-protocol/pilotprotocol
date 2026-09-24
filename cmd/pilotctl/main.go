@@ -2993,6 +2993,9 @@ func cmdDaemonStart(args []string) {
 
 	// Rename the temp log to pilot-{pid}.log. The child's fd follows the
 	// inode, so it continues writing to the same file after the rename.
+	// The daemon's log cap finishes a dead daemon's interrupted rotation
+	// only under this name (internal/logcap isDaemonStartLog): keep the
+	// two in step.
 	pidLogPath := configDir() + "/pilot-" + strconv.Itoa(pid) + ".log"
 	logFile.Close()
 	os.Rename(tmpLogPath, pidLogPath)

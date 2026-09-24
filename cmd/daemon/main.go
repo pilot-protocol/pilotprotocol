@@ -23,6 +23,7 @@ import (
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/logging"
 	"github.com/pilot-protocol/pilotprotocol/internal/enterprisecontrol"
+	"github.com/pilot-protocol/pilotprotocol/internal/logcap"
 	"github.com/pilot-protocol/pilotprotocol/internal/managedsdk/authority"
 	"github.com/pilot-protocol/pilotprotocol/internal/motd"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
@@ -114,6 +115,8 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
+	logMaxSize := flag.Int("log-max-size", 50, "rotate the daemon log once it exceeds this many MB (copy-truncate into gzipped <log>.pilot.N.gz backups). By default only a log Pilot set up is rotated: one inside ~/.pilot (install.sh's launchd daemon.log, pilotctl's pilot-<pid>.log) or the Homebrew service's <brew prefix>/var/log/pilot-daemon.log; a log elsewhere only when this is set explicitly, here or in config.json. 0 disables")
+	logMaxBackups := flag.Int("log-max-backups", 3, "gzipped generations kept by -log-max-size rotation (<log>.pilot.1.gz ... <log>.pilot.N.gz); 0 keeps none")
 	sandbox := flag.Bool("sandbox", false, "restrict all file I/O to the sandbox directory (see -sandbox-dir)")
 	sandboxDir := flag.String("sandbox-dir", "", "confinement root when -sandbox is set (default: ~/.pilot)")
 	motdFeedURL := flag.String("motd-feed-url", motd.DefaultFeedURL, "message-of-the-day feed URL (empty to disable); overridden by $PILOT_MOTD_URL")
@@ -156,12 +159,14 @@ func main() {
 			}
 		}
 	}
+	var fileConfig map[string]interface{}
 	if *configPath != "" {
 		cfg, err := config.Load(*configPath)
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
 		config.ApplyToFlags(cfg)
+		fileConfig = cfg
 	}
 	if *enterpriseControlPath == "" {
 		if discovered, ok := discoverManagedEnterpriseControl(); ok {
@@ -220,6 +225,19 @@ func main() {
 	*motdFeedURL = profileOptions.MOTDFeedURL
 
 	logging.Setup(*logLevel, *logFormat)
+	// launchd never rotates StandardOutPath/StandardErrorPath (daemon.log
+	// reached 22 MB on one laptop), so cap it from the inside. No-op when
+	// stderr isn't a regular file (journald, a terminal, a pipe), and by
+	// default for a log Pilot did not set up (outside ~/.pilot, and not
+	// the Homebrew service's), which an operator may rotate by other
+	// means. Lives for the daemon's lifetime; process exit stops it.
+	logcap.Watch(context.Background(), os.Stderr, logcap.Options{
+		MaxBytes:   int64(*logMaxSize) << 20,
+		MaxBackups: *logMaxBackups,
+		Anywhere:   flagExplicit("log-max-size", fileConfig),
+		Within:     pilotDirs(),
+		Files:      pilotLogFiles(),
+	}, time.Minute)
 
 	// Sandbox: validate all configured file paths are under the confinement
 	// root before the daemon touches the filesystem. Network paths are unaffected.
@@ -501,7 +519,8 @@ func main() {
 	// Plugin Start methods don't depend on d.Start having run; ports
 	// and tunnels are constructed in daemon.New.
 	if err := rt.StartPlugins(context.Background()); err != nil {
-		log.Fatalf("plugin startup: %v", err)
+		// StartAll leaves the plugins it already started running.
+		fatalAfterPluginStart(rt.StopPlugins, "plugin startup: %v", err)
 	}
 
 	// PILOT-343/344/345: apply rate-limit whitelists BEFORE Start so the
@@ -512,8 +531,13 @@ func main() {
 	applyNodeIDWhitelist("reply", *replyWhitelist, "PILOT_REPLY_WHITELIST", d.SetReplyWhitelist, d.SetReplyWhitelistMatchAll)
 	applyNodeIDWhitelist("rekey", *rekeyWhitelist, "PILOT_REKEY_WHITELIST", d.SetRekeyWhitelist, d.SetRekeyWhitelistMatchAll)
 
+	// Route the daemon's supervisor-respawn exits (rx watchdog) through
+	// the shutdown loop below instead of an immediate os.Exit, so they
+	// stop the plugins — and the app-store's child apps — first.
+	daemon.SetExitHandler(forwardExitRequest)
+
 	if err := d.Start(); err != nil {
-		log.Fatalf("daemon start: %v", err)
+		fatalAfterPluginStart(rt.StopPlugins, "daemon start: %v", err)
 	}
 
 	rolloutRefreshCtx, rolloutRefreshCancel := context.WithCancel(context.Background())
@@ -612,47 +636,25 @@ func main() {
 	// deliberate restart-time administrative change.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	restartRequested := false
-shutdownLoop:
-	for {
-		select {
-		case received := <-sig:
-			if received == syscall.SIGHUP {
-				if enterpriseControls == nil {
-					slog.Warn("enterprise control reload ignored: no attachment is configured")
-				} else if err := enterpriseControls.Reload(); err != nil {
-					slog.Error("enterprise control reload rejected; keeping current signed state", "err", err)
-				} else {
-					slog.Info("enterprise control reloaded")
-				}
-				continue
-			}
-			break shutdownLoop
-		case lifecycle := <-remoteLifecycleRequests:
-			restartRequested = lifecycle == "restart"
-			break shutdownLoop
+	cause := awaitShutdown(sig, remoteLifecycleRequests, supervisorExitRequests, func() {
+		if enterpriseControls == nil {
+			slog.Warn("enterprise control reload ignored: no attachment is configured")
+		} else if err := enterpriseControls.Reload(); err != nil {
+			slog.Error("enterprise control reload rejected; keeping current signed state", "err", err)
+		} else {
+			slog.Info("enterprise control reloaded")
 		}
-	}
+	})
 	signal.Stop(sig)
 	rolloutRefreshCancel()
 	receiptExportCancel()
 	fleetControlCancel()
 
-	// Order matters: Daemon.Stop publishes daemon.shutting_down to the
-	// bus before tearing down ports/IPC/tunnels. Plugins (notably
-	// webhook) are still subscribed at that point, so the event flows
-	// through. StopPlugins then drains each plugin's queue. Reversing
-	// this order would lose the shutdown event because the webhook's
-	// bus subscription would be cancelled before doStop publishes.
-	slog.Info("shutting down")
-	d.Stop()
-
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := rt.StopPlugins(stopCtx); err != nil {
-		slog.Warn("plugin shutdown error", "err", err)
-	}
-	stopCancel()
-	if restartRequested {
+	// Daemon.Stop then StopPlugins (see teardown for why the order
+	// matters). A daemon-requested exit leaves here via os.Exit with its
+	// code once the teardown finishes.
+	shutdown(cause, func() { d.Stop() }, rt.StopPlugins, os.Exit)
+	if cause.restart {
 		executable, err := os.Executable()
 		if err != nil {
 			slog.Error("resolve daemon executable for remote restart", "err", err)
