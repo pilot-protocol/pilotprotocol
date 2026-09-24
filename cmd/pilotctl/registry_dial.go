@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/netproxy"
@@ -29,10 +32,15 @@ import (
 //     daemon's (asked over IPC), else $PILOT_TRANSPORT / config.json. On a
 //     udp host that merely exports a proxy (corporate hosts, where private
 //     registries live) the registry is dialed directly, as the daemon
-//     does; with the transport unknown (no daemon, nothing configured) the
-//     direct dial comes first and the proxy is only the fallback for the
-//     production registry. A private raw-TCP registry is never sent to the
-//     environment's proxy unless the transport is compat.
+//     does. With the transport unknown (no daemon answering, nothing
+//     configured) the production registry is tried through the
+//     environment's proxy first — a proxy that accepts the CONNECT is the
+//     stronger signal: sandboxes such as Meta Muse accept a direct TCP
+//     connection with a network guard that then breaks the first request —
+//     and directly over raw TCP second, a connection that is only used when
+//     the peer does not talk first (see probedDirectDial). A private
+//     raw-TCP registry is never sent to the environment's proxy unless the
+//     transport is compat.
 //   - address: the compiled-in raw-TCP registry (34.71.57.205:9000) is
 //     replaced by registry.pilotprotocol.network:443 over TLS whenever it
 //     would be proxied (proxies allow CONNECT to :443 only) or the
@@ -47,6 +55,9 @@ type registryRoute struct {
 	Proxy       *netproxy.Resolver
 	// Switched: Addr replaced the raw-TCP default.
 	Switched bool
+	// Probe: a direct raw-TCP fallback, used only when the peer does not
+	// talk before the first request (probedDirectDial).
+	Probe bool
 }
 
 // proxied reports whether dialing r.Addr goes through a proxy.
@@ -201,13 +212,20 @@ func planRegistryRoutes(addr string) ([]registryRoute, error) {
 			policy = env
 			break
 		}
-		// Unknown transport, production registry: direct raw TCP first,
-		// then the TLS registry through the environment's proxy.
+		// Unknown transport, production registry: the TLS registry
+		// through the environment's proxy first, then direct raw TCP.
+		// Direct first would lose to a sandbox network guard, which
+		// accepts the TCP connection and only fails the first request,
+		// so the proxied route would never be tried.
 		tlsRoute := route(compatRegistryAddr, nil)
-		if proxyFor(env, compatRegistryAddr) != "" {
-			tlsRoute.Proxy = env
+		if proxyFor(env, compatRegistryAddr) == "" {
+			// NO_PROXY exempts the registry: nothing is proxied.
+			return []registryRoute{route(addr, nil), tlsRoute}, nil
 		}
-		return []registryRoute{route(addr, nil), tlsRoute}, nil
+		tlsRoute.Proxy = env
+		raw := route(addr, nil)
+		raw.Probe = true
+		return []registryRoute{tlsRoute, raw}, nil
 	default:
 		explicit, err := proxyconf.Resolve(spec)
 		if err != nil {
@@ -236,11 +254,60 @@ func planRegistryRoutes(addr string) ([]registryRoute, error) {
 	return routes, nil
 }
 
+// rawDirectDial opens a direct TCP connection (a test seam).
+var rawDirectDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
+}
+
+// guardProbeWait is how long probedDirectDial watches a fresh connection.
+const guardProbeWait = 300 * time.Millisecond
+
+// errNotRegistry marks a direct connection whose peer is not a registry.
+var errNotRegistry = errors.New("not a Pilot registry")
+
+// probedDirectDial dials addr directly and hands back the connection only
+// when the peer stays silent for guardProbeWait, as a registry does until it
+// gets a request. A peer that sends first or closes at once — the network
+// guard of a sandbox whose only way out is its HTTPS proxy answers direct
+// connections with a policy message — fails the dial, so dialRegistry
+// reports the proxied route's error rather than a broken pipe from the
+// guard. The check costs guardProbeWait, and it only runs on the direct
+// fallback after the proxied route failed.
+func probedDirectDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	c, err := rawDirectDial(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.SetReadDeadline(time.Now().Add(guardProbeWait)); err != nil {
+		c.Close()
+		return nil, err
+	}
+	var b [1]byte
+	n, err := c.Read(b[:])
+	var ne net.Error
+	if n == 0 && errors.As(err, &ne) && ne.Timeout() {
+		if err := c.SetReadDeadline(time.Time{}); err != nil {
+			c.Close()
+			return nil, err
+		}
+		return c, nil
+	}
+	c.Close()
+	if n > 0 {
+		return nil, fmt.Errorf("%w at %s: it sent data before any request (a network guard?)", errNotRegistry, addr)
+	}
+	return nil, fmt.Errorf("%w at %s: it closed the connection before any request (a network guard?): %v", errNotRegistry, addr, err)
+}
+
 // dial opens the registry connection the route describes.
 func (r registryRoute) dial() (*registry.Client, error) {
 	var opts []registry.DialOption
-	if r.Proxy.Enabled() {
+	switch {
+	case r.Proxy.Enabled():
 		opts = append(opts, registry.WithDialer(proxyconf.DialContext(r.Proxy, nil)))
+	case r.Probe && !r.TLS:
+		opts = append(opts, registry.WithDialer(probedDirectDial))
 	}
 	if !r.TLS {
 		return registry.Dial(r.Addr, opts...)

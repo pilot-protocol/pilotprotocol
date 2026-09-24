@@ -35,9 +35,12 @@ Detailed per-release notes are on the
   connection once with the new credentials. Registry redials, WSS beacon
   reconnects and every HTTP client (plugins included) follow it, so a sandbox
   that rotates its proxy credentials every few minutes (Meta Muse) no longer
-  leaves a node "online with all apps broken" until a restart. The installer
-  saves such a command in a Linux container/VM without systemd whose
-  `HTTPS_PROXY` carries credentials. The command's output is never logged.
+  leaves a node "online with all apps broken" until a restart. In a Linux
+  container/VM without systemd whose `HTTPS_PROXY` carries credentials,
+  `pilotctl daemon start` hands the daemon `PILOT_PROXY_CMD=bash -c 'printf
+  %s "${https_proxy:-$HTTPS_PROXY}"'` itself when no `proxy_cmd` is
+  configured (so a node set up by any installer gets it), and the installer
+  saves the same command. The command's output is never logged.
 - **`-transport=auto`.** UDP when the beacon answers a UDP discover (one round
   trip), otherwise compat when the compat beacon itself answers over TCP 443
   (through the proxy, if any: a TLS GET of the beacon path must return `426
@@ -78,9 +81,12 @@ Detailed per-release notes are on the
   `$PILOT_TRANSPORT` / config.json — on a udp host that merely exports a proxy
   they dial directly, as the daemon does, so a private raw-TCP registry keeps
   working. Proxied or compat dials use `registry.pilotprotocol.network:443`
-  over TLS; a direct raw-TCP attempt falls back to it (through the
-  environment's proxy when the transport is unknown). `proxy=off` restores
-  direct dials.
+  over TLS; a direct raw-TCP attempt falls back to it. With the transport
+  unknown (no daemon answering, nothing configured) the production registry
+  is tried through the environment's proxy first and directly second, and a
+  direct connection whose peer talks or hangs up before the first request (a
+  sandbox's network guard) is not used, so the proxy's error is reported
+  instead of a broken pipe. `proxy=off` restores direct dials.
 - **`daemon start` forwards the proxy/TLS environment** (`HTTPS_PROXY`,
   `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` in both cases, `PILOT_PROXY`,
   `PILOT_TRANSPORT`, `PILOT_REGISTRY_TRUST`, `PILOT_REGISTRY_FINGERPRINT`,
@@ -88,6 +94,10 @@ Detailed per-release notes are on the
   and passes through `--compat-beacon`, `--registry-trust`,
   `--registry-fingerprint` and `--tls-trust`.
 - **`install.sh --transport <auto|udp|compat>`** (or `PILOT_TRANSPORT`).
+  install.sh here is a copy of `pilot-protocol/release:install.sh`, the script
+  https://pilotprotocol.network/install.sh serves; these installer changes
+  reach users through the matching pilot-protocol/release change, which also
+  keeps the managed-node mode (`--managed-url`).
   `udp` and `compat` are saved; `auto` (the default) is not — `--transport
   auto` removes a saved transport. `compat` skips the UDP probe. No `proxy`
   key is written (the daemon default already uses the environment's proxy).

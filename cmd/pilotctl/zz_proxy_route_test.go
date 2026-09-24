@@ -172,6 +172,9 @@ func routeSpec(r registryRoute) string {
 	if r.Fingerprint != "" {
 		s += "/pin"
 	}
+	if r.Probe {
+		s += "/probe"
+	}
 	if p := r.proxyFor(r.Addr); p != "" {
 		s += " via proxy"
 	}
@@ -195,9 +198,15 @@ func TestPlanRegistryRoutes(t *testing.T) {
 	}{
 		{name: "plain host: raw default, then the TLS registry", addr: raw,
 			want: []string{raw, tlsReg}},
-		{name: "HTTPS_PROXY, transport unknown: direct first, proxied TLS fallback", addr: raw,
+		// pilotctl-raw-route-defeated-by-muse-guard: with the transport
+		// unknown, the proxied TLS registry comes first; the direct raw
+		// route is the (probed) fallback.
+		{name: "HTTPS_PROXY, transport unknown: proxied TLS first, direct raw fallback", addr: raw,
 			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
-			want: []string{raw, tlsProxy}},
+			want: []string{tlsProxy, raw + "/probe"}},
+		{name: "HTTPS_PROXY, transport unknown, NO_PROXY exempts the registry: direct", addr: raw,
+			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128", "NO_PROXY": ".pilotprotocol.network"},
+			want: []string{raw, tlsReg}},
 		{name: "HTTPS_PROXY + config compat: proxied TLS, then direct TLS", addr: raw,
 			env:  map[string]string{"HTTPS_PROXY": "http://u:p@egress.test:3128"},
 			cfg:  map[string]interface{}{"transport": "compat"},

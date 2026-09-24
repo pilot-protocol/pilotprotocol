@@ -1092,9 +1092,13 @@ Behind an HTTPS proxy with UDP blocked (e.g. hosted agent sandboxes), plain
 "pilotctl daemon start" picks compat by itself; to skip the UDP probe:
   pilotctl config --set transport=compat && pilotctl daemon start
 If the proxy rotates its credentials, give the daemon a command that prints
-the current proxy URL (install.sh does this in hosted agent sandboxes); the
-daemon re-runs it every 60s and whenever the proxy answers 407:
+the current proxy URL; the daemon re-runs it every 60s and whenever the proxy
+answers 407:
   pilotctl config --set proxy_cmd="bash -c 'printf %s \"\$https_proxy\"'"
+On Linux without systemd (containers, hosted agent sandboxes), when
+$HTTPS_PROXY carries credentials and no proxy_cmd is configured, daemon start
+passes the daemon PILOT_PROXY_CMD=bash -c 'printf %s "${https_proxy:-$HTTPS_PROXY}"'
+by itself.
 `,
 	"daemon stop": `Usage: pilotctl daemon stop
 
@@ -3124,6 +3128,13 @@ func cmdDaemonStart(args []string) {
 	// -transport=auto when no transport is configured.
 	daemonArgs, proxyEnv, requestedTransport := adaptDaemonArgs(daemonBin, plan)
 	daemonEnv := daemonChildEnv(os.Environ(), plan.AdminToken, proxyEnv, requestedTransport)
+	// In a sandbox whose proxy credentials rotate, have the daemon re-read
+	// them (see sandboxProxyCmdFor) even when no installer saved proxy_cmd.
+	sandboxRefresh := false
+	if c := sandboxProxyCmdFor(daemonBin, plan, flags); c != "" {
+		daemonEnv = setEnv(daemonEnv, "PILOT_PROXY_CMD", c)
+		sandboxRefresh = true
+	}
 
 	// --foreground: replace the current process so signal/lifetime
 	// handling matches what the user expects from systemd unit files
@@ -3250,6 +3261,9 @@ func cmdDaemonStart(args []string) {
 			if plan.Proxy != "" {
 				fields["proxy"] = redactProxyURL(plan.Proxy)
 			}
+			if sandboxRefresh {
+				fields["proxy_cmd"] = sandboxProxyCmd
+			}
 			outputOK(fields)
 		} else {
 			fmt.Printf("Daemon running (pid %d)\n", pid)
@@ -3265,6 +3279,9 @@ func cmdDaemonStart(args []string) {
 			}
 			if plan.Proxy != "" {
 				fmt.Printf("  Proxy:    %s\n", redactProxyURL(plan.Proxy))
+			}
+			if sandboxRefresh {
+				fmt.Printf("  Proxy credentials: re-read every 60s and on a 407 (%s)\n", sandboxProxyCmd)
 			}
 			fmt.Printf("  Socket:   %s\n", socketPath)
 			fmt.Printf("  Logs:     %s\n", pidLogPath)

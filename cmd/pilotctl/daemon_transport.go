@@ -5,10 +5,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -201,6 +204,109 @@ func daemonChildEnv(base []string, adminToken, proxyEnv, transport string) []str
 		}
 	}
 	return env
+}
+
+// setEnv returns env with key set to value, replacing every existing entry
+// for key (a child reads the first of duplicate entries on some paths and
+// the last on others).
+func setEnv(env []string, key, value string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); k == key {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, key+"="+value)
+}
+
+// sandboxProxyCmd is the proxy_cmd for hosted agent sandboxes: a fresh bash
+// sees the sandbox's current proxy URL, whose credentials rotate (Meta Muse:
+// every few minutes). install.sh saves the same command.
+const sandboxProxyCmd = `bash -c 'printf %s "${https_proxy:-$HTTPS_PROXY}"'`
+
+// Test seams for sandboxProxyCmdFor.
+var (
+	hostGOOS       = runtime.GOOS
+	systemdRunning = func() bool {
+		_, err := os.Stat("/run/systemd/system")
+		return err == nil
+	}
+	bashAvailable = func() bool {
+		_, err := exec.LookPath("bash")
+		return err == nil
+	}
+)
+
+// sandboxProxyCmdFor returns the $PILOT_PROXY_CMD `daemon start` hands the
+// daemon when nothing configures one, "" when none applies. Without it a
+// daemon keeps the proxy credentials it was started with, and once a
+// sandbox rotates them every new connection fails with 407 ("node online,
+// all apps broken"). It applies only when all of these hold:
+//
+//   - Linux without systemd (a container or VM such as a hosted agent
+//     sandbox, where pilotctl rather than a service manager starts the
+//     daemon);
+//   - $HTTPS_PROXY or $https_proxy carries credentials;
+//   - the proxy setting is auto (an explicit --proxy / $PILOT_PROXY URL is
+//     left alone: the command would replace it);
+//   - no proxy_cmd is configured: $PILOT_PROXY_CMD, and "proxy_cmd" in the
+//     config file the daemon reads (--config, else ~/.pilot/config.json) and
+//     in pilotctl's own config;
+//   - bash is installed and the daemon at bin supports -proxy-cmd.
+//
+// It does not depend on the installer having saved proxy_cmd, so a node
+// installed by an older installer gets it too.
+func sandboxProxyCmdFor(bin string, plan daemonLaunchPlan, flags map[string]string) string {
+	if hostGOOS != "linux" || systemdRunning() {
+		return ""
+	}
+	if plan.Proxy != "" && plan.Proxy != proxyconf.Auto {
+		return ""
+	}
+	if !proxyHasCredentials(os.Getenv("HTTPS_PROXY")) && !proxyHasCredentials(os.Getenv("https_proxy")) {
+		return ""
+	}
+	if strings.TrimSpace(os.Getenv("PILOT_PROXY_CMD")) != "" {
+		return ""
+	}
+	if configuredProxyCmd(loadConfig()) != "" || configuredProxyCmd(daemonConfigFile(flags)) != "" {
+		return ""
+	}
+	if !bashAvailable() {
+		return ""
+	}
+	if f := daemonFlags(bin); !f["proxy-cmd"] {
+		return ""
+	}
+	return sandboxProxyCmd
+}
+
+func configuredProxyCmd(cfg map[string]interface{}) string {
+	s, _ := cfg["proxy_cmd"].(string)
+	return strings.TrimSpace(s)
+}
+
+// daemonConfigFile reads the config file pilot-daemon loads: --config, else
+// $HOME/.pilot/config.json. Empty when it cannot be read.
+func daemonConfigFile(flags map[string]string) map[string]interface{} {
+	path := flagString(flags, "config", "")
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil
+		}
+		path = filepath.Join(home, ".pilot", "config.json")
+	}
+	b, err := os.ReadFile(path) // #nosec G304 -- the operator's own config path
+	if err != nil {
+		return nil
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(b, &cfg) != nil {
+		return nil
+	}
+	return cfg
 }
 
 // daemonFlagProbeTimeout bounds the `pilot-daemon -help` flag probe.
