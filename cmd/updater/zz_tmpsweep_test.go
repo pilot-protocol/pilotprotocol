@@ -13,12 +13,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// mkTree creates path as a dir holding a file of size bytes and a
-// read-only subdir with another file, the shape an unpacked bundle can
-// have, then backdates it.
+// mkTree creates path as a dir holding a file of size bytes and a bin/
+// subdir with a read-only executable, the shape an unpacked bundle has,
+// then backdates it.
 func mkTree(t *testing.T, path string, size int, mtime time.Time) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Join(path, "bin"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(path, "bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(path, "manifest.json"), make([]byte, size), 0o600); err != nil {
@@ -27,10 +27,6 @@ func mkTree(t *testing.T, path string, size int, mtime time.Time) {
 	if err := os.WriteFile(filepath.Join(path, "bin", "app"), []byte("x"), 0o500); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(filepath.Join(path, "bin"), 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(filepath.Join(path, "bin"), 0o700) })
 	if err := os.Chtimes(path, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}

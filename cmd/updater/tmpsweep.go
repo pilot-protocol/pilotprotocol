@@ -84,7 +84,11 @@ func sweepStaleTemps(dir string, now time.Time, maxAge time.Duration) sweepResul
 				continue
 			}
 			size := treeSize(path)
-			if err := removeTree(path); err != nil {
+			// os.RemoveAll does not follow symlinks inside the tree. Every
+			// directory in these trees is created owner-writable (0755/0700:
+			// pilotctl's untarUnder, the updater's staging), so nothing in
+			// them blocks removal.
+			if err := os.RemoveAll(path); err != nil {
 				res.Failed++
 				slog.Warn("temp sweep: could not remove stale download leftover", "path", path, "err", err)
 				continue
@@ -112,24 +116,6 @@ func treeSize(path string) int64 {
 		return nil
 	})
 	return total
-}
-
-// removeTree removes path and everything under it. A bundle can unpack
-// directories without write permission, whose entries os.RemoveAll then
-// cannot delete, so on failure it makes every directory in the tree
-// writable by its owner and tries again. WalkDir does not follow symlinks,
-// so only entries inside the tree are changed.
-func removeTree(path string) error {
-	if err := os.RemoveAll(path); err == nil {
-		return nil
-	}
-	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && d.IsDir() {
-			_ = os.Chmod(p, 0o700) // #nosec G302 -- owner-only, on a dir about to be removed
-		}
-		return nil
-	})
-	return os.RemoveAll(path)
 }
 
 // tempSweepLoop runs sweepStaleTemps on the system temp directory now and
