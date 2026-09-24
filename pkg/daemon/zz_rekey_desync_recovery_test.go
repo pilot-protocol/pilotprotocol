@@ -171,8 +171,6 @@ func TestPathProbePongRefreshesLiveness(t *testing.T) {
 		t.Fatalf("SendPathProbe: %v", err)
 	}
 
-	// The peer's real control handler answers, as every deployed version
-	// does: pong.Src = probe.Dst.
 	var probe *protocol.Packet
 	deadline := time.After(desyncTestWait)
 	for probe == nil {
@@ -185,6 +183,13 @@ func TestPathProbePongRefreshesLiveness(t *testing.T) {
 			t.Fatal("peer never received the path probe")
 		}
 	}
+	// Every deployed responder (v1.10.0–v1.13.9) answers with
+	// pong.Src = probe.Dst, so the probe itself must name the peer.
+	if probe.Dst.Node != peerID {
+		t.Fatalf("BUG: probe Dst.Node = %d, want %d: a deployed peer's pong would claim node %d "+
+			"and be dropped as spoofed", probe.Dst.Node, peerID, probe.Dst.Node)
+	}
+	// The peer's real control handler answers.
 	dB.handleControlPacket(probe)
 
 	deadlineT := time.Now().Add(desyncTestWait)
@@ -194,9 +199,67 @@ func TestPathProbePongRefreshesLiveness(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("BUG: the peer's pong did not refresh inbound liveness (probe Dst=%d, so pong Src=%d): "+
-		"the identity binding drops it as spoofed and the watchdog resets a healthy path",
-		probe.Dst.Node, probe.Dst.Node)
+	t.Fatal("BUG: the peer's pong did not refresh inbound liveness: " +
+		"the identity binding drops it as spoofed and the watchdog resets a healthy path")
+}
+
+// TestPongToLegacyPathProbeRefreshesProberLiveness is link 1 in a mixed
+// fleet. A prober on v1.13.0–v1.13.9 still sends its path probe with no
+// Dst, and its identity binding treats a pong (a frame with a payload)
+// exactly as this build does. Our pong must name us anyway, or the prober
+// drops it as spoofed and its watchdog resets our healthy path. A ping that
+// does name a destination keeps getting that destination back unchanged.
+func TestPongToLegacyPathProbeRefreshesProberLiveness(t *testing.T) {
+	const laptopID, peerID uint32 = 230204, 179172
+	dA, dB := newDesyncPair(t, laptopID, peerID)
+	a, b := dA.tunnels, dB.tunnels
+	answerPings(t, dB)
+	// Keep the peer's own keepalive out of it, so only the pong can prove
+	// the path.
+	b.routing.RecordOutboundSend(laptopID, time.Now())
+
+	// The prober's route loop is not running, so every pong that passes its
+	// identity binding waits in its recvCh.
+	nextPong := func() *protocol.Packet {
+		t.Helper()
+		deadline := time.After(desyncTestWait)
+		for {
+			select {
+			case in := <-a.RecvCh():
+				if in.Packet.Protocol == protocol.ProtoControl && in.Packet.HasFlag(protocol.FlagACK) {
+					return in.Packet
+				}
+			case <-deadline:
+				t.Fatal("BUG: no pong got past the prober's identity binding: a pong claiming " +
+					"node 0 is dropped as spoofed, so a v1.13.0–v1.13.9 watchdog resets this healthy path")
+			}
+		}
+	}
+
+	stale := time.Now().Add(-2 * pathSilenceThreshold)
+	a.kx.SetLastInboundDecryptForTest(peerID, stale)
+	sendV1139PathProbe(t, a, peerID)
+	pong := nextPong()
+	if pong.Src.Node != peerID {
+		t.Fatalf("pong Src.Node = %d, want %d (the responder)", pong.Src.Node, peerID)
+	}
+	if last, ok := a.LastInboundDecrypt(peerID); !ok || !last.After(stale.Add(time.Minute)) {
+		t.Fatal("BUG: the pong to a v1.13.9 path probe did not refresh the prober's inbound liveness")
+	}
+
+	named := protocol.Addr{Network: 7, Node: peerID}
+	dB.handleControlPacket(&protocol.Packet{
+		Version:  protocol.Version,
+		Protocol: protocol.ProtoControl,
+		Src:      protocol.Addr{Node: laptopID},
+		Dst:      named,
+		SrcPort:  protocol.PortPing,
+		DstPort:  protocol.PortPing,
+		Payload:  []byte("named"),
+	})
+	if got := nextPong().Src; got != named {
+		t.Fatalf("pong Src = %+v, want the ping's Dst %+v unchanged", got, named)
+	}
 }
 
 // TestLegacyUnstampedKeepaliveCountsAsLiveness is link 2: the zero-Src NAT
@@ -360,9 +423,45 @@ func TestSpoofedSourceStillDroppedNextToLegacyKeepaliveExemption(t *testing.T) {
 	}
 }
 
+// answerPingsLikeV1139 answers pings the way every deployed handleControlPacket
+// (v1.10.0–v1.13.9) does, with pong.Src = ping.Dst even when Dst is zero.
+func answerPingsLikeV1139(t *testing.T, d *Daemon) {
+	t.Helper()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			select {
+			case in, ok := <-d.tunnels.RecvCh():
+				if !ok {
+					return
+				}
+				ping := in.Packet
+				if ping.Protocol != protocol.ProtoControl || ping.DstPort != protocol.PortPing ||
+					ping.HasFlag(protocol.FlagACK) {
+					continue
+				}
+				d.tunnels.Send(ping.Src.Node, &protocol.Packet{
+					Version:  protocol.Version,
+					Flags:    protocol.FlagACK,
+					Protocol: protocol.ProtoControl,
+					Src:      ping.Dst,
+					Dst:      ping.Src,
+					SrcPort:  protocol.PortPing,
+					DstPort:  ping.SrcPort,
+					Seq:      ping.Seq,
+					Ack:      ping.Seq + 1,
+					Payload:  ping.Payload,
+				})
+			case <-done:
+				return
+			}
+		}
+	}()
+}
+
 // answerPings runs the peer's route loop, reduced to what matters here:
-// its real control handler answers pings (pong.Src = ping.Dst, as on every
-// deployed version).
+// this build's real control handler answers pings.
 func answerPings(t *testing.T, d *Daemon) {
 	t.Helper()
 	done := make(chan struct{})
@@ -390,18 +489,41 @@ func answerPings(t *testing.T, d *Daemon) {
 func sendV1120Keepalive(t *testing.T, peer *TunnelManager, toID uint32) {
 	t.Helper()
 	ka := &protocol.Packet{Version: protocol.Version, Protocol: protocol.ProtoControl, DstPort: protocol.PortPing}
-	plaintext, err := ka.Marshal()
+	sendOverSession(t, peer, toID, ka)
+}
+
+// sendV1139PathProbe sends a path probe from prober to toID exactly as
+// SendPathProbe did in v1.13.0–v1.13.9: over the established session, with
+// no Dst.
+func sendV1139PathProbe(t *testing.T, prober *TunnelManager, toID uint32) {
+	t.Helper()
+	probe := &protocol.Packet{
+		Version:  protocol.Version,
+		Protocol: protocol.ProtoControl,
+		SrcPort:  protocol.PortPing,
+		DstPort:  protocol.PortPing,
+		Src:      protocol.Addr{Node: prober.loadNodeID()},
+		Payload:  pathProbePayload,
+	}
+	sendOverSession(t, prober, toID, probe)
+}
+
+// sendOverSession seals pkt under from's established session with toID and
+// writes it to toID's endpoint, as the sending daemon's tunnel does.
+func sendOverSession(t *testing.T, from *TunnelManager, toID uint32, pkt *protocol.Packet) {
+	t.Helper()
+	plaintext, err := pkt.Marshal()
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	pc := peer.envelope.Get(toID)
-	peer.mu.RLock()
-	addr := peer.peers[toID]
-	peer.mu.RUnlock()
+	pc := from.envelope.Get(toID)
+	from.mu.RLock()
+	addr := from.peers[toID]
+	from.mu.RUnlock()
 	if pc == nil || addr == nil {
-		t.Fatalf("peer has no session/endpoint for %d", toID)
+		t.Fatalf("no session/endpoint for %d", toID)
 	}
-	if err := peer.writeFrame(toID, addr, peer.encryptFrame(pc, plaintext)); err != nil {
+	if err := from.writeFrame(toID, addr, from.encryptFrame(pc, plaintext)); err != nil {
 		t.Fatalf("writeFrame: %v", err)
 	}
 }
@@ -423,43 +545,54 @@ func waitForInboundAfter(tm *TunnelManager, peerID uint32, since time.Time) bool
 // TestPathWatchdogDoesNotResetHealthyQuietPeer ties both fixes to the
 // outcome that mattered in the incident: the path watchdog must never reach
 // resetPeerPath for a healthy peer that is only quiet. Two real daemons
-// over loopback; the peer runs the real ping handler.
+// over loopback; the peer answers pings either with this build's real
+// handler or exactly as every deployed version does.
 //
 // Not parallel: swaps the package-level pathWatchResetPeer hook.
 func TestPathWatchdogDoesNotResetHealthyQuietPeer(t *testing.T) {
-	// A current peer with nothing to send. It looks inbound-silent past the
+	// A peer with nothing to send. It looks inbound-silent past the
 	// threshold, so the watchdog probes it; its pong must clear the
-	// suspicion before the probe budget runs out.
-	t.Run("current peer answers the probe", func(t *testing.T) {
-		const laptopID, peerID uint32 = 230204, 179172
-		dA, dB := newDesyncPair(t, laptopID, peerID)
-		a, b := dA.tunnels, dB.tunnels
-		resets := swapPathResetForTest(t)
-		answerPings(t, dB)
-		// Keep the peer's own keepalive from firing during the test, so only
-		// the pong can prove the path.
-		b.routing.RecordOutboundSend(laptopID, time.Now())
+	// suspicion before the probe budget runs out. The deployed responder
+	// echoes the probe's Dst as the pong's Src, so it pins the probe fix on
+	// its own; this build's responder would name itself anyway.
+	for _, peer := range []struct {
+		name   string
+		answer func(*testing.T, *Daemon)
+	}{
+		{"current peer answers the probe", answerPings},
+		{"v1.13.9 peer answers the probe", answerPingsLikeV1139},
+	} {
+		t.Run(peer.name, func(t *testing.T) {
+			const laptopID, peerID uint32 = 230204, 179172
+			dA, dB := newDesyncPair(t, laptopID, peerID)
+			a, b := dA.tunnels, dB.tunnels
+			resets := swapPathResetForTest(t)
+			peer.answer(t, dB)
+			// Keep the peer's own keepalive from firing during the test, so
+			// only the pong can prove the path.
+			b.routing.RecordOutboundSend(laptopID, time.Now())
 
-		stale := time.Now().Add(-2 * pathSilenceThreshold)
-		a.kx.SetLastInboundDecryptForTest(peerID, stale)
+			stale := time.Now().Add(-2 * pathSilenceThreshold)
+			a.kx.SetLastInboundDecryptForTest(peerID, stale)
 
-		st := &pathPeerState{}
-		var actions []pathWatchAction
-		for tick := 0; tick <= pathProbeMax; tick++ {
-			act := dA.pathWatchPeer(peerID, st, time.Now())
-			actions = append(actions, act)
-			if act == pathActionProbe {
-				waitForInboundAfter(a, peerID, stale)
+			st := &pathPeerState{}
+			var actions []pathWatchAction
+			for tick := 0; tick <= pathProbeMax; tick++ {
+				act := dA.pathWatchPeer(peerID, st, time.Now())
+				actions = append(actions, act)
+				if act == pathActionProbe {
+					waitForInboundAfter(a, peerID, stale)
+				}
 			}
-		}
-		if len(*resets) != 0 {
-			t.Fatalf("BUG: the watchdog reset a healthy peer that answered every probe (actions %v): "+
-				"its pongs never counted as inbound liveness", actions)
-		}
-		if actions[0] != pathActionProbe || actions[len(actions)-1] != pathActionHealthy {
-			t.Fatalf("actions = %v, want one probe and then healthy", actions)
-		}
-	})
+			if len(*resets) != 0 {
+				t.Fatalf("BUG: the watchdog reset a healthy peer that answered every probe (actions %v): "+
+					"its pongs never counted as inbound liveness", actions)
+			}
+			if actions[0] != pathActionProbe || actions[len(actions)-1] != pathActionHealthy {
+				t.Fatalf("actions = %v, want one probe and then healthy", actions)
+			}
+		})
+	}
 
 	// A v1.12.0 peer with nothing to send. Its only inbound is the zero-Src
 	// keepalive every ~25s, which must keep it from ever looking silent: no
@@ -469,7 +602,7 @@ func TestPathWatchdogDoesNotResetHealthyQuietPeer(t *testing.T) {
 		dA, dB := newDesyncPair(t, laptopID, peerID)
 		a, b := dA.tunnels, dB.tunnels
 		resets := swapPathResetForTest(t)
-		answerPings(t, dB) // v1.12.0 answers pings too
+		answerPingsLikeV1139(t, dB) // v1.12.0 answers pings the same way
 
 		st := &pathPeerState{}
 		var actions []pathWatchAction

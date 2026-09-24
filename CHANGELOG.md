@@ -60,8 +60,11 @@ Detailed per-release notes are on the
   a zero source. A quiet peer therefore looked inbound-silent about 55s after
   every handshake, and its path was reset about 30s later, which could leave
   the session unusable until a restart. Probes now name the peer, and the
-  empty zero-source keepalive counts as liveness. Any other frame whose source
-  does not match the authenticated peer is still dropped. No wire change.
+  empty zero-source keepalive counts as liveness. The pong to a probe from a
+  v1.13.0–v1.13.9 node, which still has no destination, now names the
+  responder, so those nodes also stop resetting their paths to this one. Any
+  other frame whose source does not match the authenticated peer is still
+  dropped. No wire change.
 
 ## [1.12.8] - 2026-07-16
 
