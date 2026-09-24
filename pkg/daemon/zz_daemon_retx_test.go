@@ -178,10 +178,11 @@ func TestRetransmitUnackedMaxAttemptsSendsRSTAndCloses(t *testing.T) {
 	conn, captured := newDaemonRetxConn(t)
 	conn.Unacked = []*retxEntry{
 		{
-			seq:      1000,
-			data:     []byte("dead"),
-			sentAt:   time.Now().Add(-1 * time.Hour),
-			attempts: MaxRetxAttempts,
+			seq:         1000,
+			data:        []byte("dead"),
+			sentAt:      time.Now().Add(-1 * time.Hour),
+			attempts:    MaxRetxAttempts,
+			rtoAttempts: MaxRetxAttempts,
 		},
 	}
 

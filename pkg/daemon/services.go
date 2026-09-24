@@ -238,6 +238,17 @@ func (d *Daemon) handleEchoConn(conn *Connection) {
 			return
 		}
 	}
+	// Write through connAdapter, not SendData directly: SendData returns
+	// ErrSendBufFull the moment the NagleBuf cap is hit, which is routine
+	// transient backpressure whenever data arrives faster than the
+	// congestion window drains (any bulk transfer). Treating it as fatal
+	// silently killed the echo loop mid-transfer while the connection kept
+	// ACKing inbound data — the peer saw its payload accepted and nothing
+	// echoed back. connAdapter.Write blocks-and-retries with backoff (the
+	// v1.9.1 semantics net.Conn callers already rely on) and still fails on
+	// real errors: connection no longer established, or a peer stuck past
+	// connAdapterWriteDeadline.
+	w := &connAdapter{conn: conn, daemon: d}
 	for {
 		data, ok := <-conn.RecvBuf
 		// Capture right after the channel read — before any branching —
@@ -254,12 +265,12 @@ func (d *Daemon) handleEchoConn(conn *Connection) {
 			copy(resp[0:4], data[0:4])
 			copy(resp[4:12], data[4:12])
 			binary.BigEndian.PutUint64(resp[12:20], uint64(recvNs))
-			if err := d.SendData(conn, resp); err != nil {
+			if _, err := w.Write(resp); err != nil {
 				return
 			}
 			continue
 		}
-		if err := d.SendData(conn, data); err != nil {
+		if _, err := w.Write(data); err != nil {
 			return
 		}
 	}

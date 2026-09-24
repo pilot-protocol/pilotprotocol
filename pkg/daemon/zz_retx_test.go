@@ -245,10 +245,11 @@ func TestRetransmitUnackedMaxAttemptsSendsRSTAndClosesState(t *testing.T) {
 	d := New(Config{})
 	conn, cs := newRetxConn(t)
 	conn.Unacked = []*retxEntry{{
-		data:     []byte("x"),
-		seq:      999,
-		sentAt:   time.Now().Add(-2 * InitialRTO),
-		attempts: MaxRetxAttempts,
+		data:        []byte("x"),
+		seq:         999,
+		sentAt:      time.Now().Add(-2 * InitialRTO),
+		attempts:    MaxRetxAttempts,
+		rtoAttempts: MaxRetxAttempts,
 	}}
 	d.retransmitUnacked(conn)
 

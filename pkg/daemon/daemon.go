@@ -4350,7 +4350,14 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 			continue
 		}
 		if now.Sub(e.sentAt) > conn.RTO {
-			if e.attempts >= MaxRetxAttempts {
+			// Give-up check on rtoAttempts, NOT attempts: ACK-clocked
+			// retransmissions (fast retransmit / retransmitLost bursts) also
+			// increment attempts, but each one was triggered by an arriving
+			// ACK — the path is demonstrably alive. Counting them here made
+			// a spurious RTO plus a handful of partial ACKs RST a healthy
+			// connection within ~8×RTOMin (1.6 s). Only consecutive RTO
+			// firings with no ACK progress indicate a dead peer.
+			if e.rtoAttempts >= MaxRetxAttempts {
 				// Too many retransmissions — abandon connection
 				slog.Error("max retransmits exceeded, sending RST", "conn_id", conn.ID)
 				// Send RST to notify the remote peer
@@ -4412,6 +4419,7 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 			}
 
 			e.attempts++
+			e.rtoAttempts++
 			e.sentAt = now
 			conn.Mu.Lock()
 			conn.Stats.Retransmits++
