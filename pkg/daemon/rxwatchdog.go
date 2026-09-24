@@ -35,10 +35,12 @@ import (
 //     MsgDiscover reply doubles as an active inbound probe — plus
 //     reRegister with the registry. Heals transient beacon endpoint
 //     staleness without touching the transport.
-//  2. Hard: exit with rxWedgeExitCode. launchd (KeepAlive
-//     SuccessfulExit=false) and systemd (Restart=always) respawn the
-//     daemon with a fresh socket + registration — the remedy that is
-//     known to clear the wedge. Guarded so it cannot flap:
+//  2. Hard: exit with rxWedgeExitCode, after a graceful shutdown that
+//     stops the plugins (and so the app-store's child apps) — see
+//     exit.go. launchd (KeepAlive SuccessfulExit=false) and systemd
+//     (Restart=always) respawn the daemon with a fresh socket +
+//     registration — the remedy that is known to clear the wedge.
+//     Guarded so it cannot flap:
 //     only after PktsRecv has progressed at least once this process
 //     (a never-worked config soft-recovers forever instead of
 //     boot-looping), only when the registry was reachable within
@@ -113,8 +115,12 @@ const (
 )
 
 // rxWatchdogExit is swapped by tests to observe the hard escalation
-// without killing the test process.
-var rxWatchdogExit = func(code int) { os.Exit(code) }
+// without killing the test process. It requests a graceful shutdown
+// followed by exit(code) rather than calling os.Exit directly, so the
+// app-store plugin still reaps its child apps (see exit.go).
+var rxWatchdogExit = func(code int) {
+	requestSupervisorExit(ExitRequest{Code: code, Reason: "rx-wedge"})
+}
 
 // rxWatchdogState carries the loop's tick-to-tick memory. Kept as a
 // struct (not loop locals) so tests can drive rxWatchdogTick directly,
@@ -178,7 +184,12 @@ func (d *Daemon) rxWatchdogLoop() {
 				d.rxWatchdogResume(st, now, gap)
 			}
 			lastTick = now
-			d.rxWatchdogTick(st, now)
+			if d.rxWatchdogTick(st, now) == rxActionExit {
+				// Exit requested; shutdown is in flight. Stop ticking so
+				// a slow teardown can't re-escalate and record a second
+				// exit against the restart-loop breaker.
+				return
+			}
 		}
 	}
 }

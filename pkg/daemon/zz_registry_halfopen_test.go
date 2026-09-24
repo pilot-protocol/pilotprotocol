@@ -126,3 +126,24 @@ func TestForceReconnectRegistryRecoversFromHalfOpenConn(t *testing.T) {
 		t.Fatalf("register response missing node_id: %v", resp)
 	}
 }
+
+// A reconnect requested after Stop began (the heartbeat and rx-watchdog
+// call forceReconnectRegistry without coordinating with Stop) must not
+// install a fresh registry pool that nothing will ever close.
+func TestForceReconnectRegistryAfterStopDoesNotReplaceConn(t *testing.T) {
+	t.Parallel()
+	reg, liveRC := startTestRegistry(t)
+	defer reg.Close()
+	defer liveRC.Close()
+
+	d := New(Config{RegistryAddr: reg.Addr().String()})
+	d.regConn.Store(liveRC)
+	close(d.stopCh)
+
+	if err := d.forceReconnectRegistry(); !errors.Is(err, errDaemonStopping) {
+		t.Fatalf("forceReconnectRegistry after stop: err = %v, want errDaemonStopping", err)
+	}
+	if got := d.reg(); got != liveRC {
+		t.Fatal("forceReconnectRegistry replaced the registry conn after Stop began")
+	}
+}
