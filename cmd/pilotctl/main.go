@@ -907,6 +907,7 @@ Flags:
   --no-resend           on first contact, never send the request a second
                         time (by default a request with no reply by mid-wait
                         is re-sent once on a new stream)
+  --timeout <dur>       total wall time, including connect, handshake and reply
   --trace               print per-step timing breakdown to stderr
   --no-auto-handshake   skip automatic trust handshake with known agents
   --enterprise-control <path>  request a signed enterprise decision before sending
@@ -1592,7 +1593,12 @@ func printCommandHelp(cmd string, cmdArgs []string) {
 // --- Usage ---
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `pilotctl — Pilot Protocol CLI
+	printUsage(os.Stderr)
+	os.Exit(2)
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, `pilotctl — Pilot Protocol CLI
 
 Global flags:
   --json                        Output structured JSON (for agent/programmatic use)
@@ -1719,7 +1725,6 @@ Companion binaries:
   $PILOT_DAEMON_BIN / $PILOT_GATEWAY_BIN, next to the pilotctl
   executable, then $PATH.
 `)
-	os.Exit(2)
 }
 
 // --- Main ---
@@ -1755,8 +1760,9 @@ func main() {
 	cmdArgs := args[1:]
 
 	// Top-level help
-	if cmd == "-h" || cmd == "--help" {
-		usage()
+	if cmd == "help" || cmd == "-h" || cmd == "--help" {
+		printUsage(os.Stdout)
+		return
 	}
 	// Per-command help: pilotctl <cmd> -h / --help
 	if hasHelpFlag(cmdArgs) {
@@ -1778,7 +1784,7 @@ dispatch:
 		cmdArgs = cmdArgs[1:]
 		goto dispatch
 
-	case "version":
+	case "version", "--version":
 		fmt.Println(version)
 		return
 
@@ -2181,28 +2187,10 @@ func cmdConfig(args []string) {
 		if len(parts) != 2 {
 			fatalCode("invalid_argument", "usage: pilotctl config --set key=value")
 		}
-		// Validate the keys daemon start (and pilot-daemon, which reads
-		// config.json itself) interprets, so a typo fails here rather than
-		// on the next daemon start. Empty clears the key.
-		value := parts[1]
-		if value != "" {
-			switch parts[0] {
-			case "transport":
-				t, err := normalizeTransport(value)
-				if err == nil && t == "" {
-					err = validateTransport(value)
-				}
-				if err != nil {
-					fatalCode("invalid_argument", "config: %v", err)
-				}
-				value = t
-			case "proxy":
-				p, err := proxyconf.Normalize(value)
-				if err != nil {
-					fatalCode("invalid_argument", "config: %v", err)
-				}
-				value = p
-			}
+		parts[0] = strings.ReplaceAll(parts[0], "-", "_")
+		value, err := validateConfigValue(parts[0], parts[1])
+		if err != nil {
+			fatalCode("invalid_argument", "config: %v", err)
 		}
 		cfg := loadConfig()
 		cfg[parts[0]] = value
@@ -2228,7 +2216,7 @@ func cmdConfig(args []string) {
 			fatalCode("internal", "save config: %v", err)
 		}
 		if parts[0] == "proxy" {
-			result["value"] = redactProxyURL(value)
+			result["value"] = redactProxyURL(value.(string))
 		}
 		outputOK(result)
 		return
@@ -2510,7 +2498,7 @@ func contextCatalog() map[string]interface{} {
 
 			// Messaging
 			"send-message": map[string]interface{}{
-				"args":        []string{"<address|hostname>", "--data <text>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]"},
+				"args":        []string{"<address|hostname>", "--data <text>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]"},
 				"description": "Send a typed message to a node via data exchange (port 1001). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Default type: text",
 				"returns":     "target, to, type, bytes, ack, reuse_conn",
 			},
@@ -2881,7 +2869,17 @@ func planDaemonLaunch(args []string) daemonLaunchPlan {
 			hostname = h
 		}
 	}
-	encrypt := !flagBool(flags, "no-encrypt")
+	encrypt := true
+	if value, ok := cfg["encrypt"]; ok {
+		parsed, err := strconv.ParseBool(fmt.Sprint(value))
+		if err != nil {
+			fatalCode("invalid_argument", "config: encrypt must be true or false")
+		}
+		encrypt = parsed
+	}
+	if flagBool(flags, "no-encrypt") {
+		encrypt = false
+	}
 	identityPath := flagString(flags, "identity", "")
 	if identityPath == "" {
 		identityPath = configDir() + "/identity.json"
@@ -2945,7 +2943,7 @@ func planDaemonLaunch(args []string) daemonLaunchPlan {
 		"--log-format", logFormat,
 	)
 	// pilot-daemon's encrypt flag defaults to true; pass `=false`
-	// only when --no-encrypt was supplied.
+	// when disabled through config or --no-encrypt.
 	if !encrypt {
 		daemonArgs = append(daemonArgs, "--encrypt=false")
 	}
@@ -4844,8 +4842,29 @@ func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename s
 
 func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
-	if len(pos) < 1 {
-		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--no-resend] [--enterprise-control <path> --governed-resource <receiver-resource>]")
+	for name := range flags {
+		switch name {
+		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake", "enterprise-control", "governed-resource":
+		default:
+			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
+		}
+	}
+	// The CLI owns a hard wall-clock budget: driver and registry requests,
+	// handshakes, policy decisions, ACKs and inbox polling can all block.
+	// Exiting closes the IPC session, cancelling its outstanding daemon work.
+	// --wait retains its reply-only meaning; --timeout caps the entire command.
+	if raw, ok := flags["timeout"]; ok {
+		timeout, err := time.ParseDuration(raw)
+		if err != nil || timeout <= 0 {
+			fatalCode("invalid_argument", "--timeout must be a positive duration")
+		}
+		timer := time.AfterFunc(timeout, func() {
+			fatalHint("timeout", "delivery may already have occurred; check the inbox before retrying", "send-message exceeded total timeout %s", timeout)
+		})
+		defer timer.Stop()
+	}
+	if len(pos) != 1 {
+		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend] [--enterprise-control <path> --governed-resource <receiver-resource>]")
 	}
 
 	sendCount := flagInt(flags, "count", 1)
@@ -4858,7 +4877,11 @@ func cmdSendMessage(args []string) {
 		if raw == "true" {
 			waitDur = 30 * time.Second
 		} else {
-			waitDur = flagDuration(flags, "wait", 30*time.Second)
+			var err error
+			waitDur, err = time.ParseDuration(raw)
+			if err != nil || waitDur <= 0 {
+				fatalCode("invalid_argument", "--wait must be a positive duration")
+			}
 		}
 	}
 

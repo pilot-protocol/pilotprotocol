@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
@@ -350,12 +352,23 @@ func daemonFlagUsage(bin string) map[string]string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), daemonFlagProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "-help")
-	// Minimal environment: -help prints each flag's default, and an older
-	// daemon with env-backed defaults would echo e.g. a credential-bearing
-	// $PILOT_PROXY into the captured output.
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
-	out, _ := cmd.CombinedOutput() // -help exits 0 (flag.ExitOnError) or 2 on older builds
+	var out []byte
+	for attempt := 0; ; attempt++ {
+		cmd := exec.CommandContext(ctx, bin, "-help")
+		// Minimal environment: -help prints each flag's default, and an older
+		// daemon with env-backed defaults would echo e.g. a credential-bearing
+		// $PILOT_PROXY into the captured output.
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+		var err error
+		out, err = cmd.CombinedOutput() // -help exits 0 (flag.ExitOnError) or 2 on older builds
+		// ETXTBSY: the binary is still open for writing (an updater or
+		// installer swapping it, or a concurrently forked process that
+		// inherited the write fd). It clears within milliseconds.
+		if !errors.Is(err, syscall.ETXTBSY) || attempt >= 4 || ctx.Err() != nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	var set map[string]string
 	current := ""
 	sc := bufio.NewScanner(strings.NewReader(string(out)))
@@ -381,7 +394,10 @@ func daemonFlagUsage(bin string) map[string]string {
 			set[current] += strings.TrimSpace(line) + " "
 		}
 	}
-	daemonFlagCache[bin] = set
+	if set != nil {
+		// A failed probe is not cached, so a later call can still learn the flags.
+		daemonFlagCache[bin] = set
+	}
 	return set
 }
 
