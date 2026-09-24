@@ -34,6 +34,9 @@ func CommandSource(command string, env []string) func(ctx context.Context) (stri
 		env = append(make([]string, 0, len(env)), env...)
 	}
 	return func(ctx context.Context) (string, error) {
+		// #nosec G204 -- running the operator's proxy command (-proxy-cmd,
+		// $PILOT_PROXY_CMD, config.json proxy_cmd) with sh -c is this function's
+		// purpose; it is set by whoever starts the daemon, never by a peer.
 		cmd := exec.CommandContext(ctx, "sh", "-c", command)
 		if env != nil {
 			cmd.Env = env

@@ -229,10 +229,17 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **Proxy credential hints no longer send an operator who already set
+  `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
+  a proxy command and the proxy still rejects them (407, or Meta Muse's
+  garbled answer), `pilotctl daemon start` names the command in use and says
+  to check what it prints from a fresh shell; the daemon's own hint covers
+  both cases. The installer's sandbox `proxy_cmd` is now checked in CI to be
+  the command `pilotctl daemon start` hands the daemon (they must not drift).
 - **`pilotctl --json trusted list` printed the text table**; it now returns
   `{"trusted": [{"hostname", "address", "node_id"}], "count"}`.
 - **A new pilotctl starting a pilot-daemon that predates proxy support**
-  (v1.13.9) from a shell with `$HTTPS_PROXY` / `$ALL_PROXY` now warns that
+  (v1.13.10 and earlier) from a shell with `$HTTPS_PROXY` / `$ALL_PROXY` now warns that
   the daemon will not use the proxy, instead of leaving a bare "did not
   become ready" to explain it.
 - **Downgrading after `transport=auto` was saved no longer bricks the daemon.**

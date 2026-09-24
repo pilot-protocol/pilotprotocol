@@ -22,7 +22,7 @@ import (
 // the proxy must allow CONNECT to the registry.
 func TestCLIDaemonStartGarbledProxyAnswerHint(t *testing.T) {
 	const garbled = "proxy CONNECT registry.pilotprotocol.network:443 via http://***@127.0.0.1:3151: read CONNECT response: malformed HTTP status code (response text withheld)"
-	hint := proxyErrorHint(garbled)
+	hint := proxyErrorHint(garbled, "")
 	if !strings.Contains(hint, "could not be parsed") || !strings.Contains(hint, "proxy_cmd") || strings.Contains(hint, "must allow CONNECT") {
 		t.Errorf("proxyErrorHint(garbled) = %q", hint)
 	}
@@ -33,7 +33,7 @@ func TestCLIDaemonStartGarbledProxyAnswerHint(t *testing.T) {
 		"proxy CONNECT registry.pilotprotocol.network:443: 403 Forbidden",
 		"proxy CONNECT registry.pilotprotocol.network:443 via http://***@p:1: read CONNECT response: EOF",
 	} {
-		if h := proxyErrorHint(other); strings.Contains(h, "could not be parsed") {
+		if h := proxyErrorHint(other, ""); strings.Contains(h, "could not be parsed") {
 			t.Errorf("proxyErrorHint(%q) = %q, not a garbled answer", other, h)
 		}
 	}
@@ -113,5 +113,68 @@ func TestSandboxProxyCmdKeepsTheCredentialedProxy(t *testing.T) {
 	}
 	if got := proxyconf.ProxyFor(r, "registry.pilotprotocol.network:443"); got != "http://***@egress.test:3128" {
 		t.Fatalf("daemon proxy with the sandbox command = %q, want the credentialed http://***@egress.test:3128", got)
+	}
+}
+
+// When the daemon already re-reads its credentials with a proxy command,
+// a rejected credential means that command printed stale or wrong ones:
+// the hint must say so and not tell the operator to set one (E2E scenario
+// 3: a 407 with config.json proxy_cmd in place was answered with "give the
+// daemon a command that prints the current proxy URL").
+func TestProxyErrorHintWithProxyCommandInUse(t *testing.T) {
+	for _, proxyErr := range []string{
+		"proxy CONNECT registry.pilotprotocol.network:443: 407 Proxy Authentication Required",
+		"proxy CONNECT registry.pilotprotocol.network:443 via http://***@127.0.0.1:3151: read CONNECT response: malformed HTTP status code (response text withheld)",
+	} {
+		without := proxyErrorHint(proxyErr, "")
+		if !strings.Contains(without, rotateHint) {
+			t.Errorf("no proxy command: hint %q lacks the proxy_cmd advice", without)
+		}
+		with := proxyErrorHint(proxyErr, "config.json proxy_cmd")
+		if strings.Contains(with, rotateHint) || strings.Contains(with, "give the daemon a command") {
+			t.Errorf("proxy command in use: hint %q still says to set one", with)
+		}
+		if !strings.Contains(with, "already re-reads them with config.json proxy_cmd") || !strings.Contains(with, "fresh shell") {
+			t.Errorf("proxy command in use: hint %q does not name it or say how to check it", with)
+		}
+	}
+	if h := proxyErrorHint("proxy CONNECT registry.pilotprotocol.network:443: 403 Forbidden", "config.json proxy_cmd"); strings.Contains(h, "re-reads") {
+		t.Errorf("a 403 is not a credential problem: %q", h)
+	}
+}
+
+// install.sh saves SANDBOX_PROXY_CMD as config.json proxy_cmd on sandbox
+// hosts, and a saved proxy_cmd turns off the one `daemon start` would hand
+// the daemon (sandboxProxyCmdFor). The two must be the same command, or a
+// node the installer set up runs an older one (web4-470 review: the
+// installer kept `printf %s "${https_proxy:-$HTTPS_PROXY}"`, which drops
+// credentials that only HTTPS_PROXY carries).
+func TestInstallerSavesTheSandboxProxyCmd(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	src, err := os.ReadFile(filepath.Join("..", "..", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var assign string
+	for _, line := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(line, "SANDBOX_PROXY_CMD=") {
+			if assign != "" {
+				t.Fatal("install.sh assigns SANDBOX_PROXY_CMD more than once")
+			}
+			assign = line
+		}
+	}
+	if assign == "" {
+		t.Fatal("install.sh has no SANDBOX_PROXY_CMD= line")
+	}
+	out, err := exec.Command(sh, "-c", assign+`; printf %s "$SANDBOX_PROXY_CMD"`).Output()
+	if err != nil {
+		t.Fatalf("evaluating %q: %v", assign, err)
+	}
+	if string(out) != sandboxProxyCmd {
+		t.Errorf("install.sh SANDBOX_PROXY_CMD = %q\npilotctl sandboxProxyCmd  = %q", out, sandboxProxyCmd)
 	}
 }

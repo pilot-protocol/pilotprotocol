@@ -206,15 +206,29 @@ func daemonExitStatus(err error) string {
 // daemon rotating credentials.
 const rotateHint = "if the proxy rotates its credentials, give the daemon a command that prints the current proxy URL: --proxy-cmd, or pilotctl config --set proxy_cmd=\"bash -c 'printf %s \\\"\\$https_proxy\\\"'\""
 
+// refreshingHint replaces rotateHint when the daemon already re-reads its
+// credentials with a proxy command (src names it, see proxyCmdSource):
+// telling the user to set one would send them after the wrong fix. The
+// command itself printed credentials the proxy refused.
+func refreshingHint(src string) string {
+	return "the daemon already re-reads them with " + src + " (every 60s and on each rejection), so that command printed credentials the proxy refused: run it from a fresh shell and check that it prints a proxy URL with the current credentials"
+}
+
 // proxyErrorHint says what to do about a proxy error the daemon logged.
-func proxyErrorHint(proxyErr string) string {
+// refreshSrc is the proxy command the daemon re-reads its credentials
+// with (proxyCmdSource), "" when it has none.
+func proxyErrorHint(proxyErr, refreshSrc string) string {
+	credentials := rotateHint
+	if refreshSrc != "" {
+		credentials = refreshingHint(refreshSrc)
+	}
 	switch {
 	case strings.Contains(proxyErr, " 407 "):
-		return "the proxy rejected the credentials (407): check HTTPS_PROXY (or --proxy / PILOT_PROXY); " + rotateHint
+		return "the proxy rejected the credentials (407): check HTTPS_PROXY (or --proxy / PILOT_PROXY); " + credentials
 	case strings.Contains(proxyErr, "read CONNECT response: ") && strings.Contains(proxyErr, "(response text withheld)"):
 		// netproxy's report of a CONNECT answer it could not parse — how
 		// Meta Muse's proxy rejects wrong or expired credentials.
-		return "the proxy's answer to CONNECT could not be parsed (\"malformed HTTP status code\"), which is how some egress proxies (Meta Muse's) reject wrong or expired credentials: check the credentials in HTTPS_PROXY (or --proxy / PILOT_PROXY); " + rotateHint
+		return "the proxy's answer to CONNECT could not be parsed (\"malformed HTTP status code\"), which is how some egress proxies (Meta Muse's) reject wrong or expired credentials: check the credentials in HTTPS_PROXY (or --proxy / PILOT_PROXY); " + credentials
 	case strings.Contains(proxyErr, ": dial proxy "):
 		return "the proxy could not be reached: check HTTPS_PROXY (or --proxy / PILOT_PROXY)"
 	default:
@@ -226,12 +240,12 @@ func proxyErrorHint(proxyErr string) string {
 // ready: it exited (exitStatus != "") or the wait ran out. It shows what
 // the daemon's log says went wrong — above all its last proxy error, which
 // behind an egress proxy is nearly always the cause — instead of only "did
-// not become ready".
-func reportDaemonStartFailure(pid int, logPath, exitStatus string, waited time.Duration) {
+// not become ready". refreshSrc is as for proxyErrorHint.
+func reportDaemonStartFailure(pid int, logPath, exitStatus string, waited time.Duration, refreshSrc string) {
 	proxyErr := lastProxyErrorFromLog(logPath)
 	hint := fmt.Sprintf("check logs: tail -f %s", logPath)
 	if proxyErr != "" {
-		hint = proxyErrorHint(proxyErr) + "; full log: " + logPath
+		hint = proxyErrorHint(proxyErr, refreshSrc) + "; full log: " + logPath
 	}
 	if exitStatus != "" {
 		msg := fmt.Sprintf("daemon (pid %d) exited during startup (%s)", pid, exitStatus)

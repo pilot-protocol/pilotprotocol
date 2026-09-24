@@ -112,7 +112,7 @@ func StartRelay(r *netproxy.Resolver, proxyTLS *tls.Config) (*Relay, error) {
 func startRelayOn(ln net.Listener, r *netproxy.Resolver, proxyTLS *tls.Config) (*Relay, error) {
 	raw := make([]byte, 24)
 	if _, err := rand.Read(raw); err != nil {
-		ln.Close()
+		_ = ln.Close()
 		return nil, fmt.Errorf("proxy relay: token: %w", err)
 	}
 	token := hex.EncodeToString(raw)
@@ -184,7 +184,7 @@ func (rl *Relay) Close() error {
 	rl.closed = true
 	err := rl.ln.Close()
 	for c := range rl.conns {
-		c.Close()
+		_ = c.Close()
 	}
 	rl.mu.Unlock()
 	rl.cancel()
@@ -212,7 +212,7 @@ func (rl *Relay) untrack(c net.Conn) {
 	rl.mu.Lock()
 	delete(rl.conns, c)
 	rl.mu.Unlock()
-	c.Close()
+	_ = c.Close()
 }
 
 func (rl *Relay) serve() {
@@ -235,7 +235,7 @@ func (rl *Relay) serve() {
 		}
 		backoff = 5 * time.Millisecond
 		if !rl.track(c, true) {
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		go func() {
@@ -295,7 +295,7 @@ func (rl *Relay) handle(c net.Conn) {
 		return
 	}
 	if !rl.track(up, false) {
-		up.Close()
+		_ = up.Close()
 		return
 	}
 	defer rl.untrack(up)
@@ -421,5 +421,5 @@ func closeWrite(c net.Conn) {
 			return
 		}
 	}
-	c.Close()
+	_ = c.Close()
 }

@@ -391,15 +391,21 @@ func UnreadableConnectReply(err error) bool {
 	return strings.Contains(msg, "read CONNECT response: ") && strings.Contains(msg, "(response text withheld)")
 }
 
+// rotatingCredentialsHint ends CredentialHint. It covers both a daemon
+// without a proxy command and one whose command is already set (and then
+// printed the credentials the proxy refused), so it never sends an
+// operator who set -proxy-cmd off to set it again.
+const rotatingCredentialsHint = "if the proxy rotates its credentials, the daemon needs -proxy-cmd ($PILOT_PROXY_CMD, config.json proxy_cmd), a command that prints the current proxy URL; when one is set, check what it prints from a fresh shell"
+
 // CredentialHint explains a proxy's rejection of the credentials — a 407,
 // or an answer that could not be parsed — for a log line or error; "" for
 // any other error.
 func CredentialHint(err error) string {
 	switch {
 	case AuthRejected(err):
-		return "the proxy rejected its credentials (407), also after re-reading them: check HTTPS_PROXY / -proxy; if the proxy rotates its credentials, set -proxy-cmd ($PILOT_PROXY_CMD, config.json proxy_cmd) to a command that prints the current proxy URL"
+		return "the proxy rejected its credentials (407), also after re-reading them: check HTTPS_PROXY / -proxy; " + rotatingCredentialsHint
 	case UnreadableConnectReply(err):
-		return "the proxy's answer to CONNECT could not be parsed, which is how some egress proxies (Meta Muse's) reject wrong or expired credentials: check the credentials in HTTPS_PROXY / -proxy; if the proxy rotates them, set -proxy-cmd ($PILOT_PROXY_CMD, config.json proxy_cmd) to a command that prints the current proxy URL"
+		return "the proxy's answer to CONNECT could not be parsed, which is how some egress proxies (Meta Muse's) reject wrong or expired credentials: check the credentials in HTTPS_PROXY / -proxy; " + rotatingCredentialsHint
 	}
 	return ""
 }

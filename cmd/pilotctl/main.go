@@ -3271,8 +3271,8 @@ func cmdDaemonStart(args []string) {
 			if !jsonOutput {
 				fmt.Fprintln(os.Stderr) // end the dots line
 			}
-			os.Remove(pidFilePath())
-			reportDaemonStartFailure(pid, pidLogPath, daemonExitStatus(werr), 0)
+			_ = os.Remove(pidFilePath())
+			reportDaemonStartFailure(pid, pidLogPath, daemonExitStatus(werr), 0, proxyCmdSource(plan, flags, pidLogPath, sandboxRefresh))
 		case <-time.After(200 * time.Millisecond):
 		}
 		dots++
@@ -3350,7 +3350,7 @@ func cmdDaemonStart(args []string) {
 		fmt.Fprintln(os.Stderr) // end the dots line
 	}
 
-	reportDaemonStartFailure(pid, pidLogPath, "", waitDur)
+	reportDaemonStartFailure(pid, pidLogPath, "", waitDur, proxyCmdSource(plan, flags, pidLogPath, sandboxRefresh))
 }
 
 func cmdDaemonStop() {

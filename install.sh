@@ -438,6 +438,16 @@ EFFECTIVE_TRANSPORT="${TRANSPORT:-${CONFIG_TRANSPORT:-auto}}"
 # authenticating proxy is a credential. Nothing in this script writes a proxy
 # URL to disk.
 #
+# ENV_PROXY_CREDS: the proxy environment itself carries credentials — read
+# before PILOT_PROXY is copied into it below for this run's downloads. Only
+# then can the sandbox proxy command (SANDBOX_PROXY_CMD), which prints what a
+# fresh shell's $https_proxy / $HTTPS_PROXY hold, print them: credentials
+# that arrive in PILOT_PROXY never reach a fresh shell.
+ENV_PROXY_CREDS=false
+case "${https_proxy:-}${HTTPS_PROXY:-}" in
+    *@*) ENV_PROXY_CREDS=true ;;
+esac
+
 # PILOT_PROXY is the daemon's own proxy setting; an http(s):// URL there
 # carries this run's downloads too when the environment names no proxy
 # (exported to this process and its children only).
@@ -457,20 +467,23 @@ PILOT_PROXY_URL="${https_proxy:-${HTTPS_PROXY:-${all_proxy:-${ALL_PROXY:-}}}}"
 # keeps the ones it started with, and the proxy answers its next CONNECT with
 # 407. A fresh shell sees the current ones. PROXY_REFRESH_CMD prints the
 # current proxy URL: $PILOT_PROXY_CMD, else — in a Linux container/VM without
-# systemd whose HTTPS_PROXY or https_proxy carries credentials — what a fresh
-# bash has: whichever of $https_proxy and $HTTPS_PROXY carries credentials
-# ($https_proxy when both do, the variable Meta Muse's guidance reads), else
+# systemd whose HTTPS_PROXY or https_proxy carries credentials (ENV_PROXY_CREDS)
+# and no explicit PILOT_PROXY is set — what a fresh bash has: whichever of
+# $https_proxy and $HTTPS_PROXY carries credentials ($https_proxy when both do, the variable Meta Muse's guidance reads), else
 # ${HTTPS_PROXY:-$https_proxy}, so a URL with credentials is never traded for
 # one without (pilotctl uses the same command). It is saved as the daemon's
 # proxy_cmd further down, and pcurl uses it here to retry a download once
 # after the credentials rotated mid-install.
 # shellcheck disable=SC2016 # literal: the fresh bash expands it, not this shell
 SANDBOX_PROXY_CMD='bash -c '\''case $https_proxy in *@*) printf %s "$https_proxy";; *) printf %s "${HTTPS_PROXY:-$https_proxy}";; esac'\'''
+# An explicit PILOT_PROXY is left alone, as pilotctl leaves it: pilot-daemon
+# runs a proxy command in place of the URL it would use, so the sandbox
+# command would replace that URL with the environment's proxy.
 PROXY_REFRESH_CMD="${PILOT_PROXY_CMD:-}"
 if [ -z "$PROXY_REFRESH_CMD" ] && [ "$SANDBOX_HOST" = true ] \
-   && command -v bash >/dev/null 2>&1; then
-    case "${https_proxy:-}${HTTPS_PROXY:-}" in
-        *@*) PROXY_REFRESH_CMD="$SANDBOX_PROXY_CMD" ;;
+   && [ "$ENV_PROXY_CREDS" = true ] && command -v bash >/dev/null 2>&1; then
+    case "${PILOT_PROXY:-}" in
+        ""|auto|AUTO|Auto) PROXY_REFRESH_CMD="$SANDBOX_PROXY_CMD" ;;
     esac
 fi
 
@@ -1367,7 +1380,16 @@ case "$TRANSPORT" in
         if [ "$DAEMON_HAS_AUTO" = true ]; then
             if [ -n "$CONFIG_TRANSPORT" ]; then TRANSPORT_CLEAR=true; fi
         else
-            echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto; it keeps its default (udp)."
+            # Nothing is saved or removed: this release has no auto to go
+            # back to, and what it runs is what config.json already says.
+            case "$CONFIG_TRANSPORT" in
+                compat|udp)
+                    echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto; it keeps the"
+                    echo "        transport saved in config.json (${CONFIG_TRANSPORT}). Switch with --transport udp or"
+                    echo "        --transport compat." ;;
+                *)
+                    echo "  Note: this pilot-daemon (${TAG:-source}) predates -transport=auto; it keeps its default (udp)." ;;
+            esac
         fi ;;
 esac
 if [ "$CONFIG_TRANSPORT" = "auto" ] && [ "$DAEMON_HAS_AUTO" != true ] && [ -z "$TRANSPORT_TO_SAVE" ]; then
@@ -1559,6 +1581,13 @@ fi
 # There every "start the daemon" instruction below is replaced by the
 # recipe; elsewhere it is kept, with the condition spelled out.
 SANDBOX_RECIPE_URL="https://pilotprotocol.network/learn/install-pilot-skills-in-meta-muse"
+# The recipe needs Linux (root and `unshare -m` for its SNI router): on any
+# other OS the way forward is a release whose pilot-daemon has -proxy.
+if [ "$OS" = "linux" ]; then
+    PROXY_REMEDY="the pilot-sandbox recipe (step 3): ${SANDBOX_RECIPE_URL}"
+else
+    PROXY_REMEDY="re-run this installer once a Pilot release whose pilot-daemon -h lists -proxy is out"
+fi
 PROXY_UNSUPPORTED=false
 PROXY_ONLY=false
 if [ -n "$PILOT_PROXY_URL" ] && [ "$DAEMON_HAS_PROXY" != true ]; then
@@ -1575,14 +1604,13 @@ if [ -n "$PILOT_PROXY_URL" ] && [ "$DAEMON_HAS_PROXY" != true ]; then
         echo "  WARNING: this host goes out through a proxy ($(redact_proxy "$PILOT_PROXY_URL")), and this"
         echo "           pilot-daemon (${TAG:-source}) cannot use one: \`pilotctl daemon start\` would dial"
         echo "           the registry directly, around the proxy, and never come online."
-        echo "           Do not run it here. Bring the node online with the pilot-sandbox"
-        echo "           recipe (step 3): ${SANDBOX_RECIPE_URL}"
+        echo "           Do not start it here. What brings the node online: ${PROXY_REMEDY}"
     else
         echo "  WARNING: a proxy is set ($(redact_proxy "$PILOT_PROXY_URL")), but this pilot-daemon"
         echo "           (${TAG:-source}) cannot use one: it dials the registry directly. If the"
         echo "           proxy is this host's only way out (UDP blocked, e.g. an agent sandbox),"
-        echo "           \`pilotctl daemon start\` will not come online with this release: use the"
-        echo "           pilot-sandbox recipe (step 3) instead: ${SANDBOX_RECIPE_URL}"
+        echo "           the daemon will not come online with this release. What does then:"
+        echo "           ${PROXY_REMEDY}"
     fi
 fi
 
@@ -1598,18 +1626,25 @@ if [ "$EFFECTIVE_TRANSPORT" = "udp" ] && [ "$DAEMON_HAS_AUTO" != true ] \
     UDP_ONLY_HINT=true
 fi
 
-# start_hint PREFIX COMMAND [NAME] — print how to start the daemon: COMMAND,
-# except where this daemon cannot use the proxy (the WARNING above). On a
-# proxy-only host (PROXY_ONLY) COMMAND is not printed as something to run:
-# only that NAME (default: COMMAND) must not be run there, and the recipe.
+# start_hint PREFIX COMMAND [NAME [STOP]] — print how to start the daemon:
+# COMMAND, except where this daemon cannot use the proxy (the WARNING above).
+# On a proxy-only host (PROXY_ONLY) COMMAND is not printed as something to
+# run: only that NAME (default: COMMAND) must not be run there, and
+# PROXY_REMEDY. STOP (restart hints) is printed first there: the recipe starts
+# a daemon but never stops one, and two daemons must not share an identity.
 start_hint() {
     if [ "$PROXY_ONLY" = true ]; then
         echo "${1}Do not run \`${3:-$2}\` on this host (see the WARNING above)."
-        echo "${1}Use the pilot-sandbox recipe (step 3): ${SANDBOX_RECIPE_URL}"
+        if [ -n "${4:-}" ]; then
+            echo "${1}Stop the running daemon first: ${4}"
+            echo "${1}then bring it back with ${PROXY_REMEDY}"
+        else
+            echo "${1}What brings the node online: ${PROXY_REMEDY}"
+        fi
     elif [ "$PROXY_UNSUPPORTED" = true ]; then
         echo "${1}${2}"
-        echo "${1}(if the proxy is this host's only way out, use the pilot-sandbox recipe"
-        echo "${1} instead, see the WARNING above)"
+        echo "${1}(if the proxy is this host's only way out, it will not come online with"
+        echo "${1} this release: see the WARNING above)"
     else
         echo "${1}${2}"
     fi
@@ -2035,7 +2070,12 @@ UPLIST
         case " $RESTART_LAUNCHD " in
             *" network.pilotprotocol.pilot-daemon "*) ;;
             *)
-                echo "  Start daemon: launchctl load -w $PLIST"
+                if [ "$PROXY_UNSUPPORTED" = true ]; then
+                    echo "  Start daemon:"
+                    start_hint "    " "launchctl load -w $PLIST" "launchctl load -w $PLIST"
+                else
+                    echo "  Start daemon: launchctl load -w $PLIST"
+                fi
                 echo "  Stop daemon:  launchctl unload $PLIST"
                 ;;
         esac
@@ -2210,7 +2250,7 @@ if [ "$UPDATING" = true ]; then
     if [ -z "$RESTART_SYSTEMD" ] && [ -z "$RESTART_LAUNCHD" ]; then
         echo "No managed service was running. If you run the daemon yourself,"
         echo "restart it to pick up the new version:"
-        start_hint "  " "pilotctl daemon stop && pilotctl daemon start" "pilotctl daemon start"
+        start_hint "  " "pilotctl daemon stop && pilotctl daemon start" "pilotctl daemon start" "pilotctl daemon stop"
         echo ""
     fi
     exit 0
@@ -2263,13 +2303,13 @@ echo "     export PATH=\"${BIN_DIR}:\$PATH\"   # only needed in THIS shell, befo
 # (see PROXY_UNSUPPORTED / PROXY_ONLY): a proxy-only host gets the recipe.
 if [ "$PROXY_ONLY" = true ]; then
     echo "     # Do NOT run \`pilotctl daemon start\` on this host: this pilot-daemon (${TAG:-source})"
-    echo "     # cannot use the proxy and would dial the registry directly. Bring the node"
-    echo "     # online with the pilot-sandbox recipe (step 3), then check it here:"
-    echo "     #   ${SANDBOX_RECIPE_URL}"
+    echo "     # cannot use the proxy and would dial the registry directly. What brings the"
+    echo "     # node online (then check it here):"
+    echo "     #   ${PROXY_REMEDY}"
 elif [ "$PROXY_UNSUPPORTED" = true ]; then
     echo "     # This pilot-daemon (${TAG:-source}) cannot use the proxy (see the WARNING above). If the"
-    echo "     # proxy is this host's only way out, skip the next line and use the pilot-sandbox"
-    echo "     # recipe (step 3) instead: ${SANDBOX_RECIPE_URL}"
+    echo "     # proxy is this host's only way out, skip the next line; what works then:"
+    echo "     #   ${PROXY_REMEDY}"
     echo "     pilotctl daemon start --hostname my-agent         # blocks until registered; email already saved"
 else
     echo "     pilotctl daemon start --hostname my-agent         # blocks until registered; email already saved"
