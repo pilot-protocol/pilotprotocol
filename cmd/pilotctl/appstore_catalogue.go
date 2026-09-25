@@ -95,6 +95,12 @@ type catalogueEntry struct {
 	// non-sideloaded app's manifest publisher matches it before spawning.
 	Publisher string `json:"publisher,omitempty"`
 
+	// Hidden entries stay resolvable (so old ids keep working) but are left
+	// out of the catalogue listing. RenamedTo marks an id that moved: it has
+	// no bundle of its own, and install follows it to the new id.
+	Hidden    bool   `json:"hidden,omitempty"`
+	RenamedTo string `json:"renamed_to,omitempty"`
+
 	// --- v3 per-platform bundles ---
 	// Bundles maps "os/arch" (e.g. "darwin/arm64") → that platform's
 	// tarball + sha256. When present, install picks the host's entry;
@@ -316,6 +322,9 @@ func cmdAppStoreCatalogue(_ []string) {
 		return
 	}
 	for _, e := range c.Apps {
+		if e.Hidden {
+			continue
+		}
 		headline := e.DisplayName
 		if headline == "" {
 			headline = e.Description
@@ -367,6 +376,10 @@ func resolveInstallTargetVersion(target, wantVersion string) (string, installSou
 			if target != e.ID {
 				continue
 			}
+			e, err := followRename(c, e)
+			if err != nil {
+				return "", installSourceCatalogue, err
+			}
 			if e.Version != wantVersion {
 				return "", installSourceCatalogue, fmt.Errorf("%w: %s offers %q, not %q", ErrCatalogueVersionUnavailable, e.ID, e.Version, wantVersion)
 			}
@@ -390,6 +403,10 @@ func resolveInstallTarget(target string) (string, installSource, error) {
 	} else {
 		for _, e := range c.Apps {
 			if target == e.ID {
+				e, err := followRename(c, e)
+				if err != nil {
+					return "", installSourceCatalogue, err
+				}
 				dir, err := fetchAndUnpackBundle(e)
 				return dir, installSourceCatalogue, err
 			}
@@ -400,6 +417,22 @@ func resolveInstallTarget(target string) (string, installSource, error) {
 		return target, installSourceLocal, nil
 	}
 	return "", installSourceLocal, fmt.Errorf("not a catalogue ID or a bundle dir: %q (try `pilotctl appstore catalogue` to list installable apps)", target)
+}
+
+// followRename resolves an entry marked renamed_to to the entry it moved to,
+// telling the user which app is actually being installed. It follows one hop
+// only: a chain of renames is a catalogue mistake, not something to walk.
+func followRename(c *catalogue, e catalogueEntry) (catalogueEntry, error) {
+	if e.RenamedTo == "" {
+		return e, nil
+	}
+	for _, n := range c.Apps {
+		if n.ID == e.RenamedTo && n.RenamedTo == "" {
+			fmt.Fprintf(os.Stderr, "note: %s was renamed to %s — installing %s\n", e.ID, n.ID, n.ID)
+			return n, nil
+		}
+	}
+	return e, fmt.Errorf("%s was renamed to %s, which the catalogue does not offer", e.ID, e.RenamedTo)
 }
 
 // fetchAndUnpackBundle downloads the catalogue entry's tarball,
