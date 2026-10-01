@@ -125,7 +125,7 @@ func TestSendDataNagleFullMSSSegmentEmitsSingleFrame(t *testing.T) {
 	t.Parallel()
 	d, peer, conn := setupSendDataConn(t)
 
-	payload := bytes.Repeat([]byte{0x61}, MaxSegmentSize) // exactly one MSS
+	payload := bytes.Repeat([]byte{0x61}, SendSegmentSize) // exactly one MSS
 	if err := d.SendData(conn, payload); err != nil {
 		t.Fatalf("SendData: %v", err)
 	}
@@ -137,8 +137,8 @@ func TestSendDataNagleFullMSSSegmentEmitsSingleFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pkt.Payload) != MaxSegmentSize {
-		t.Errorf("Payload size=%d, want %d", len(pkt.Payload), MaxSegmentSize)
+	if len(pkt.Payload) != SendSegmentSize {
+		t.Errorf("Payload size=%d, want %d", len(pkt.Payload), SendSegmentSize)
 	}
 }
 
@@ -227,7 +227,7 @@ func TestNagleFlushWaitsForNagleChWhenUnackedPresent(t *testing.T) {
 	}
 }
 
-func TestNagleFlushSubMSSWithUnackedRetxStopAborts(t *testing.T) {
+func TestHeldTailIsDroppedWhenConnectionStops(t *testing.T) {
 	t.Parallel()
 	d, _, conn := setupSendDataConn(t)
 	conn.NagleMu.Lock()
@@ -238,20 +238,34 @@ func TestNagleFlushSubMSSWithUnackedRetxStopAborts(t *testing.T) {
 	conn.RetxMu.Unlock()
 	conn.RetxStop = make(chan struct{})
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- d.nagleFlush(conn) }()
+	// The short write is held behind the unacknowledged short segment; the
+	// caller is not made to wait for it.
+	if err := d.nagleFlush(conn); err != nil {
+		t.Fatalf("nagleFlush: %v", err)
+	}
+	flusher := func() bool {
+		conn.NagleMu.Lock()
+		defer conn.NagleMu.Unlock()
+		return conn.tailFlusher
+	}
+	if !flusher() {
+		t.Fatal("a held tail should leave a flusher waiting to send it")
+	}
 
-	// Close RetxStop to trigger the ErrConnClosed branch.
-	time.Sleep(20 * time.Millisecond)
+	// The connection stopping ends the wait without sending.
 	close(conn.RetxStop)
-
-	select {
-	case err := <-errCh:
-		if err != protocol.ErrConnClosed {
-			t.Errorf("err=%v, want ErrConnClosed", err)
+	deadline := time.Now().Add(2 * time.Second)
+	for flusher() {
+		if time.Now().After(deadline) {
+			t.Fatal("the flusher did not exit after RetxStop closed")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("nagleFlush did not return after RetxStop close")
+		time.Sleep(time.Millisecond)
+	}
+	conn.RetxMu.Lock()
+	sent := len(conn.Unacked)
+	conn.RetxMu.Unlock()
+	if sent != 1 {
+		t.Errorf("%d segments tracked, want only the one that was already in flight", sent)
 	}
 }
 
@@ -265,26 +279,23 @@ func TestNagleFlushNagleTimeoutFlushesEventually(t *testing.T) {
 	conn.Unacked = []*retxEntry{{seq: 1, data: []byte("x"), sentAt: time.Now(), attempts: 1}}
 	conn.RetxMu.Unlock()
 
+	// nagleFlush leaves the held write in the buffer and returns; it goes
+	// out when NagleTimeout has passed with the short segment ahead of it
+	// still unacknowledged.
 	start := time.Now()
-	errCh := make(chan error, 1)
-	go func() { errCh <- d.nagleFlush(conn) }()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("nagleFlush: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("nagleFlush did not fire after NagleTimeout")
+	if err := d.nagleFlush(conn); err != nil {
+		t.Fatalf("nagleFlush: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed < NagleTimeout-5*time.Millisecond {
-		t.Errorf("nagleFlush returned too early: %v (want >= %v)", elapsed, NagleTimeout)
+	if returned := time.Since(start); returned >= NagleTimeout {
+		t.Errorf("nagleFlush took %v to return: it waited for the held write", returned)
 	}
 
 	frame := readOneFrame(t, peer)
 	if frame == nil {
 		t.Fatal("no frame received after Nagle timeout")
+	}
+	if elapsed := time.Since(start); elapsed < NagleTimeout-5*time.Millisecond {
+		t.Errorf("held write was sent too early: %v (want >= %v)", elapsed, NagleTimeout)
 	}
 	pkt, err := protocol.Unmarshal(frame[4:])
 	if err != nil {

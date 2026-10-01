@@ -95,7 +95,9 @@ func TestFastRecoveryPostPartialAckDupAckInflation(t *testing.T) {
 	// RFC 5681 §3.2 step 5 ("while in fast retransmit"): cwnd += SMSS.
 	c.ProcessAck(seqB, true)
 
-	if c.CongWin < congWinBefore+MaxSegmentSize {
+	// The inflation is one segment as sent: SendSegmentSize, which is what a
+	// duplicate ACK says has left the network.
+	if c.CongWin < congWinBefore+SendSegmentSize {
 		t.Errorf("1st dup ACK after partial-ACK DupAckCount reset: CongWin=%d, want >=%d "+
 			"(%d+MSS=%d); RFC 5681 §3.2 step 5 requires cwnd += SMSS for every dup ACK "+
 			"'while in fast retransmit' (InRecovery=true, FastRecovery=true); "+
@@ -105,7 +107,7 @@ func TestFastRecoveryPostPartialAckDupAckInflation(t *testing.T) {
 			"the 3-dup threshold is the ENTRY condition only, not a per-inflation gate; "+
 			"fix: add 'if DupAckCount<3 && InRecovery && FastRecovery' branch before the "+
 			"DupAckCount==3 check to inflate cwnd += MSS for counts 1-2 inside fast recovery",
-			c.CongWin, congWinBefore+MaxSegmentSize,
-			congWinBefore, congWinBefore+MaxSegmentSize)
+			c.CongWin, congWinBefore+SendSegmentSize,
+			congWinBefore, congWinBefore+SendSegmentSize)
 	}
 }
