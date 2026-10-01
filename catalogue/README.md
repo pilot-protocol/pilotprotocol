@@ -81,11 +81,11 @@ and `publisher` (so existing installs keep their pin and keep running), set
 `metadata_url` (the tombstone is not installable), and delete the old
 `apps/<old-id>/` detail dir. The full new entry lives under the new id, and the
 catalogue is re-signed. A `pilotctl` that knows the fields (this repo's, from
-the release after v1.13.10) then:
+v1.14.1) then:
 
 - omits the old id from `catalogue` (text and `--json`);
 - on `install <old>`, warns and installs `renamed_to` instead. With
-  `--version` (a pin, as the managed-fleet reconcile passes) it refuses, naming
+  `--version` (a pin) it refuses, naming
   the new id: a pin names a release of one app, and the old id has none;
 - reports an installed old id in `outdated` as `renamed` (AVAILABLE is the new
   id). `upgrade --all` skips it, since the hourly updater runs it and the new id

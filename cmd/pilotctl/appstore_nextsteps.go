@@ -138,7 +138,7 @@ func loadNextStepsGraph(appID string) *nextStepsGraph {
 	// `pilotctl appstore call ../../etc/x ...` would resolve outside the install
 	// root and we would happily read (and print) whatever we found. resolveUnder
 	// is the same containment guard install and the supervisor use.
-	dir, err := resolveUnder(appStoreRoot(), appID)
+	dir, err := resolveAppDir(appStoreRoot(), appID)
 	if err != nil {
 		return nil
 	}
@@ -451,7 +451,7 @@ func ensureNextStepsFresh(appID string) {
 	if nextStepsDisabled() {
 		return
 	}
-	dir, err := resolveUnder(appStoreRoot(), appID)
+	dir, err := resolveAppDir(appStoreRoot(), appID)
 	if err != nil {
 		return
 	}

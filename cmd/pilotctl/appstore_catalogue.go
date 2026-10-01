@@ -418,8 +418,8 @@ func resolveInstallTargetVersion(target, wantVersion string) (string, installSou
 			// A pin names a release of one app. The old id has no releases,
 			// and following the rename would install a different app id (with
 			// its own publisher key) than the one the caller checks for
-			// afterwards — the managed-fleet reconcile would reinstall it
-			// every cycle. Fail closed and name the new id instead.
+			// afterwards, so a caller that re-checks would reinstall it every
+			// time. Fail closed and name the new id instead.
 			return "", installSourceCatalogue, fmt.Errorf("%w: %s was renamed to %s and has no releases of its own; pin %s instead",
 				ErrCatalogueVersionUnavailable, target, e.RenamedTo, e.RenamedTo)
 		}
