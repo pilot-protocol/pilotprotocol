@@ -895,7 +895,9 @@ var commandHelp = map[string]string{
 Send a message to a remote agent and optionally wait for the reply.
 
 Flags:
-  --data <text>         message payload (required)
+  --data <text>         message payload; "-" reads it from stdin
+  --data-file <path>    read the payload from a file (for payloads too large
+                        for a command-line argument)
   --type text|json|binary  payload encoding (default: text)
   --count <n>           send N times (default: 1)
   --reuse-conn          reuse the connection across --count sends (saves ~1 RTT)
@@ -912,6 +914,8 @@ Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
   pilotctl send-message my-peer --data "hello" --wait
   pilotctl send-message 0:0000.0000.400E --data "ping" --trace
+  pilotctl send-message my-peer --data-file report.json --type json
+  generate-report | pilotctl send-message my-peer --data -
 `,
 	"ping": `Usage: pilotctl ping <address|hostname> [flags]
 
@@ -4744,11 +4748,43 @@ func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename s
 	return result, nil
 }
 
+// messagePayload returns the body for send-message: --data, or the whole of
+// stdin for "--data -", or the contents of --data-file. A payload passed as an
+// argument is capped by the OS (ARG_MAX; 128 KiB per argument on Linux), which
+// is why callers with large bodies needed a separate stdin helper.
+func messagePayload(flags map[string]string, stdin io.Reader) (string, error) {
+	data, hasData := flags["data"]
+	file, hasFile := flags["data-file"]
+	switch {
+	case hasData && hasFile:
+		return "", fmt.Errorf("give --data or --data-file, not both")
+	case hasFile:
+		if file == "" || file == "true" {
+			return "", fmt.Errorf("--data-file needs a path")
+		}
+		b, err := os.ReadFile(file) // #nosec G304 -- the operator names the file to send
+		if err != nil {
+			return "", fmt.Errorf("read --data-file: %v", err)
+		}
+		data = string(b)
+	case data == "-":
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("read payload from stdin: %v", err)
+		}
+		data = string(b)
+	}
+	if data == "" {
+		return "", fmt.Errorf("--data is required")
+	}
+	return data, nil
+}
+
 func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
 	for name := range flags {
 		switch name {
-		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
+		case "data", "data-file", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
 		default:
 			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
 		}
@@ -4823,9 +4859,9 @@ func cmdSendMessage(args []string) {
 		fatalCode("not_found", "%v", err)
 	}
 
-	data := flagString(flags, "data", "")
-	if data == "" {
-		fatalCode("invalid_argument", "--data is required")
+	data, err := messagePayload(flags, os.Stdin)
+	if err != nil {
+		fatalCode("invalid_argument", "%v", err)
 	}
 	msgType := flagString(flags, "type", "text")
 
@@ -4974,6 +5010,17 @@ func cmdSendMessage(args []string) {
 		defer cl.Close()
 		r := sendOne(cl, 0, false)
 		ackAt := time.Now()
+		// Every receiver answers a stored message with an ACK frame. No ACK
+		// means the message was not stored, or was never sent — the daemon
+		// drops a write it cannot buffer without telling the client — so
+		// "ok" here was reporting messages that never arrived.
+		if _, failed := r["error"]; !failed {
+			if _, acked := r["ack"]; !acked {
+				fatalHint("connection_failed",
+					"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
+					"%s did not acknowledge the message (%d bytes)", target, len(data))
+			}
+		}
 		// The receiver answers "ERR ..." when it could not store the
 		// message (disk full, inbox unwritable). That is a failed send, not
 		// a delivered one — same rule send-file applies.
