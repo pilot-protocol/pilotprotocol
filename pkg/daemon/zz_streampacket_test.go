@@ -410,6 +410,11 @@ func TestHandleStreamACKWithDataDeliversAndSchedulesDelayedACK(t *testing.T) {
 	conn.State = StateEstablished
 	conn.ExpectedSeq = 1000
 	conn.Mu.Unlock()
+	// A connection starts with a budget of lone segments it ACKs at once
+	// (QuickACKBudget); this test is about what happens once it is spent.
+	conn.AckMu.Lock()
+	conn.QuickACKs = 0
+	conn.AckMu.Unlock()
 
 	data := streamPacket(protocol.FlagACK, peerNode, d.NodeID(), 443, 55555, 1000, 1)
 	data.Payload = []byte("hello")
@@ -472,5 +477,78 @@ func TestHandleStreamACKWithDataNonEstablishedIsIgnoredPayloadNotDelivered(t *te
 	conn.Mu.Unlock()
 	if bytesRecv != 0 || segsRecv != 0 {
 		t.Fatalf("non-Established conn received data: bytes=%d segs=%d", bytesRecv, segsRecv)
+	}
+}
+
+// A sender that holds its next small write until the previous one is ACKed
+// sends one segment and waits. Delaying that lone segment's ACK stalled it
+// for the whole delayed-ACK timer: once on the first exchange of every
+// connection, and once per segment for a peer up to v1.14.1 relaying what it
+// read from this node (bench against one took 3.2s for 1 MB).
+func TestLoneSegmentIsAckedAtOnceWithinQuickACKBudget(t *testing.T) {
+	t.Parallel()
+	d, peerNode, _ := setupDaemonWithPeer(t, Config{Public: true})
+	d.setNodeID_testhelper(0xABCD0010)
+
+	conn := d.ports.NewConnection(55556, protocol.Addr{Network: 0, Node: peerNode}, 443)
+	conn.LocalAddr = protocol.Addr{Network: 0, Node: d.NodeID()}
+	conn.Mu.Lock()
+	conn.State = StateEstablished
+	conn.ExpectedSeq = 1000
+	conn.Mu.Unlock()
+
+	ackState := func() (pending, quick int, timer bool) {
+		conn.AckMu.Lock()
+		defer conn.AckMu.Unlock()
+		return conn.PendingACKs, conn.QuickACKs, conn.ACKTimer != nil
+	}
+	if _, quick, _ := ackState(); quick != QuickACKBudget {
+		t.Fatalf("a new connection has a quick-ACK budget of %d, want %d", quick, QuickACKBudget)
+	}
+	seq := uint32(1000)
+	lone := func() {
+		pkt := streamPacket(protocol.FlagACK, peerNode, d.NodeID(), 443, 55556, seq, 1)
+		pkt.Payload = []byte("hello")
+		seq += 5
+		d.handleStreamPacket(pkt)
+	}
+
+	// Within the budget: ACKed at once, nothing left pending, no timer.
+	lone()
+	if pending, quick, timer := ackState(); pending != 0 || timer || quick != QuickACKBudget-1 {
+		t.Fatalf("first lone segment: pending=%d timer=%v budget=%d, want 0, false, %d", pending, timer, quick, QuickACKBudget-1)
+	}
+
+	// Budget spent: the lone segment's ACK is delayed.
+	conn.AckMu.Lock()
+	conn.QuickACKs = 0
+	conn.AckMu.Unlock()
+	lone()
+	if pending, _, timer := ackState(); pending != 1 || !timer {
+		t.Fatalf("lone segment with the budget spent: pending=%d timer=%v, want 1, true", pending, timer)
+	}
+
+	// The timer firing means nothing followed that segment, so its sender is
+	// likely waiting on the ACK: the budget is restored.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pending, quick, timer := ackState()
+		if pending == 0 && !timer && quick == QuickACKBudget {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the delayed-ACK timer: pending=%d timer=%v budget=%d, want 0, false, %d", pending, timer, quick, QuickACKBudget)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A pair of segments is ACKed on the second and spends none of it.
+	conn.AckMu.Lock()
+	conn.QuickACKs = 0
+	conn.AckMu.Unlock()
+	lone()
+	lone()
+	if pending, quick, timer := ackState(); pending != 0 || timer || quick != 0 {
+		t.Fatalf("two segments with the budget spent: pending=%d timer=%v budget=%d, want 0, false, 0", pending, timer, quick)
 	}
 }

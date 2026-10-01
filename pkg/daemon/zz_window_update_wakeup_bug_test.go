@@ -104,7 +104,9 @@ func TestWindowUpdateDoesNotWakeSender(t *testing.T) {
 	}
 
 	// Peer sends a window-update ACK: same cumulative ACK (1000 == LastAck),
-	// but Window=1 (receiver window now open).
+	// but Window=2 (receiver window now open). The window is a count of free
+	// receive slots and the unacked segment above will take one of them, so
+	// two is the smallest update that leaves room for a new segment.
 	// This is a dup-ACK from ProcessAck's point of view; ProcessAck will NOT
 	// signal WindowCh on the dup-ACK path.
 	windowUpdatePkt := &protocol.Packet{
@@ -117,7 +119,7 @@ func TestWindowUpdateDoesNotWakeSender(t *testing.T) {
 		DstPort:  localPort,
 		Seq:      500,
 		Ack:      1000, // == LastAck — dup-ACK path in ProcessAck
-		Window:   1,    // non-zero: peer's window just opened
+		Window:   2,    // room for the segment in flight plus one more
 	}
 	d.handleStreamPacket(windowUpdatePkt)
 
@@ -127,7 +129,7 @@ func TestWindowUpdateDoesNotWakeSender(t *testing.T) {
 	case <-conn.WindowCh:
 		// good — sender wakes up promptly
 	case <-time.After(100 * time.Millisecond):
-		t.Errorf("window-update ACK (Ack=LastAck, Window=1 with PeerRecvWin=0) did not " +
+		t.Errorf("window-update ACK (Ack=LastAck, Window=2 with PeerRecvWin=0) did not " +
 			"signal conn.WindowCh within 100ms; " +
 			"handleStreamPacket updates PeerRecvWin but never signals WindowCh; " +
 			"ProcessAck is called with ack=LastAck (dup-ACK path) which returns " +
