@@ -251,6 +251,15 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **Dial timeouts against a peer that is answering no longer read as a
+  wedged transport.** The watchdog's `outbound-dial-wedged` check counted
+  every dial timeout, so a burst of parallel sends to one peer whose SYN
+  limiter dropped them (`dial_timeouts=32`) made a healthy node re-register
+  with the beacon and registry, and could escalate to a restart. A timeout
+  is now counted only when nothing was received from that peer while the
+  dial was in progress. Timeouts against peers that stay silent count as
+  before. Applies to encrypted tunnels (the default); with `-encrypt=false`
+  every timeout still counts.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's
