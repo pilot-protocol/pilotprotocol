@@ -6,11 +6,10 @@ import "testing"
 
 func validEnterpriseDaemonOptions() daemonSecurityOptions {
 	return daemonSecurityOptions{
-		RegistryAddr:          "registry.example:443",
-		RegistryFingerprint:   "abcdef",
-		RegistryTrust:         "pinned",
-		IdentityPath:          "/var/lib/pilot/identity.json",
-		EnterpriseControlPath: "control.json",
+		RegistryAddr:        "registry.example:443",
+		RegistryFingerprint: "abcdef",
+		RegistryTrust:       "pinned",
+		IdentityPath:        "/var/lib/pilot/identity.json",
 	}
 }
 
@@ -52,7 +51,6 @@ func TestEnterpriseDaemonProfileRejectsUnsafeConfiguration(t *testing.T) {
 		"missing pin":        func(o *daemonSecurityOptions) { o.RegistryFingerprint = "" },
 		"bad trust mode":     func(o *daemonSecurityOptions) { o.RegistryTrust = "insecure" },
 		"HTTP webhook":       func(o *daemonSecurityOptions) { o.WebhookURL = "http://example.com/hook" },
-		"missing control":    func(o *daemonSecurityOptions) { o.EnterpriseControlPath = "" },
 	}
 	for name, mutate := range cases {
 		mutate := mutate
@@ -73,17 +71,6 @@ func TestEnterpriseDaemonProfileAllowsSystemTrustAndLoopbackWebhook(t *testing.T
 	o.RegistryTrust = "system"
 	o.RegistryFingerprint = ""
 	o.WebhookURL = "http://127.0.0.1:8080/hook"
-	if err := applyDaemonSecurityProfile(securityProfileEnterprise, &o); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestEnterpriseDaemonProfileAllowsBothGovernedTransportsToBeDisabled(t *testing.T) {
-	t.Parallel()
-	o := validEnterpriseDaemonOptions()
-	o.EnterpriseControlPath = ""
-	o.DisableDataExchange = true
-	o.DisableEventStream = true
 	if err := applyDaemonSecurityProfile(securityProfileEnterprise, &o); err != nil {
 		t.Fatal(err)
 	}

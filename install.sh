@@ -16,8 +16,6 @@ set -e
 #                   before auto stay on UDP unless given --transport compat, and
 #                   use no proxy: the installer prints what to do instead.
 #                   Proxy credentials that rotate: see PILOT_PROXY_CMD below)
-#   Managed node:   export PILOT_ENROLLMENT_TOKEN   # enter it without putting it in shell history
-#                   sh install.sh --managed-url https://management.pilotprotocol.network
 #   Uninstall:      curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall
 #
 # Flags:
@@ -38,12 +36,6 @@ set -e
 #                      $HTTPS_PROXY/$ALL_PROXY when set (CONNECT by hostname) —
 #                      for UDP-blocked hosts and agent sandboxes whose only way
 #                      out is an HTTPS proxy.
-#   --managed-url <origin>
-#                       Install the checksum-pinned core managed runtime, claim
-#                       a one-time hosted identity, and start signed reporting.
-#                       This does not install pilot-mcp or a harness adapter.
-#   --no-start          With --managed-url, install and adopt without starting
-#                       the daemon. The hosted onboarding flow omits this flag.
 #
 # Legacy env vars (still honored, lower precedence than flags):
 #   PILOT_RELEASE_TAG=vX.Y.Z   Same as --version.
@@ -64,9 +56,6 @@ set -e
 #   PILOT_ALLOW_ROOT=1         Install as root on a host with systemd/launchd,
 #                              or under sudo/doas (not needed where the agent
 #                              itself is root in a container/VM without systemd).
-#   PILOT_MANAGEMENT_URL=https://management.example
-#                              Same as --managed-url. Requires the one-time
-#                              PILOT_ENROLLMENT_TOKEN on first adoption.
 #
 # Proxies: every download is a curl HTTPS request, so HTTPS_PROXY / https_proxy /
 # ALL_PROXY / NO_PROXY are honored (curl asks the proxy to CONNECT by hostname —
@@ -145,7 +134,6 @@ REGISTRY="${PILOT_REGISTRY:-$DEFAULT_REGISTRY}"
 BEACON="${PILOT_BEACON:-$DEFAULT_BEACON}"
 PILOT_DIR="$HOME/.pilot"
 BIN_DIR="$PILOT_DIR/bin"
-MANAGED_CONTROL_PATH="$PILOT_DIR/managed/enterprise-control.json"
 
 # validate_safe LABEL VALUE EXTRA — abort if VALUE contains any character
 # outside [A-Za-z0-9] plus the punctuation in EXTRA. These values are
@@ -188,8 +176,6 @@ PILOT_REQUESTED_VERSION=""
 PILOT_REQUESTED_CHANNEL=""
 PILOT_YES=0
 PILOT_NO_WARN=0
-PILOT_MANAGED_NO_START=0
-PILOT_MANAGEMENT_URL="${PILOT_MANAGEMENT_URL:-}"
 PILOT_POSITIONAL=""
 PILOT_REQUESTED_TRANSPORT=""
 
@@ -214,13 +200,6 @@ while [ $# -gt 0 ]; do
             PILOT_YES=1; shift ;;
         --no-warn)
             PILOT_NO_WARN=1; shift ;;
-        --managed-url|--management-url)
-            if [ $# -lt 2 ]; then echo "Error: $1 requires an HTTPS origin" >&2; exit 2; fi
-            PILOT_MANAGEMENT_URL="$2"; shift 2 ;;
-        --managed-url=*|--management-url=*)
-            PILOT_MANAGEMENT_URL="${1#*=}"; shift ;;
-        --no-start)
-            PILOT_MANAGED_NO_START=1; shift ;;
         -h|--help)
             # The usage header: from line 4 up to "WHAT THIS SCRIPT DOES".
             awk 'NR >= 4 { if (/^# WHAT THIS SCRIPT DOES/) exit; print }' "$0" 2>/dev/null \
@@ -238,70 +217,6 @@ while [ $# -gt 0 ]; do
             PILOT_POSITIONAL="$PILOT_POSITIONAL $1"; shift ;;
     esac
 done
-
-PILOT_MANAGED_MODE=0
-MANAGED_TOKEN=""
-if [ -n "$PILOT_MANAGEMENT_URL" ]; then
-    PILOT_MANAGED_MODE=1
-    # Accept a cosmetic trailing slash, but require an HTTPS origin with no
-    # credentials, path, query, or fragment. The value later becomes both a
-    # manifest URL and the enrollment authority endpoint.
-    PILOT_MANAGEMENT_URL="${PILOT_MANAGEMENT_URL%/}"
-    case "$PILOT_MANAGEMENT_URL" in
-        https://*) ;;
-        *) echo "Error: --managed-url must be an HTTPS origin." >&2; exit 2 ;;
-    esac
-    _managed_host="${PILOT_MANAGEMENT_URL#https://}"
-    case "$_managed_host" in
-        ""|*/*|*@*|*\?*|*\#*)
-            echo "Error: --managed-url must not contain credentials, a path, query, or fragment." >&2
-            exit 2 ;;
-    esac
-    validate_safe "management host" "$_managed_host" ".:-"
-
-    if [ -n "$PILOT_POSITIONAL" ]; then
-        echo "Error: --managed-url cannot be combined with an install/uninstall positional command." >&2
-        exit 2
-    fi
-    if [ -n "$PILOT_REQUESTED_VERSION" ] || [ -n "${PILOT_RELEASE_TAG:-}" ] \
-       || [ -n "$PILOT_REQUESTED_CHANNEL" ] || [ "${PILOT_RC:-}" = "1" ]; then
-        echo "Error: managed adoption uses the runtime pinned by the management authority; do not combine it with --version or --channel." >&2
-        exit 2
-    fi
-
-    MANAGED_TOKEN="${PILOT_ENROLLMENT_TOKEN:-}"
-    # Do not let the bearer secret reach curl, tar, service managers, or any
-    # other child. It is exported only to the single pilotctl claim process.
-    unset PILOT_ENROLLMENT_TOKEN
-    if [ -e "$MANAGED_CONTROL_PATH" ]; then
-        if [ -L "$MANAGED_CONTROL_PATH" ] || [ ! -f "$MANAGED_CONTROL_PATH" ]; then
-            echo "Error: the existing managed control attachment is not a regular file." >&2
-            exit 1
-        fi
-        if [ -n "$MANAGED_TOKEN" ]; then
-            echo "Error: this node is already managed; refusing to consume a new enrollment token." >&2
-            echo "       Re-run without PILOT_ENROLLMENT_TOKEN to repair or update the managed runtime." >&2
-            exit 1
-        fi
-    else
-        if [ -z "$MANAGED_TOKEN" ]; then
-            echo "Error: PILOT_ENROLLMENT_TOKEN is required for first managed adoption." >&2
-            exit 1
-        fi
-        _managed_token_bytes=$(printf '%s' "$MANAGED_TOKEN" | wc -c | tr -d ' ')
-        if [ "$_managed_token_bytes" -gt 4096 ] \
-           || LC_ALL=C printf '%s' "$MANAGED_TOKEN" | grep -q '[[:cntrl:]]'; then
-            echo "Error: PILOT_ENROLLMENT_TOKEN is invalid." >&2
-            exit 1
-        fi
-    fi
-    # Managed credentials and state created by this process default owner-only.
-    umask 077
-    MANIFEST_URL="${PILOT_MANAGEMENT_URL}/.well-known/pilot-managed-runtime.json"
-elif [ "$PILOT_MANAGED_NO_START" = "1" ]; then
-    echo "Error: --no-start is only valid with --managed-url." >&2
-    exit 2
-fi
 
 # Validate channel value early so we fail fast. `edge` is a back-compat alias
 # for `beta`: the manifest publishes channels.stable and channels.beta only, so
@@ -374,47 +289,6 @@ if [ "${1:-}" != "uninstall" ] && [ "$(id -u)" = "0" ] && [ -z "${PILOT_ALLOW_RO
         echo "       Set PILOT_ALLOW_ROOT=1 to override (not recommended)."
         exit 1
     fi
-fi
-
-# A managed identity is per node, but the CLI links, service label and daemon
-# socket are machine-wide. A different HOME therefore does not make a second
-# installation safe. Refuse before downloading, stopping services, replacing
-# links or consuming the enrollment token. An existing attachment in this
-# same PILOT_DIR remains the ordinary repair/update path handled above.
-if [ "$PILOT_MANAGED_MODE" = "1" ] && [ ! -e "$MANAGED_CONTROL_PATH" ] \
-   && [ "${PILOT_REPLACE_EXISTING_NODE:-}" != "1" ]; then
-    _pilot_collision=""
-    for _pilot_link in /usr/local/bin/pilotctl /usr/local/bin/pilot-daemon; do
-        if [ -L "$_pilot_link" ]; then
-            _pilot_target=$(readlink "$_pilot_link" 2>/dev/null || true)
-            case "$_pilot_target" in
-                "$BIN_DIR"/*) ;;
-                */.pilot/bin/*) _pilot_collision="${_pilot_collision}${_pilot_collision:+, }$_pilot_link -> $_pilot_target" ;;
-            esac
-        fi
-    done
-    _pilot_os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    if [ "$_pilot_os" = "darwin" ] && command -v launchctl >/dev/null 2>&1; then
-        _pilot_service=$(launchctl print "gui/$(id -u)/network.pilotprotocol.pilot-daemon" 2>/dev/null || true)
-        if [ -n "$_pilot_service" ] && ! printf '%s\n' "$_pilot_service" | grep -Fq "$BIN_DIR/pilot-daemon"; then
-            _pilot_collision="${_pilot_collision}${_pilot_collision:+, }LaunchAgent network.pilotprotocol.pilot-daemon"
-        fi
-    elif [ "$_pilot_os" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
-        _pilot_service=$(systemctl cat pilot-daemon 2>/dev/null || true)
-        if [ -n "$_pilot_service" ] && ! printf '%s\n' "$_pilot_service" | grep -Fq "$BIN_DIR/pilot-daemon"; then
-            _pilot_collision="${_pilot_collision}${_pilot_collision:+, }systemd pilot-daemon"
-        fi
-    fi
-    if [ -n "$_pilot_collision" ]; then
-        MANAGED_TOKEN=""
-        unset MANAGED_TOKEN
-        echo "Error: another Pilot node installation already owns machine-wide resources." >&2
-        echo "       Detected: $_pilot_collision" >&2
-        echo "       This enrollment token was not consumed and nothing was changed." >&2
-        echo "       Manage or remove the existing node first; do not run two node identities under one service label." >&2
-        exit 1
-    fi
-    _pilot_collision=""; _pilot_target=""; _pilot_service=""; _pilot_os=""
 fi
 
 # The transport already saved in config.json, if any ("udp", "compat",
@@ -604,9 +478,9 @@ manifest_platform_field() {
 # manifest_describes_tag "<tag>" "<os>-<arch>" "<file>" — whether the
 # manifest's per-platform entry is the archive of <tag>. The manifest carries
 # hashes for one release only: the platform url names it
-# (…/releases/download/<tag>/…), and a manifest without urls (the managed
-# runtime's) describes its latest_stable. Any other tag — a --version pin, the
-# beta channel — has no second anchor, so its hash must not be compared.
+# (…/releases/download/<tag>/…), and a manifest without urls describes its
+# latest_stable. Any other tag — a --version pin, the beta channel — has no
+# second anchor, so its hash must not be compared.
 manifest_describes_tag() {
     [ "$1" = "$(manifest_field "latest_stable" "$3")" ] && return 0
     case "$(manifest_platform_field "$2" url "$3")" in
@@ -889,11 +763,6 @@ HAVE_MANIFEST=0
 if fetch_manifest "$MANIFEST_FILE"; then
     HAVE_MANIFEST=1
 fi
-if [ "$PILOT_MANAGED_MODE" = "1" ] && [ "$HAVE_MANIFEST" != "1" ]; then
-    echo "Error: the management authority did not publish a managed-runtime manifest." >&2
-    echo "       No binary or enrollment state was changed." >&2
-    exit 1
-fi
 
 if [ -n "$PILOT_REQUESTED_VERSION" ]; then
     TAG="$PILOT_REQUESTED_VERSION"
@@ -926,16 +795,6 @@ else
         | grep -i '^location:' \
         | sed -n 's|.*/releases/download/\([^/]*\)/.*|\1|p' \
         | tr -d '\r' | head -1)
-fi
-
-if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-    case "$TAG" in
-        managed-runtime-v[0-9]*.[0-9]*.[0-9]*) ;;
-        *)
-            echo "Error: the management authority published an invalid managed-runtime version." >&2
-            exit 1 ;;
-    esac
-    validate_safe "managed runtime version" "$TAG" ".-"
 fi
 
 # Fail loudly if the user explicitly asked for a released version/channel but it
@@ -1071,11 +930,6 @@ if [ -n "$TAG" ]; then
         fi
         tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" --strip-components=1
     else
-        if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-            echo "Error: managed runtime ${TAG} could not be downloaded." >&2
-            echo "       Refusing to fall back to an unmanaged build." >&2
-            exit 1
-        fi
         # Archive download failed. Only the automatic default path may fall
         # back to a source build; an explicit request already hard-failed
         # above, so reaching here means no version/channel was pinned.
@@ -1142,17 +996,6 @@ if [ -z "$STAGED_DAEMON" ] || [ -z "$STAGED_CTL" ]; then
     echo "       Nothing was replaced — your existing install is untouched." >&2
     exit 1
 fi
-if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-    _managed_probe=$(PILOT_ENROLLMENT_TOKEN='' "$STAGED_CTL" --json enterprise adopt --endpoint "$PILOT_MANAGEMENT_URL" 2>&1 || true)
-    case "$_managed_probe" in
-        *PILOT_ENROLLMENT_TOKEN*) ;;
-        *)
-            echo "Error: ${TAG} does not contain core managed-adoption support." >&2
-            echo "       Nothing was replaced and the enrollment token was not consumed." >&2
-            exit 1 ;;
-    esac
-    _managed_probe=""
-fi
 # gateway is optional: extracted to a sibling repo, no longer ships in
 # release tarballs (release.yml BINS=daemon/pilotctl/updater) and the
 # source build only runs when ./cmd/gateway is present in the checkout.
@@ -1207,10 +1050,7 @@ if [ "$OS" = "linux" ] && [ "$CAN_PRIV" = true ] \
                 fi ;;
         esac
         if [ -n "$_want" ]; then
-            if { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$PILOT_MANAGED_NO_START" != "1" ]; } \
-               && { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$_svc" != "pilot-updater" ]; }; then
-                RESTART_SYSTEMD="${RESTART_SYSTEMD}${RESTART_SYSTEMD:+ }${_svc}"
-            fi
+            RESTART_SYSTEMD="${RESTART_SYSTEMD}${RESTART_SYSTEMD:+ }${_svc}"
             # shellcheck disable=SC2086 # $PILOT_SUDO is "" or "sudo" — intentional split
             $PILOT_SUDO systemctl stop "$_svc" 2>/dev/null || true
             echo "  Stopped ${_svc} (will restart after upgrade)"
@@ -1231,13 +1071,10 @@ if [ "$OS" = "darwin" ]; then
                 echo "Error: could not unload ${_label}; aborting upgrade" >&2
                 exit 1
             fi
-            if { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$PILOT_MANAGED_NO_START" != "1" ]; } \
-               && { [ "$PILOT_MANAGED_MODE" != "1" ] || [ "$_new_label" != "network.pilotprotocol.pilot-updater" ]; }; then
-                case " $RESTART_LAUNCHD " in
-                    *" ${_new_label} "*) ;;
-                    *) RESTART_LAUNCHD="${RESTART_LAUNCHD}${RESTART_LAUNCHD:+ }${_new_label}" ;;
-                esac
-            fi
+            case " $RESTART_LAUNCHD " in
+                *" ${_new_label} "*) ;;
+                *) RESTART_LAUNCHD="${RESTART_LAUNCHD}${RESTART_LAUNCHD:+ }${_new_label}" ;;
+            esac
             echo "  Unloaded ${_label} (will reload as ${_new_label} after upgrade)"
         fi
         if [ "$_new_label" != "$_label" ] && [ -f "$_lp" ]; then
@@ -1270,32 +1107,6 @@ install_bin "$STAGED_DAEMON" "$BIN_DIR/pilot-daemon"
 install_bin "$STAGED_CTL" "$BIN_DIR/pilotctl"
 [ -n "$STAGED_GATEWAY" ] && install_bin "$STAGED_GATEWAY" "$BIN_DIR/pilot-gateway"
 [ -n "$STAGED_UPDATER" ] && install_bin "$STAGED_UPDATER" "$BIN_DIR/pilot-updater"
-
-# --- Optional hosted adoption (core Pilot, not MCP) ---
-#
-# The one-time token is exposed only to this process. pilotctl validates the
-# delegated key, root pin, trust bundle, bootstrap policy, authority origins,
-# and owner-only output before atomically installing ~/.pilot/managed.
-MANAGED_ADOPTED=0
-if [ "$PILOT_MANAGED_MODE" = "1" ] && [ ! -e "$MANAGED_CONTROL_PATH" ]; then
-    if ! _managed_result=$(PILOT_ENROLLMENT_TOKEN="$MANAGED_TOKEN" "$BIN_DIR/pilotctl" --json enterprise adopt --endpoint "$PILOT_MANAGEMENT_URL" 2>&1); then
-        MANAGED_TOKEN=""
-        unset MANAGED_TOKEN
-        echo "Error: the hosted authority did not complete managed adoption." >&2
-        printf '%s\n' "$_managed_result" >&2
-        exit 1
-    fi
-    MANAGED_TOKEN=""
-    unset MANAGED_TOKEN
-    _managed_result=""
-    if [ -L "$MANAGED_CONTROL_PATH" ] || [ ! -f "$MANAGED_CONTROL_PATH" ]; then
-        echo "Error: managed adoption returned without installing the verified control attachment." >&2
-        exit 1
-    fi
-    MANAGED_ADOPTED=1
-fi
-MANAGED_TOKEN=""
-unset MANAGED_TOKEN
 
 # --- Symlink into /usr/local/bin so NON-INTERACTIVE shells can find pilotctl ---
 #
@@ -1337,7 +1148,7 @@ if [ "$LINK_OK" = true ]; then
         # shellcheck disable=SC2086
         $LINK_SUDO ln -sf "$BIN_DIR/pilot-gateway" "$LINK_DIR/pilot-gateway" 2>/dev/null || true
     fi
-    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ -f "$BIN_DIR/pilot-updater" ]; then
         # shellcheck disable=SC2086
         $LINK_SUDO ln -sf "$BIN_DIR/pilot-updater" "$LINK_DIR/pilot-updater" 2>/dev/null || true
     fi
@@ -1733,13 +1544,7 @@ service_proxy_note() {
 # only when the file is absent so an operator who later runs `pilotctl update
 # disable` is never silently re-enabled. Turn off any time with
 # `pilotctl update disable`.
-if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-    # Stable-channel updater builds do not yet carry the managed control
-    # client. Pin this authority-selected runtime instead of allowing
-    # a background downgrade to silently remove enforcement.
-    printf '{\n  "enabled": false,\n  "reason": "managed-runtime-pinned-by-authority"\n}\n' > "$PILOT_DIR/auto-update.json"
-    echo "Auto-updates pinned to the management authority runtime channel"
-elif [ ! -f "$PILOT_DIR/auto-update.json" ]; then
+if [ ! -f "$PILOT_DIR/auto-update.json" ]; then
     printf '{\n  "enabled": true\n}\n' > "$PILOT_DIR/auto-update.json"
     echo "Auto-updates ENABLED (opt-out) — disable with: pilotctl update disable"
 fi
@@ -1749,8 +1554,6 @@ fi
 # The units are (re)generated on EVERY run, fresh install or upgrade. That is
 # what makes re-running the installer a real repair path: a host whose unit was
 # written by an older, buggy installer gets a correct one without uninstalling.
-
-MANAGED_START_STYLE=""
 
 if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     if [ "$CAN_PRIV" = true ]; then
@@ -1814,7 +1617,7 @@ RestartSec=5
 WantedBy=multi-user.target
 SVC
     # Auto-updater service
-    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ -f "$BIN_DIR/pilot-updater" ]; then
     # shellcheck disable=SC2086
     $PILOT_SUDO tee /etc/systemd/system/pilot-updater.service >/dev/null <<USVC
 [Unit]
@@ -1840,14 +1643,8 @@ USVC
     # under `set -e` — the binaries and skill injection still matter.
     # shellcheck disable=SC2086
     $PILOT_SUDO systemctl daemon-reload || true
-    if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-        # A stale stable-channel updater could replace the authority-pinned
-        # managed runtime with a build that lacks hosted control support.
-        # shellcheck disable=SC2086
-        $PILOT_SUDO systemctl disable --now pilot-updater 2>/dev/null || true
-    fi
     echo "  Service: pilot-daemon.service"
-    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ -f "$BIN_DIR/pilot-updater" ]; then
         echo "  Service: pilot-updater.service (auto-updates)"
     fi
     service_proxy_note "pilot-daemon.service"
@@ -1863,7 +1660,7 @@ USVC
     # operator-tunable flags (-public, -hostname, registry overrides) that the
     # operator may want to set before first start; on a re-run anything that
     # was already running is restored below.
-    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ -f "$BIN_DIR/pilot-updater" ]; then
         # shellcheck disable=SC2086
         if $PILOT_SUDO systemctl enable --now pilot-updater; then
             echo "  Started: pilot-updater (check automatic-update state: pilotctl update status)"
@@ -1884,51 +1681,38 @@ USVC
         fi
     done
 
-    if [ "$PILOT_MANAGED_MODE" = "1" ] && [ "$PILOT_MANAGED_NO_START" != "1" ]; then
-        # Managed onboarding promises a live signed check-in, so unlike an
-        # ordinary local install it explicitly enables the daemon now.
-        # shellcheck disable=SC2086
-        $PILOT_SUDO systemctl enable --now pilot-daemon
-        MANAGED_START_STYLE="systemd"
-        echo "  Started: pilot-daemon (managed reporting enabled)"
-    elif [ "$PILOT_MANAGED_MODE" != "1" ]; then
-        case " $RESTART_SYSTEMD " in
-            *" pilot-daemon "*) ;;
-            *)
-                if [ "$PROXY_UNSUPPORTED" = true ]; then
-                    echo "  Start daemon:"
-                    start_hint "    " "sudo systemctl enable --now pilot-daemon"
-                else
-                    echo "  Start daemon: sudo systemctl enable --now pilot-daemon"
-                fi ;;
-        esac
-    fi
+    case " $RESTART_SYSTEMD " in
+        *" pilot-daemon "*) ;;
+        *)
+            if [ "$PROXY_UNSUPPORTED" = true ]; then
+                echo "  Start daemon:"
+                start_hint "    " "sudo systemctl enable --now pilot-daemon"
+            else
+                echo "  Start daemon: sudo systemctl enable --now pilot-daemon"
+            fi ;;
+    esac
     else
     echo "  Skipped systemd setup (run as root or with passwordless sudo to enable)"
-    if [ "$PILOT_MANAGED_MODE" != "1" ]; then
-        if [ "$PROXY_UNSUPPORTED" = true ]; then
-            echo "  Start the daemon without a service manager:"
-            start_hint "    " "pilotctl daemon start"
-        else
-            echo "  Start the daemon without a service manager: pilotctl daemon start"
-        fi
+    if [ "$PROXY_UNSUPPORTED" = true ]; then
+        echo "  Start the daemon without a service manager:"
+        start_hint "    " "pilotctl daemon start"
+    else
+        echo "  Start the daemon without a service manager: pilotctl daemon start"
     fi
     fi
 elif [ "$OS" = "linux" ]; then
     # systemd is not the init system here (container / WSL / CI runner /
     # hosted agent sandbox). There is no service to install — tell the agent
     # the portable start path instead of silently leaving it with no daemon.
-    if [ "$PILOT_MANAGED_MODE" != "1" ]; then
-        if [ "$PROXY_ONLY" = true ]; then
-            echo "No systemd detected (container / WSL / CI / sandbox):"
-        else
-            echo "No systemd detected (container / WSL / CI / sandbox) — start the daemon manually:"
-        fi
-        start_hint "  " "pilotctl daemon start"
-        if [ "$PROXY_UNSUPPORTED" != true ] && [ "$EFFECTIVE_TRANSPORT" != "udp" ]; then
-            echo "  (transport=${EFFECTIVE_TRANSPORT}; start it from a shell that has HTTPS_PROXY"
-            echo "   set if this host reaches the internet only through a proxy)"
-        fi
+    if [ "$PROXY_ONLY" = true ]; then
+        echo "No systemd detected (container / WSL / CI / sandbox):"
+    else
+        echo "No systemd detected (container / WSL / CI / sandbox) — start the daemon manually:"
+    fi
+    start_hint "  " "pilotctl daemon start"
+    if [ "$PROXY_UNSUPPORTED" != true ] && [ "$EFFECTIVE_TRANSPORT" != "udp" ]; then
+        echo "  (transport=${EFFECTIVE_TRANSPORT}; start it from a shell that has HTTPS_PROXY"
+        echo "   set if this host reaches the internet only through a proxy)"
     fi
 fi
 
@@ -2015,7 +1799,7 @@ ${PLIST_ENV}    <key>RunAtLoad</key>
 </plist>
 PLIST
     # Auto-updater LaunchAgent
-    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ -f "$BIN_DIR/pilot-updater" ]; then
         UPLIST="$PLIST_DIR/network.pilotprotocol.pilot-updater.plist"
         cat > "$UPLIST" <<UPLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2044,13 +1828,7 @@ UPLIST
     fi
 
     echo "  Service: network.pilotprotocol.pilot-daemon"
-    if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-        _managed_updater_plist="$PLIST_DIR/network.pilotprotocol.pilot-updater.plist"
-        if [ -f "$_managed_updater_plist" ]; then
-            launchctl unload -w "$_managed_updater_plist" 2>/dev/null || true
-        fi
-    fi
-    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ]; then
+    if [ -f "$BIN_DIR/pilot-updater" ]; then
         echo "  Service: network.pilotprotocol.pilot-updater (auto-updates)"
     fi
     service_proxy_note "the launchd agent"
@@ -2065,7 +1843,7 @@ UPLIST
     # idempotent: any stale running agent is replaced cleanly. -w persists
     # the load across reboots. The daemon is left as opt-in for the same
     # reason as the Linux branch.
-    if [ "$PILOT_MANAGED_MODE" != "1" ] && [ -f "$BIN_DIR/pilot-updater" ] && [ -f "$UPLIST" ]; then
+    if [ -f "$BIN_DIR/pilot-updater" ] && [ -f "$UPLIST" ]; then
         launchctl unload "$UPLIST" 2>/dev/null || true
         launchctl load -w "$UPLIST"
         echo "  Started: pilot-updater (check automatic-update state: pilotctl update status)"
@@ -2087,47 +1865,18 @@ UPLIST
         fi
     done
 
-    if [ "$PILOT_MANAGED_MODE" != "1" ]; then
-        case " $RESTART_LAUNCHD " in
-            *" network.pilotprotocol.pilot-daemon "*) ;;
-            *)
-                if [ "$PROXY_UNSUPPORTED" = true ]; then
-                    echo "  Start daemon:"
-                    start_hint "    " "launchctl load -w $PLIST" "launchctl load -w $PLIST"
-                else
-                    echo "  Start daemon: launchctl load -w $PLIST"
-                fi
-                echo "  Stop daemon:  launchctl unload $PLIST"
-                ;;
-        esac
-    fi
-fi
-
-# A managed Connect Agent run is complete only when the newly adopted core
-# daemon is locally responsive. The management console independently waits for
-# the signed remote report, so this check cannot forge onboarding success.
-if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-    if [ "$PILOT_MANAGED_NO_START" = "1" ]; then
-        echo "Managed runtime adopted but not started (--no-start)."
-    elif [ "$MANAGED_START_STYLE" = "systemd" ]; then
-        _managed_wait=0
-        until "$BIN_DIR/pilotctl" daemon status --check >/dev/null 2>&1; do
-            _managed_wait=$((_managed_wait + 1))
-            if [ "$_managed_wait" -ge 30 ]; then
-                echo "Error: the managed daemon did not become ready under systemd." >&2
-                exit 1
+    case " $RESTART_LAUNCHD " in
+        *" network.pilotprotocol.pilot-daemon "*) ;;
+        *)
+            if [ "$PROXY_UNSUPPORTED" = true ]; then
+                echo "  Start daemon:"
+                start_hint "    " "launchctl load -w $PLIST" "launchctl load -w $PLIST"
+            else
+                echo "  Start daemon: launchctl load -w $PLIST"
             fi
-            sleep 1
-        done
-    else
-        # Portable and launchd installs need an explicit restart so a daemon
-        # that was already running cannot keep the pre-adoption configuration.
-        if "$BIN_DIR/pilotctl" daemon status --check >/dev/null 2>&1; then
-            "$BIN_DIR/pilotctl" daemon stop >/dev/null
-        fi
-        "$BIN_DIR/pilotctl" daemon start --wait 30s >/dev/null
-        "$BIN_DIR/pilotctl" daemon status --check >/dev/null
-    fi
+            echo "  Stop daemon:  launchctl unload $PLIST"
+            ;;
+    esac
 fi
 
 # --- Add to PATH ---
@@ -2198,30 +1947,6 @@ fi
 
 # Write version file for the auto-updater
 [ -n "$TAG" ] && echo "$TAG" > "$BIN_DIR/.pilot-version"
-
-if [ "$PILOT_MANAGED_MODE" = "1" ]; then
-    echo ""
-    echo "Managed Pilot node ready:"
-    echo "  Runtime:    ${TAG}"
-    echo "  Authority:  ${PILOT_MANAGEMENT_URL}"
-    echo "  Control:    ${MANAGED_CONTROL_PATH}"
-    if [ "$MANAGED_ADOPTED" = "1" ]; then
-        echo "  Enrollment: claimed once and installed"
-    else
-        echo "  Enrollment: existing managed identity preserved"
-    fi
-    if [ "$PILOT_MANAGED_NO_START" = "1" ]; then
-        echo "  Daemon:     not started (--no-start)"
-    else
-        echo "  Daemon:     running; signed fleet reporting enabled"
-    fi
-    echo "  MCP:        not installed (optional, separate product)"
-    echo ""
-    echo "Harness interception is a separate optional attachment step."
-    echo "The management console will verify the node's signed report before"
-    echo "it marks onboarding complete."
-    exit 0
-fi
 
 # transport_line — the transport the installed daemon will run, stated once
 # the binaries are known (the banner at the top does not guess), plus what to

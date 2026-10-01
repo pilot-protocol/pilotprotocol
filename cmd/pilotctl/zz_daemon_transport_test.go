@@ -419,7 +419,7 @@ exit 0
 var baseDaemonFlags = []string{
 	"registry", "beacon", "listen", "socket", "identity", "log-level", "log-format",
 	"encrypt", "email", "hostname", "config", "public", "webhook", "networks",
-	"trust-auto-approve", "enterprise-control", "endpoint", "compat-beacon",
+	"trust-auto-approve", "endpoint", "compat-beacon",
 	"registry-trust", "registry-fingerprint", "tls-trust", "motd-feed-url", "motd-interval",
 }
 

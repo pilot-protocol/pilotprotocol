@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ['v*', 'managed-runtime-v*']
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -193,10 +193,7 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
-          # Managed runtimes are authority-pinned artifacts, not the generic
-          # Pilot update channel. Publishing one must not replace vX.Y.Z as
-          # GitHub's /releases/latest target for ordinary installers.
-          make_latest: ${{ startsWith(github.ref_name, 'managed-runtime-') && 'false' || 'true' }}
+          make_latest: 'true'
 
   # ---------------------------------------------------------------------------
   # Downstream fan-out is NO LONGER driven from here.
