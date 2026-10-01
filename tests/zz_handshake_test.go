@@ -485,9 +485,19 @@ func TestHandshakeTrustPersistence(t *testing.T) {
 		}
 	}
 
-	// Verify trust store file exists
-	if _, err := os.Stat(trustPathA); err != nil {
-		t.Fatalf("trust store not created: %v", err)
+	// Verify trust store file exists. It is written by a goroutine after
+	// the in-memory state changes, so it can lag what TrustedPeers reports.
+	deadline = time.After(5 * time.Second)
+	for {
+		_, err := os.Stat(trustPathA)
+		if err == nil {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("trust store not created: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	t.Log("trust store file created")
 }
@@ -614,13 +624,15 @@ func TestHandshakeTrustLoadVerify(t *testing.T) {
 		}
 	}
 
-	// Verify trust file was created and contains correct data
-	data, err := os.ReadFile(trustPath)
-	if err != nil {
-		t.Fatalf("read trust file: %v", err)
-	}
-
-	var snap struct {
+	// Verify trust file was created and contains correct data.
+	//
+	// The handshake manager persists asynchronously: a goroutine writes the
+	// file (with an fsync) after the in-memory state has changed, so that
+	// the write does not hold up other handshake operations. TrustedPeers
+	// can therefore report the peer before the file exists, or while it
+	// still holds the earlier pending-only state. Reading it at once failed
+	// under load with "no such file or directory".
+	type trustFile struct {
 		Trusted []struct {
 			NodeID     uint32 `json:"node_id"`
 			PublicKey  string `json:"public_key"`
@@ -631,12 +643,29 @@ func TestHandshakeTrustLoadVerify(t *testing.T) {
 			NodeID uint32 `json:"node_id"`
 		} `json:"pending"`
 	}
-	if err := json.Unmarshal(data, &snap); err != nil {
-		t.Fatalf("unmarshal trust file: %v", err)
-	}
-
-	if len(snap.Trusted) == 0 {
-		t.Fatal("trust file should have at least one trusted peer")
+	var snap trustFile
+	deadline = time.After(5 * time.Second)
+	for {
+		data, err := os.ReadFile(trustPath)
+		if err == nil {
+			snap = trustFile{}
+			if err := json.Unmarshal(data, &snap); err != nil {
+				t.Fatalf("unmarshal trust file: %v", err)
+			}
+			if len(snap.Trusted) > 0 {
+				break
+			}
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("read trust file: %v", err)
+		}
+		select {
+		case <-deadline:
+			if err != nil {
+				t.Fatalf("read trust file: %v", err)
+			}
+			t.Fatal("trust file should have at least one trusted peer")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 
 	// Verify B's node ID is in the trusted list
