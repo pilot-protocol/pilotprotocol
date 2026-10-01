@@ -29,6 +29,22 @@ Detailed per-release notes are on the
   existing `SendTo` command is unchanged and still never replies, so
   current clients and SDKs are unaffected; `pilotctl dgram` switches to the
   confirmed send once the driver release that carries it is picked up.
+- **`pilotctl send-message --wait` matches the reply by message ID.** The
+  wait took the oldest new message from the peer, so two concurrent requests
+  to one peer, or anything else the peer sent in the window, could hand a
+  caller another request's answer. Every message is now sent with a new
+  message ID (`message_id` in the `--json` result, and in the receiver's inbox
+  record), and a message from the peer whose `reply_to` is that ID is the
+  reply. A message whose `reply_to` names another request is never taken. A
+  peer that does not echo the ID is matched by sender and arrival time as
+  before, so nothing changes for it — that is every service responder today.
+  New flag `--reply-to <id>` sends a message as the answer to a received one.
+  A first-contact re-send uses an ID of its own (the receiver would drop a
+  repeat of the same ID as a duplicate) and a reply to either is accepted.
+  Receivers that predate message IDs still get the message, in the old format
+  (`"tagged": false` in the result); that costs one extra exchange on the same
+  connection. No dependency change: dataexchange v0.2.3 already carries the
+  IDs.
 - **The daemon caps its own log file.** launchd never rotates the daemon's
   `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
   without bound — 22 MB on one laptop. When stderr is a regular file the

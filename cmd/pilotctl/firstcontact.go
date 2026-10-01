@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pilot-protocol/common/driver"
@@ -153,14 +154,28 @@ func dialFailureHint(target string, err error, attempts int, elapsed time.Durati
 // inboxWatch finds the reply to one request in the inbox. It snapshots
 // the files present before the request is sent, so a reply to an
 // earlier request (or the late duplicate some services send) that is
-// already sitting in the inbox is never taken for this one, and it
-// returns the oldest new file from the peer rather than whichever one
-// the directory listing happens to put first.
+// already sitting in the inbox is never taken for this one.
+//
+// Which new message is the reply:
+//
+//   - Every request is sent with a message ID (addID). A message from the
+//     peer whose reply_to is one of our IDs is the reply, whatever else
+//     arrived before it.
+//   - A message whose reply_to names some other request is never taken: it
+//     answers another send-message --wait to the same peer.
+//   - A message without reply_to comes from a peer that does not echo the
+//     ID (every responder older than this, and old daemons, which drop the
+//     ID). The oldest such message from the peer is taken, as before IDs
+//     existed. Two concurrent requests to such a peer, or anything else it
+//     sends in the window, still cannot be told apart.
 type inboxWatch struct {
 	dir    string
 	from   string
 	cutoff time.Time
 	seen   map[string]bool
+
+	mu  sync.Mutex
+	ids map[string]bool // message IDs of our request (and of its re-send)
 }
 
 func inboxDirPath() (string, error) {
@@ -188,7 +203,49 @@ func newInboxWatch(from string) *inboxWatch {
 	return w
 }
 
-// poll returns the oldest reply that arrived since the snapshot.
+// addID registers the message ID of a request this watch waits on. The
+// re-sent request has an ID of its own; a reply to either one is ours.
+func (w *inboxWatch) addID(id string) {
+	if id == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ids == nil {
+		w.ids = map[string]bool{}
+	}
+	w.ids[id] = true
+}
+
+// replyKind says how a message's reply_to relates to this watch's requests.
+type replyKind int
+
+const (
+	replyUntagged replyKind = iota // no reply_to: only sender and time to go by
+	replyOurs                      // reply_to is one of our message IDs
+	replyOther                     // reply_to names somebody else's request
+)
+
+func (w *inboxWatch) classify(msg map[string]interface{}) replyKind {
+	replyTo, _ := msg["reply_to"].(string)
+	if replyTo == "" {
+		return replyUntagged
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.ids) == 0 {
+		// A caller that sent without an ID has nothing to compare with.
+		return replyUntagged
+	}
+	if w.ids[replyTo] {
+		return replyOurs
+	}
+	return replyOther
+}
+
+// poll returns the reply that arrived since the snapshot: the message that
+// names one of our requests in reply_to, else the oldest one from the peer
+// that names none.
 func (w *inboxWatch) poll() (map[string]interface{}, error) {
 	if w.dir == "" {
 		dir, err := inboxDirPath()
@@ -214,6 +271,7 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 		}
 		return ni[di:] < nj[dj:]
 	})
+	var untagged map[string]interface{}
 	for _, e := range entries {
 		if e.IsDir() || w.seen[e.Name()] {
 			continue
@@ -235,9 +293,19 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 				continue
 			}
 		}
-		return msg, nil
+		switch w.classify(msg) {
+		case replyOurs:
+			return msg, nil
+		case replyOther:
+			// Another request's answer. It stays out of w.seen: an ID
+			// added later (the re-send) is checked against it again.
+		case replyUntagged:
+			if untagged == nil {
+				untagged = msg
+			}
+		}
 	}
-	return nil, nil
+	return untagged, nil
 }
 
 // replyWait configures awaitReply.
