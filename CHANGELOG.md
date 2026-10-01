@@ -276,6 +276,15 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **A message larger than 256 KB is delivered instead of silently dropped.**
+  The daemon refused any single stream write bigger than its send buffer, and
+  an IPC send has no reply, so the client never knew: `send-message` printed
+  `"status":"ok"` for a 1 MB message that never left the node. A large write is
+  now fed through the buffer in pieces, blocking on the window like any other
+  write. The buffer's size cap is unchanged.
+- **`pilotctl send-message` fails when the receiver does not acknowledge the
+  message.** Every receiver answers a stored message with an ACK; with none,
+  the command used to exit 0.
 - **`-advertise-endpoint` survives a re-registration.** When the daemon
   re-registered (registry reconnect, transport watchdog recovery) it sent
   the tunnel socket's local address instead of the advertised endpoint, so

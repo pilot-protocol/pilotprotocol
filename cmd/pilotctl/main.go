@@ -4784,7 +4784,7 @@ func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
 	for name := range flags {
 		switch name {
-		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
+		case "data", "data-file", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
 		default:
 			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
 		}
@@ -5010,6 +5010,17 @@ func cmdSendMessage(args []string) {
 		defer cl.Close()
 		r := sendOne(cl, 0, false)
 		ackAt := time.Now()
+		// Every receiver answers a stored message with an ACK frame. No ACK
+		// means the message was not stored, or was never sent — the daemon
+		// drops a write it cannot buffer without telling the client — so
+		// "ok" here was reporting messages that never arrived.
+		if _, failed := r["error"]; !failed {
+			if _, acked := r["ack"]; !acked {
+				fatalHint("connection_failed",
+					"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
+					"%s did not acknowledge the message (%d bytes)", target, len(data))
+			}
+		}
 		// The receiver answers "ERR ..." when it could not store the
 		// message (disk full, inbox unwritable). That is a failed send, not
 		// a delivered one — same rule send-file applies.
