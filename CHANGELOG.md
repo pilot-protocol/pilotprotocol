@@ -251,6 +251,38 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **A node whose IP address changes recovers in about a second instead of
+  about half a minute.** When the host's address changed under a running
+  daemon (new DHCP lease, Wi-Fi to Ethernet, a VPN taking the default route, a
+  container moved to another address), nothing in the daemon noticed. Peers
+  kept sending to the old address until their own timeouts moved them to the
+  relay or the node's 25 s keepalive reached them, the node's own registry
+  connections stayed bound to the old address until a 30 s read timeout, and
+  the registry kept handing out the old endpoint for a minute or more. The
+  daemon now checks once a second which source address the kernel would use
+  toward the beacon (a route lookup; nothing is sent) and, when it changes,
+  re-registers with the beacon, sends one authenticated probe straight to
+  every tunnel peer so each learns the new address from it, and re-registers
+  with the registry over a fresh connection, also refreshing the LAN
+  addresses it advertises. Measured in a three-node Docker lab, moving one
+  node to a new address: peer to moved node 32 s before, under 1 s after;
+  moved node to peer 30 s before, no failed send after; a node with no
+  existing tunnel timed out after 30 s before and connected directly in 0.2 s
+  after. Peers need no update.
+  - An interface that drops and returns with the same address triggers
+    nothing, and neither does an unrelated interface appearing (a Docker
+    bridge, a VPN that does not take the route). Recoveries are at least 10 s
+    apart, and the gap doubles up to 2 minutes while changes keep coming, so
+    a flapping interface cannot flood the registry; a change seen during the
+    gap runs when the gap ends.
+  - Behind NAT the local address does not change when the public one does.
+    The daemon now also reads the address the beacon reports seeing it at
+    (the reply to its periodic beacon registration, every keepalive interval,
+    60 s by default) and runs the same recovery when that IP changes. This
+    path has unit tests only; it was not exercised against a real NAT.
+  - Publishes `tunnel.addr_changed` (`reason`, `previous`, `current`,
+    `peers_notified`, `registry_ok`). A relay-only or compat-mode node does
+    not probe peers directly.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's
