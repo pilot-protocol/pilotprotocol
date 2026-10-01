@@ -5940,8 +5940,16 @@ func (d *Daemon) tryDirectUpgrade(nodeID uint32) {
 	// A prior blackhole flip may have PINNED the peer to relay; ClearRelayOnDirect
 	// will not promote a pinned peer. Unpin it — we've confirmed above it is not
 	// registry relay-only, so direct is allowed to win on its merits.
+	//
+	// Only the pin goes. The peer stays on the relay until direct packets
+	// from it actually arrive. Clearing the relay flag here as well put
+	// every blackholed peer back on its dead direct path within one
+	// RelayProbeInterval of the flip, where it stayed until the blackhole
+	// heuristic tripped again (three more silent sends): about 75 s of
+	// every 90 s spent sending into the void, for as long as the direct
+	// path was down.
 	if d.tunnels.IsRelayPinned(nodeID) {
-		d.tunnels.SetRelayPeerPinned(nodeID, false)
+		d.tunnels.UnpinRelayPeer(nodeID)
 	}
 
 	// Coordinate the punch (opens the conntrack pinhole on both NATs).
