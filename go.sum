@@ -237,8 +237,8 @@ github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3I
 github.com/pborman/getopt v0.0.0-20170112200414-7148bc3a4c30/go.mod h1:85jBQOZwpVEaDAr341tbn15RS4fCAsIst0qp7i8ex1o=
 github.com/pilot-protocol/app-store v1.0.5 h1:Eugkaw0CkZpat0R4CYazQJ30aNbs29ziVtlbmjDWho8=
 github.com/pilot-protocol/app-store v1.0.5/go.mod h1:Sz1vIZ92zNMWEnTJTXNxw7QmlbPRXs73qY/duNC0tgs=
-github.com/pilot-protocol/beacon v0.2.10 h1:RT40+IzU0cRgREJWZwYca3nA70+qhhsG3G95Npus8+E=
-github.com/pilot-protocol/beacon v0.2.10/go.mod h1:TPzemcFEopN+nUEwTkkDNPtMQpGMyi5GrDvQsg6xVTg=
+github.com/pilot-protocol/beacon v0.2.12 h1:FdlCFXQD1jwFpf2/e8ryGafEyMqs+Ee5yT8iQ8cslJ0=
+github.com/pilot-protocol/beacon v0.2.12/go.mod h1:iVrjVrLa/J63DZkruYCAJehcu/8+8nDqnnJZ6tUpzes=
 github.com/pilot-protocol/common v0.6.0 h1:mmljgxFrVKKwXMLRm+yl8oMY9HmP24IvWUSdOA2aXHs=
 github.com/pilot-protocol/common v0.6.0/go.mod h1:OTXD84ScrBbKTAhawgFlLw9HtisgNvr83Zs1yDAuG9k=
 github.com/pilot-protocol/dataexchange v0.3.0 h1:dQsPMEPqKJ/cLy/qOzKoI0w/ZIiDAEH+8Ws1p20V9eo=
