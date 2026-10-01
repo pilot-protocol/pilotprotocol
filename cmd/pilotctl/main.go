@@ -907,6 +907,13 @@ Flags:
   --timeout <dur>       total wall time, including connect, handshake and reply
   --trace               print per-step timing breakdown to stderr
   --no-auto-handshake   skip automatic trust handshake with known agents
+  --reply-to <id>       mark this message as the answer to a received message:
+                        <id> is that message's message_id (pilotctl inbox),
+                        and the sender's --wait matches the reply on it
+
+Every message is sent with a new message ID (message_id in the --json result).
+--wait takes the message from the peer whose reply_to is that ID. A peer that
+does not echo the ID is matched by sender and arrival time, as before.
 
 Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
@@ -4748,7 +4755,7 @@ func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
 	for name := range flags {
 		switch name {
-		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
+		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake", "reply-to":
 		default:
 			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
 		}
@@ -4768,7 +4775,14 @@ func cmdSendMessage(args []string) {
 		defer timer.Stop()
 	}
 	if len(pos) != 1 {
-		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend]")
+		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend] [--reply-to <message-id>]")
+	}
+	// --reply-to marks this message as the answer to a message received
+	// earlier: the value is that message's message_id (see `pilotctl inbox`),
+	// and the sender's --wait matches on it.
+	replyTo := flagString(flags, "reply-to", "")
+	if _, given := flags["reply-to"]; given && !dataexchange.ValidMessageID(replyTo) {
+		fatalCode("invalid_argument", "--reply-to must be a message ID: 1-%d characters of A-Z a-z 0-9 . _ : -", dataexchange.MaxMessageIDLen)
 	}
 
 	sendCount := flagInt(flags, "count", 1)
@@ -4866,39 +4880,51 @@ func cmdSendMessage(args []string) {
 		return c
 	}
 
+	// Set below when --wait is given. Declared here so sendOne can register
+	// each request's message ID with it before the request leaves.
+	var watch *inboxWatch
+
 	// sendOne sends one message on cl and returns timing/ack metadata.
 	// reused=true is recorded when the connection was dialled on a prior call.
+	//
+	// Every send carries a new message ID, so the receiver can tell a
+	// re-delivery from a new message and a reply can name the request it
+	// answers (reply_to). Client.Send delivers the message without the ID to
+	// a receiver too old to know it: such a receiver stores nothing for the
+	// tagged frame, says so, and gets the plain frame on the same connection.
 	sendOne := func(cl *dataexchange.Client, seq int, reused bool) map[string]interface{} {
-		var sentAtNs int64
-		var sendErr error
-		if traceTime {
-			sentAtNs, sendErr = cl.SendTrace(innerType, []byte(data))
-		} else {
-			sendStart := time.Now()
-			switch msgType {
-			case "text":
-				sendErr = cl.SendText(data)
-			case "json":
-				sendErr = cl.SendJSON([]byte(data))
-			case "binary":
-				sendErr = cl.SendBinary([]byte(data))
-			}
-			sentAtNs = sendStart.UnixNano()
+		messageID := dataexchange.NewMessageID()
+		if watch != nil {
+			watch.addID(messageID)
 		}
-		if sendErr != nil {
-			return map[string]interface{}{"seq": seq, "error": sendErr.Error()}
-		}
-
-		ack, ackErr := cl.Recv()
+		sentAtNs := time.Now().UnixNano()
+		res, sendErr := cl.Send(messageFrame(innerType, []byte(data), messageID, replyTo, traceTime, sentAtNs))
 		ackRecvAtNs := time.Now().UnixNano()
-		if ackErr != nil {
-			slog.Debug("send-message ACK read failed", "err", ackErr)
+		var ack *dataexchange.Frame
+		switch {
+		case res != nil:
+			// Delivered, or answered "ERR ..." (ErrRejected): either way the
+			// receiver's answer is the ack.
+			ack = res.Ack
+		case isAckReadError(sendErr):
+			// The message was written; only the ack did not come back.
+			slog.Debug("send-message ACK read failed", "err", sendErr)
+		default:
+			return map[string]interface{}{"seq": seq, "error": sendErr.Error(), "message_id": messageID}
 		}
 
 		r := map[string]interface{}{
 			"seq":    seq,
 			"bytes":  len(data),
 			"reused": reused,
+			// message_id is the ID this message was sent with. tagged says
+			// whether the receiver got it: false for a receiver too old to
+			// know message IDs, which can then not be asked to echo it.
+			"message_id": messageID,
+			"tagged":     res != nil && res.Tagged,
+		}
+		if replyTo != "" {
+			r["reply_to"] = replyTo
 		}
 		if ack != nil {
 			r["ack"] = string(ack.Payload)
@@ -4935,7 +4961,6 @@ func cmdSendMessage(args []string) {
 	agentHint := target.String()
 	// Snapshot the inbox before the send so --wait only takes a reply that
 	// arrives after it (never one already sitting there).
-	var watch *inboxWatch
 	if waitDur > 0 {
 		watch = newInboxWatch(agentHint)
 	}
@@ -5108,6 +5133,28 @@ func cmdSendMessage(args []string) {
 	}
 	tracef("outputOK")
 	maybePromptPilotReview()
+}
+
+// messageFrame builds the data-exchange frame for one send-message. With
+// trace it is the TypeTrace wrapper (inner type, send time, payload) the
+// receiver answers with a timing ACK; the message ID and reply-to ride
+// outside it either way.
+func messageFrame(innerType uint32, data []byte, messageID, replyTo string, trace bool, sentAtNs int64) *dataexchange.Frame {
+	f := &dataexchange.Frame{Type: innerType, Payload: data, MessageID: messageID, ReplyTo: replyTo}
+	if trace {
+		buf := make([]byte, 12+len(data))
+		binary.BigEndian.PutUint32(buf[0:4], innerType)
+		binary.BigEndian.PutUint64(buf[4:12], uint64(sentAtNs)) // #nosec G115 -- a wall-clock nanosecond count is positive
+		copy(buf[12:], data)
+		f.Type, f.Payload = dataexchange.TypeTrace, buf
+	}
+	return f
+}
+
+// isAckReadError reports whether a Client.Send error means the frame was
+// written and only the receiver's acknowledgement could not be read.
+func isAckReadError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "dataexchange: read ack:")
 }
 
 // maybePromptPilotReview occasionally prints a Pilot review nudge to stderr
