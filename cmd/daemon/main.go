@@ -11,7 +11,6 @@ import (
 	"log"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -23,9 +22,7 @@ import (
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/logging"
 	"github.com/pilot-protocol/common/netproxy"
-	"github.com/pilot-protocol/pilotprotocol/internal/enterprisecontrol"
 	"github.com/pilot-protocol/pilotprotocol/internal/logcap"
-	"github.com/pilot-protocol/pilotprotocol/internal/managedsdk/authority"
 	"github.com/pilot-protocol/pilotprotocol/internal/motd"
 	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
@@ -49,8 +46,6 @@ import (
 )
 
 var version = "dev"
-
-var remoteLifecycleRequests = make(chan string, 1)
 
 func main() {
 	configPath := flag.String("config", "", "path to config file (JSON)")
@@ -101,7 +96,6 @@ func main() {
 	noDataExchange := flag.Bool("no-dataexchange", false, "disable built-in data exchange service (port 1001)")
 	dataExchangeB64 := flag.Bool("dataexchange-b64", false, "write inbox message payloads as a raw base64 `data_b64` field in place of the UTF-8 `data` field — needed only for binary payloads (e.g. zlib-compressed envelopes)")
 	noEventStream := flag.Bool("no-eventstream", false, "disable built-in event stream service (port 1002)")
-	enterpriseControlPath := flag.String("enterprise-control", "", "path to signed enterprise control attachment (root pin, trust bundle, policy bundle, and governed transport rules)")
 	noSkillinject := flag.Bool("no-skillinject", false, "disable built-in skill-injection service (agent context injection). Env: PILOT_NO_SKILLINJECT=1.")
 	webhookURL := flag.String("webhook", "", "HTTP(S) endpoint for event notifications (empty = disabled)")
 	webhookSecret := flag.String("webhook-secret", "", "HMAC-SHA256 pre-shared secret for webhook payload signing (empty = no signature). Env: PILOT_WEBHOOK_SECRET.")
@@ -180,11 +174,6 @@ func main() {
 	sources := newFlagSources(flag.CommandLine, fileConfig)
 	if fileConfig != nil {
 		config.ApplyToFlags(fileConfig)
-	}
-	if *enterpriseControlPath == "" {
-		if discovered, ok := discoverManagedEnterpriseControl(); ok {
-			*enterpriseControlPath = discovered
-		}
 	}
 
 	logging.Setup(*logLevel, *logFormat)
@@ -318,9 +307,6 @@ func main() {
 		SkillinjectVerificationKeyFound: os.Getenv("PILOT_SKILLINJECT_MANIFEST_PUBKEY") != "" || os.Getenv("PILOT_SKILLINJECT_PUBKEY") != "",
 		MOTDFeedURL:                     *motdFeedURL,
 		WebhookURL:                      *webhookURL,
-		EnterpriseControlPath:           *enterpriseControlPath,
-		DisableDataExchange:             *noDataExchange,
-		DisableEventStream:              *noEventStream,
 	}
 	if err := applyDaemonSecurityProfile(*securityProfile, &profileOptions); err != nil {
 		log.Fatalf("security profile: %v", err)
@@ -370,21 +356,6 @@ func main() {
 		checkSandbox("config", *configPath)
 		checkSandbox("identity", *identityPath)
 		checkSandbox("socket", *socketPath)
-		checkSandbox("enterprise-control", *enterpriseControlPath)
-	}
-
-	var enterpriseControls *enterprisecontrol.Runtime
-	if *enterpriseControlPath != "" {
-		var err error
-		enterpriseControls, err = enterprisecontrol.Load(*enterpriseControlPath)
-		if err != nil {
-			log.Fatalf("enterprise control: %v", err)
-		}
-	}
-	if strings.EqualFold(strings.TrimSpace(*securityProfile), securityProfileEnterprise) {
-		if err := enterpriseControls.RequireEnabledServiceGates(!*noDataExchange, !*noEventStream); err != nil {
-			log.Fatalf("enterprise control: %v", err)
-		}
 	}
 
 	if registryFromEnv {
@@ -494,20 +465,13 @@ func main() {
 		dataExchangeConfig := dataexchange.ServiceConfig{
 			IncludeBase64: *dataExchangeB64,
 		}
-		if err := enterpriseControls.ApplyDataExchange(&dataExchangeConfig); err != nil {
-			log.Fatalf("configure dataexchange enterprise control: %v", err)
-		}
 		if err := rt.Register(dataexchange.NewService(dataExchangeConfig)); err != nil {
 			log.Fatalf("register dataexchange: %v", err)
 		}
 	}
 
 	if !*noEventStream {
-		eventStreamService := eventstream.NewService()
-		if err := enterpriseControls.ApplyEventStream(eventStreamService); err != nil {
-			log.Fatalf("configure eventstream enterprise control: %v", err)
-		}
-		if err := rt.Register(eventStreamService); err != nil {
+		if err := rt.Register(eventstream.NewService()); err != nil {
 			log.Fatalf("register eventstream: %v", err)
 		}
 	}
@@ -520,9 +484,6 @@ func main() {
 
 	// Manual trust-handshake (port 444) — extracted from pkg/daemon in T3.3.
 	hsSvc := handshake.NewService(runtime.NewHandshakeRuntime(dapi))
-	if actionHook := enterpriseControls.ActionHook(); actionHook != nil {
-		hsSvc.Manager().SetActionHook(actionHook)
-	}
 	if err := rt.Register(hsSvc); err != nil {
 		log.Fatalf("register handshake: %v", err)
 	}
@@ -641,300 +602,18 @@ func main() {
 		fatalAfterPluginStart(rt.StopPlugins, "daemon start: %v", err)
 	}
 
-	rolloutRefreshCtx, rolloutRefreshCancel := context.WithCancel(context.Background())
-	if enterpriseControls.HasRollout() {
-		if err := enterpriseControls.RefreshRollout(rolloutRefreshCtx); err != nil {
-			slog.Warn("enterprise rollout refresh failed; retaining current local policy", "err", err)
-		}
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.RolloutInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-rolloutRefreshCtx.Done():
-					return
-				case <-ticker.C:
-					if err := enterpriseControls.RefreshRollout(rolloutRefreshCtx); err != nil {
-						slog.Warn("enterprise rollout refresh failed; retaining current local policy", "err", err)
-					}
-				}
-			}
-		}()
-	}
-
-	fleetControlCtx, fleetControlCancel := context.WithCancel(context.Background())
-	if enterpriseControls.HasFleetControl() {
-		synchronizeFleetControl(fleetControlCtx, enterpriseControls, d)
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.FleetReportInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-fleetControlCtx.Done():
-					return
-				case <-ticker.C:
-					synchronizeFleetControl(fleetControlCtx, enterpriseControls, d)
-				}
-			}
-		}()
-	}
-	if enterpriseControls.HasFleetStateSync() {
-		synchronizeFleetState(fleetControlCtx, enterpriseControls)
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.FleetStateSyncInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-fleetControlCtx.Done():
-					return
-				case <-ticker.C:
-					synchronizeFleetState(fleetControlCtx, enterpriseControls)
-				}
-			}
-		}()
-	}
-
-	if enterpriseControls.HasAppReconcile() {
-		appInstaller := enterprisecontrol.PilotctlInstaller{BinaryPath: pilotctlBinaryPath()}
-		reconcileApps(fleetControlCtx, enterpriseControls, appInstaller)
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.AppReconcileInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-fleetControlCtx.Done():
-					return
-				case <-ticker.C:
-					reconcileApps(fleetControlCtx, enterpriseControls, appInstaller)
-				}
-			}
-		}()
-	}
-
-	receiptExportCtx, receiptExportCancel := context.WithCancel(context.Background())
-	if enterpriseControls.HasReceiptExport() {
-		if err := enterpriseControls.ExportReceiptsOnce(receiptExportCtx); err != nil {
-			slog.Warn("enterprise receipt export failed; local evidence remains durable", "err", err)
-		}
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.ReceiptExportInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-receiptExportCtx.Done():
-					return
-				case <-ticker.C:
-					if err := enterpriseControls.ExportReceiptsOnce(receiptExportCtx); err != nil {
-						slog.Warn("enterprise receipt export failed; local evidence remains durable", "err", err)
-					}
-				}
-			}
-		}()
-	}
-
-	// SIGHUP advances only the already-pinned signed authority state. It does
-	// not reload daemon flags, root pins, or resource mappings, which remain a
-	// deliberate restart-time administrative change.
+	// SIGHUP is caught and ignored, so a closed terminal does not stop a
+	// foreground daemon.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	cause := awaitShutdown(sig, remoteLifecycleRequests, supervisorExitRequests, func() {
-		if enterpriseControls == nil {
-			slog.Warn("enterprise control reload ignored: no attachment is configured")
-		} else if err := enterpriseControls.Reload(); err != nil {
-			slog.Error("enterprise control reload rejected; keeping current signed state", "err", err)
-		} else {
-			slog.Info("enterprise control reloaded")
-		}
-	})
+	cause := awaitShutdown(sig, supervisorExitRequests)
 	signal.Stop(sig)
-	rolloutRefreshCancel()
-	receiptExportCancel()
-	fleetControlCancel()
 
 	// Daemon.Stop then StopPlugins (see teardown for why the order
 	// matters). A daemon-requested exit leaves here via os.Exit with its
 	// code once the teardown finishes.
 	shutdown(cause, func() { d.Stop() }, rt.StopPlugins, os.Exit)
 	_ = proxyRelay.Close() // the plugins and apps are stopped
-	if cause.restart {
-		executable, err := os.Executable()
-		if err != nil {
-			slog.Error("resolve daemon executable for remote restart", "err", err)
-			return
-		}
-		slog.Info("restarting daemon after graceful shutdown")
-		// #nosec G204,G702 -- restart re-execs the current OS-resolved daemon directly; signed fleet commands cannot supply a path or arguments.
-		// The launch environment, not os.Environ(): that may point the proxy
-		// variables at this daemon's proxy relay, which is gone once it execs.
-		if err := syscall.Exec(executable, os.Args, launchEnvironment); err != nil {
-			slog.Error("remote daemon restart failed", "err", err)
-		}
-	}
-}
-
-func discoverManagedEnterpriseControl() (string, bool) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", false
-	}
-	path := filepath.Join(home, ".pilot", "managed", "enterprise-control.json")
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return "", false
-	}
-	return path, true
-}
-
-// synchronizeFleetControl reports bounded local health and runs only the
-// fixed, authority-signed maintenance commands. It intentionally has no
-// generic process execution, file access, shell, or network-dial capability.
-func synchronizeFleetControl(ctx context.Context, controls *enterprisecontrol.Runtime, daemonInstance *daemon.Daemon) {
-	health := daemonInstance.HealthSnapshot()
-	info := daemonInstance.Info()
-	reconciliation, reconciliationErr := controls.ReconcileFleetControl(ctx, info.Version)
-	if reconciliationErr != nil {
-		slog.Warn("fleet desired-state reconciliation failed", "err", reconciliationErr)
-	} else if reconciliation.Found && reconciliation.Status != "applied" {
-		slog.Warn("fleet desired state requires attention", "revision", reconciliation.Control.Revision, "detail", reconciliation.DetailCode)
-	}
-	if reconciliation.Found {
-		if err := controls.ReportFleetControlAcknowledgement(ctx, reconciliation, info.Version); err != nil {
-			slog.Warn("fleet desired-state acknowledgement failed", "revision", reconciliation.Control.Revision, "err", err)
-		}
-	}
-	status := enterprisecontrol.FleetNodeStatus{
-		NodeID:        info.NodeID,
-		AgentVersion:  info.Version,
-		UptimeSeconds: uint64(health.Uptime.Seconds()),
-		// #nosec G115 -- daemon counters are non-negative in-memory collection sizes and cannot exceed the process address space.
-		Connections: uint32(health.Connections),
-		// #nosec G115 -- daemon counters are non-negative in-memory collection sizes and cannot exceed the process address space.
-		Peers: uint32(health.Peers),
-		// #nosec G115 -- daemon counters are non-negative in-memory collection sizes and cannot exceed the process address space.
-		EncryptedPeers: uint32(health.EncryptedPeers),
-		BytesSent:      health.BytesSent,
-		BytesReceived:  health.BytesRecv,
-		PolicyRevision: controls.CurrentPolicyRevision(ctx),
-	}
-	if err := controls.ReportFleetStatus(ctx, status); err != nil {
-		slog.Warn("fleet status report failed", "err", err)
-	}
-	commands, err := controls.FleetCommands(ctx)
-	if err != nil {
-		slog.Warn("fleet command poll failed", "err", err)
-		return
-	}
-	for _, command := range commands {
-		outcome, detail := "succeeded", ""
-		lifecycle := ""
-		switch command.Kind {
-		case authority.FleetCommandRefreshPolicy:
-			if err := controls.RefreshRollout(ctx); err != nil {
-				outcome, detail = "failed", "rollout_refresh_failed"
-			}
-		case authority.FleetCommandExportReceipts:
-			if !controls.HasReceiptExport() {
-				outcome, detail = "rejected", "receipt_export_unconfigured"
-			} else if err := controls.ExportReceiptsOnce(ctx); err != nil {
-				outcome, detail = "failed", "receipt_export_failed"
-			}
-		case authority.FleetCommandReloadControl:
-			if err := controls.Reload(); err != nil {
-				outcome, detail = "failed", "control_reload_failed"
-			}
-		case authority.FleetCommandSyncState:
-			if !controls.HasFleetStateSync() {
-				outcome, detail = "rejected", "state_sync_unconfigured"
-			} else if _, err := controls.SyncFleetState(ctx); err != nil {
-				outcome, detail = "failed", "state_sync_failed"
-			}
-		case authority.FleetCommandDiagnostics:
-			// The signed health report above is the bounded diagnostic
-			// payload. Include the .pilot mirror when that optional channel
-			// is enabled, without returning logs or environment values.
-			if controls.HasFleetStateSync() {
-				if _, err := controls.SyncFleetState(ctx); err != nil {
-					outcome, detail = "failed", "diagnostics_sync_failed"
-				}
-			}
-		case authority.FleetCommandRestartRuntime:
-			if controls.LifecycleCommandAlreadyApplied(command) {
-				outcome, detail = "rejected", "already_applied"
-			} else {
-				lifecycle = "restart"
-			}
-		case authority.FleetCommandShutdownRuntime:
-			if controls.LifecycleCommandAlreadyApplied(command) {
-				outcome, detail = "rejected", "already_applied"
-			} else {
-				lifecycle = "shutdown"
-			}
-		default:
-			outcome, detail = "rejected", "command_not_allowlisted"
-		}
-		if err := controls.ReportFleetCommandResult(ctx, command.ID, outcome, detail); err != nil {
-			slog.Warn("fleet command result report failed", "command_id", command.ID, "err", err)
-			continue
-		}
-		if outcome == "succeeded" && lifecycle != "" {
-			// Persist the idempotency record BEFORE acting, and fail closed if
-			// it can't be written — otherwise a replayed signed command could
-			// loop across every poll and across the restart it triggers.
-			if err := controls.MarkLifecycleCommandApplied(command); err != nil {
-				slog.Error("persist lifecycle idempotency record failed; refusing to act to avoid a replay loop", "command_id", command.ID, "err", err)
-				continue
-			}
-			select {
-			case remoteLifecycleRequests <- lifecycle:
-			default:
-				slog.Warn("fleet lifecycle request already pending", "command_id", command.ID)
-			}
-		}
-	}
-}
-
-// pilotctlBinaryPath resolves the pilotctl that ships beside this daemon.
-// Preferring the sibling binary over $PATH keeps the verified install path
-// pinned to the same release as the daemon rather than to whatever a user
-// happens to have earlier in their environment.
-func pilotctlBinaryPath() string {
-	if executable, err := os.Executable(); err == nil {
-		sibling := filepath.Join(filepath.Dir(executable), "pilotctl")
-		if info, statErr := os.Stat(sibling); statErr == nil && !info.IsDir() {
-			return sibling
-		}
-	}
-	if resolved, err := exec.LookPath("pilotctl"); err == nil {
-		return resolved
-	}
-	return "pilotctl"
-}
-
-// reconcileApps converges installed apps toward the authority's desired set.
-// A failure here must never disturb policy enforcement or the state mirror, so
-// it is logged and retried on the next tick rather than propagated.
-func reconcileApps(ctx context.Context, controls *enterprisecontrol.Runtime, installer enterprisecontrol.AppInstaller) {
-	result, err := controls.ReconcileApps(ctx, installer)
-	if err != nil {
-		slog.Warn("managed app reconcile failed", "err", err)
-		return
-	}
-	if result.Installed+result.Staged+result.Removed+result.Failed > 0 {
-		slog.Info("managed apps reconciled",
-			"desired", result.Desired, "installed", result.Installed,
-			"awaiting_grants", result.Staged, "removed", result.Removed, "failed", result.Failed)
-	}
-}
-
-func synchronizeFleetState(ctx context.Context, controls *enterprisecontrol.Runtime) {
-	result, err := controls.SyncFleetState(ctx)
-	if err != nil {
-		slog.Warn("fleet .pilot state synchronization failed", "err", err)
-		return
-	}
-	if result.AppliedMutations > 0 || result.RejectedMutations > 0 {
-		slog.Info("fleet .pilot state synchronized", "revision", result.Revision, "entries", result.Entries, "applied_mutations", result.AppliedMutations, "rejected_mutations", result.RejectedMutations)
-	}
 }
 
 func envString(name, fallback string) string {

@@ -42,7 +42,7 @@ Communication commands:
   pilotctl connect <address|hostname> [port] [--message <msg>] [--timeout <dur>]
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
-  pilotctl send-file <address|hostname> <filepath> [--enterprise-control <path> --governed-resource <resource>]
+  pilotctl send-file <address|hostname> <filepath>
   pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
@@ -100,7 +100,6 @@ Updates:
   pilotctl updates [--count <n>] [--scope <scope>]        read the Pilot changelog feed
 
 Operator / admin (run 'pilotctl extras' or 'pilotctl context' for the full list):
-  pilotctl enterprise status|dashboard-url|policy|mandate|receipt --endpoint <URL> --tenant <tenant>  inspect or submit signed enterprise control state
   pilotctl extras <cmd>              network / managed / policy / member-tags / enterprise / low-level plumbing
   pilotctl extras gateway start|stop|map|unmap|list       IP gateway (requires root — creates loopback interface aliases)
 

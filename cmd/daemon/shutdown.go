@@ -32,27 +32,21 @@ func forwardExitRequest(req daemon.ExitRequest) {
 
 // shutdownCause records what ended the shutdown loop.
 type shutdownCause struct {
-	// restart: a signed fleet lifecycle command asked for a re-exec.
-	restart bool
 	// exit: the daemon asked to exit for supervisor respawn. nil for
-	// signals and fleet lifecycle requests.
+	// signals.
 	exit *daemon.ExitRequest
 }
 
 // awaitShutdown blocks until something asks the daemon to stop: SIGINT/
-// SIGTERM, a fleet lifecycle request, or a daemon exit request. SIGHUP
-// runs onReload and keeps waiting.
-func awaitShutdown(sig <-chan os.Signal, lifecycle <-chan string, exits <-chan daemon.ExitRequest, onReload func()) shutdownCause {
+// SIGTERM or a daemon exit request. SIGHUP is ignored.
+func awaitShutdown(sig <-chan os.Signal, exits <-chan daemon.ExitRequest) shutdownCause {
 	for {
 		select {
 		case received := <-sig:
 			if received == syscall.SIGHUP {
-				onReload()
 				continue
 			}
 			return shutdownCause{}
-		case l := <-lifecycle:
-			return shutdownCause{restart: l == "restart"}
 		case req := <-exits:
 			return shutdownCause{exit: &req}
 		}

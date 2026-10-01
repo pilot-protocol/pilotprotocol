@@ -140,7 +140,7 @@ func describeProxy(spec, transport string, r *netproxy.Resolver) string {
 // installDefaultTransportProxy makes net/http's shared DefaultTransport
 // follow the proxy resolver. Every HTTP client the daemon wires in without
 // a transport of its own — catalogue pins, skillinject, trustedagents,
-// webhook, enterprise-control clients — uses DefaultTransport (or a clone
+// webhook — uses DefaultTransport (or a clone
 // of it), and not all of them accept an injected client. Each new
 // connection takes the resolver's current settings, so rotated
 // credentials (-proxy-cmd) reach these clients too. With the proxy relay

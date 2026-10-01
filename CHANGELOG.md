@@ -205,6 +205,28 @@ Detailed per-release notes are on the
   systemd the installer runs as root without `PILOT_ALLOW_ROOT` (hosted
   sandboxes run the agent as root); regular hosts still refuse root.
 
+### Removed
+- **Hosted control plane client.** The hosted control plane has been retired,
+  and everything in this repository that existed only to talk to it is gone:
+  - `pilotctl enterprise` (`adopt`, `status`, `dashboard-url`, `trust`,
+    `policy`, `mandate`, `receipt`, `workflow`, `hook`).
+  - The `--enterprise-control` and `--governed-resource` flags of
+    `pilotctl send-message` and `pilotctl send-file`. Both commands now
+    refuse those flags instead of sending ungoverned.
+  - The daemon's `-enterprise-control` flag, the `enterprise_control` config
+    key, automatic discovery of `~/.pilot/managed/enterprise-control.json`,
+    signed fleet reporting, fleet commands (including remote restart and
+    shutdown), policy rollout refresh, `.pilot` state sync, managed app
+    reconcile and receipt export. A leftover attachment file or config key is
+    ignored.
+  - The `control-agent` binary.
+  - `install.sh --managed-url` / `PILOT_MANAGEMENT_URL` / `--no-start`, and
+    the `managed-runtime-v*` release tag stream.
+- `-security-profile enterprise` no longer requires `-enterprise-control`
+  while data exchange or event stream is enabled; its other locked settings
+  are unchanged.
+- SIGHUP no longer reloads control state. It is still caught and ignored.
+
 ### Changed
 - **Dependencies: skillinject v0.2.4, dataexchange v0.2.3, updater v0.2.5**
   (plus common v0.5.14, and the sigstore-go v1.3.0 / go-openapi versions

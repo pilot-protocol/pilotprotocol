@@ -26,7 +26,6 @@ var configValueKinds = map[string]string{
 	"email":                  "String",
 	"encrypt":                "Bool",
 	"endpoint":               "String",
-	"enterprise_control":     "String",
 	"hostname":               "String",
 	"identity":               "String",
 	"idle_timeout":           "Duration",
@@ -122,7 +121,7 @@ func validateConfigValue(key, raw string) (interface{}, error) {
 			strings.ContainsAny(host, " /\\?#@\t\r\n") {
 			return nil, fmt.Errorf("%s must be a host:port address", key)
 		}
-	case "socket", "identity", "enterprise_control", "sandbox_dir":
+	case "socket", "identity", "sandbox_dir":
 		if strings.ContainsRune(raw, 0) {
 			return nil, fmt.Errorf("%s contains a NUL byte", key)
 		}
