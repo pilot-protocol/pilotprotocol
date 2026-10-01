@@ -78,9 +78,10 @@ fi
 
 # Always exclude: the runner itself, the in-container p2p driver, the
 # python SDK test, and test_cli.sh. test_cli.sh is the in-container driver
-# for the Dockerfile image: run on the host it starts with
-# `pkill -9 -f pilot-daemon` and then launches a daemon against the public
-# network, which kills the developer's own daemon.
+# for the Dockerfile image: run on the host it launches a daemon on
+# /tmp/pilot.sock against the public network, and its cleanup runs
+# `pkill -9 -f pilot-daemon` and deletes /tmp/pilot.sock, which takes the
+# developer's own daemon down with it.
 TESTS=$(printf '%s\n' "$TESTS" | grep -v '^run-all\.sh$' | grep -v '^test_p2p\.sh$' | grep -v '^test_sdk\.py$' | grep -v '^test_cli\.sh$')
 
 if [ -z "$TESTS" ]; then
