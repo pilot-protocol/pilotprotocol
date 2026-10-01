@@ -568,7 +568,18 @@ type Daemon struct {
 	AcceptQueueDrops uint64
 }
 
-const perSourceSYNLimit = 10     // max SYNs per source per second
+const perSourceSYNLimit = 10 // sustained SYNs per source per second (bucket refill rate)
+
+// perSourceSYNBurst is the per-source bucket capacity: how many SYNs one
+// source may send at once before it is held to perSourceSYNLimit. A node
+// running parallel sends to one peer opens that many connections in the
+// same instant; with a capacity equal to the rate (10) the excess SYNs were
+// dropped, the dialers retransmitted in lock-step and each wave found at
+// most 10 tokens, so a burst of 64 took 9 s and larger ones timed out.
+// Kept below DefaultSYNRateLimit so one source's burst cannot use the
+// whole shared bucket.
+const perSourceSYNBurst = 64
+
 const maxPerSrcSYNEntries = 4096 // max tracked source entries (M9 fix)
 
 type srcSYNBucket struct {
@@ -687,7 +698,8 @@ func (d *Daemon) allowSYN() bool {
 	return false
 }
 
-// allowSYNFromSource checks per-source SYN rate limit (10 SYNs/source/second).
+// allowSYNFromSource checks the per-source SYN rate limit: a token bucket of
+// perSourceSYNBurst tokens refilled at perSourceSYNLimit tokens/second.
 func (d *Daemon) allowSYNFromSource(srcNode uint32) bool {
 	d.perSrcSYNMu.Lock()
 	defer d.perSrcSYNMu.Unlock()
@@ -699,7 +711,7 @@ func (d *Daemon) allowSYNFromSource(srcNode uint32) bool {
 		if len(d.perSrcSYN) >= maxPerSrcSYNEntries {
 			return false // reject when map is full
 		}
-		d.perSrcSYN[srcNode] = &srcSYNBucket{tokens: perSourceSYNLimit - 1, lastFill: now}
+		d.perSrcSYN[srcNode] = &srcSYNBucket{tokens: perSourceSYNBurst - 1, lastFill: now}
 		return true
 	}
 
@@ -708,8 +720,8 @@ func (d *Daemon) allowSYNFromSource(srcNode uint32) bool {
 		refill := int(elapsed.Seconds() * float64(perSourceSYNLimit))
 		if refill > 0 {
 			b.tokens += refill
-			if b.tokens > perSourceSYNLimit {
-				b.tokens = perSourceSYNLimit
+			if b.tokens > perSourceSYNBurst {
+				b.tokens = perSourceSYNBurst
 			}
 			b.lastFill = now
 		}
@@ -3321,17 +3333,19 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			}
 		}
 
-		// SYN rate limiting
+		// SYN rate limiting. The per-source bucket is checked first so a
+		// source over its own limit cannot spend the shared tokens every
+		// other peer depends on.
+		if !synWhitelisted && !d.allowSYNFromSource(pkt.Src.Node) {
+			slog.Warn("per-source SYN rate limit exceeded", "src_node", pkt.Src.Node, "src_port", pkt.SrcPort)
+			return
+		}
 		if !synWhitelisted && !d.allowSYN() {
 			slog.Warn("SYN rate limit exceeded", "src_addr", pkt.Src, "src_port", pkt.SrcPort)
 			d.publishEvent("security.syn_rate_limited", map[string]interface{}{
 				"src_addr_hash": redactID(pkt.Src.String()), "src_port": pkt.SrcPort,
 			})
 			return // silently drop — don't even RST (avoid amplification)
-		}
-		if !synWhitelisted && !d.allowSYNFromSource(pkt.Src.Node) {
-			slog.Warn("per-source SYN rate limit exceeded", "src_node", pkt.Src.Node, "src_port", pkt.SrcPort)
-			return
 		}
 
 		// Check per-port connection limit
