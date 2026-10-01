@@ -448,8 +448,8 @@ func TestAllowSYNFromSourceFirstCallSeedsBucket(t *testing.T) {
 	if !ok || b == nil {
 		t.Fatalf("bucket should be created for source 42")
 	}
-	if b.tokens != perSourceSYNLimit-1 {
-		t.Fatalf("new bucket tokens = %d, want %d", b.tokens, perSourceSYNLimit-1)
+	if b.tokens != perSourceSYNBurst-1 {
+		t.Fatalf("new bucket tokens = %d, want %d", b.tokens, perSourceSYNBurst-1)
 	}
 }
 
@@ -458,13 +458,13 @@ func TestAllowSYNFromSourceDeniesAfterLimit(t *testing.T) {
 	d := New(Config{})
 	src := uint32(99)
 	granted := 0
-	for i := 0; i < perSourceSYNLimit+5; i++ {
+	for i := 0; i < perSourceSYNBurst+5; i++ {
 		if d.allowSYNFromSource(src) {
 			granted++
 		}
 	}
-	if granted != perSourceSYNLimit {
-		t.Fatalf("granted = %d, want %d", granted, perSourceSYNLimit)
+	if granted != perSourceSYNBurst {
+		t.Fatalf("granted = %d, want %d", granted, perSourceSYNBurst)
 	}
 }
 

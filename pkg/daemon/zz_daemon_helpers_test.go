@@ -188,15 +188,15 @@ func TestAllowSYNRefillsAfterTime(t *testing.T) {
 func TestAllowSYNFromSourceFirstAcceptedThenLimited(t *testing.T) {
 	t.Parallel()
 	d := New(Config{})
-	// First N up to perSourceSYNLimit must accept (initial = limit-1, plus the one consumed by initial creation = limit total)
+	// First N up to perSourceSYNBurst must accept (initial = limit-1, plus the one consumed by initial creation = limit total)
 	accepts := 0
-	for i := 0; i < perSourceSYNLimit; i++ {
+	for i := 0; i < perSourceSYNBurst; i++ {
 		if d.allowSYNFromSource(42) {
 			accepts++
 		}
 	}
-	if accepts != perSourceSYNLimit {
-		t.Errorf("got %d accepts in first %d calls, want %d", accepts, perSourceSYNLimit, perSourceSYNLimit)
+	if accepts != perSourceSYNBurst {
+		t.Errorf("got %d accepts in first %d calls, want %d", accepts, perSourceSYNBurst, perSourceSYNBurst)
 	}
 	// Next must deny
 	if d.allowSYNFromSource(42) {
