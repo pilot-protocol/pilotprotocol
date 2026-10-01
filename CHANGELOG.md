@@ -271,6 +271,18 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **`-advertise-endpoint` survives a re-registration.** When the daemon
+  re-registered (registry reconnect, transport watchdog recovery) it sent
+  the tunnel socket's local address instead of the advertised endpoint, so
+  the registry replaced the operator's address with `<observed-ip>:<local
+  port>`. The override is now applied on re-registration as it is at start.
+- **A node on a private network no longer reports a loopback endpoint.** With
+  the beacon and registry on the node's own private network (a container on
+  a Docker bridge, a lab LAN) the daemon logged `daemon registered ...
+  endpoint=[::1]:<port>` and `pilotctl info` showed the same, although the
+  registry had recorded — and peers resolved — the node's private address
+  with the real tunnel port. The daemon now reports that address. Nothing
+  sent to the registry changes.
 - **Datagrams no longer use up the daemon's ports.** Every datagram sent
   (`pilotctl dgram`, `SendTo`, broadcasts) took an ephemeral source port and
   never gave it back, because only closing a connection released one. After

@@ -1122,6 +1122,17 @@ func (d *Daemon) Start() error {
 				registrationAddr = net.JoinHostPort(obsHost, stunPort)
 				slog.Info("using registry-observed IP", "observed", obsHost)
 			}
+		} else if obsIP != nil && obsIP.IsPrivate() {
+			// Beacon and registry are both on our private network (container
+			// bridge, lab LAN): the private STUN result was discarded above
+			// and we sent the loopback form of the tunnel socket, whose host
+			// the registry replaced with the one it observed. Report what
+			// peers actually resolve instead of loopback.
+			regHost, regPort, _ := net.SplitHostPort(registrationAddr)
+			if regIP := net.ParseIP(regHost); regIP != nil && regIP.IsLoopback() {
+				registrationAddr = net.JoinHostPort(obsHost, regPort)
+				slog.Info("using registry-observed private IP", "observed", obsHost)
+			}
 		}
 	}
 
@@ -5566,6 +5577,11 @@ func (d *Daemon) reRegister() {
 		if d.tunnels.LocalAddr() != nil {
 			registrationAddr = resolveLocalAddr(d.tunnels.LocalAddr().String())
 		}
+	}
+	// Same override as Start (step 1b): an operator-set advertised
+	// endpoint must survive a re-registration.
+	if d.config.AdvertiseEndpoint != "" {
+		registrationAddr = d.config.AdvertiseEndpoint
 	}
 
 	// Always re-register with client-generated key.
