@@ -293,6 +293,16 @@ Detailed per-release notes are on the
 - **`pilotctl received --clear` removes interrupted transfers too.** Their
   bytes stay in `received/.partial` for a resume and count against the disk,
   but were never listed or cleared. The reply gains a `cleared_partial` count.
+- **Parallel sends to one peer no longer stall or time out on the peer's
+  SYN limiter.** The per-source limit admitted 10 connections at once and
+  silently dropped the rest; the dialers retransmitted together, so a burst
+  of 64 connections from one node took 9 s and larger bursts ended in dial
+  timeouts (and flipped a healthy direct peer to relay). A source may now
+  open 64 connections at once; the sustained rate is still 10 per second.
+  The per-source limit is also checked before the shared one, so a source
+  over its own limit no longer uses up the tokens other peers need
+  (previously every SYN it had rejected still took a shared token).
+  `-syn-whitelist` is unchanged.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's
