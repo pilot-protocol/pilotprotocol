@@ -1238,7 +1238,7 @@ func cmdAppStoreInstall(args []string) {
 		// The bundle was unpacked into a temporary directory for this
 		// install alone. It was never removed, so every install — failed or
 		// not — left a copy of the app behind in $TMPDIR.
-		removeUnpacked := func() { _ = os.RemoveAll(bundleDir) }
+		removeUnpacked := func() { _ = os.RemoveAll(bundleDir) } // #nosec G703 -- for a catalogue install bundleDir is the os.MkdirTemp directory fetchAndUnpackBundle created; never a caller-supplied path
 		defer removeUnpacked()
 		fatalCleanups = append(fatalCleanups, removeUnpacked)
 	}
@@ -2687,7 +2687,7 @@ func cmdAppStoreCall(args []string) {
 				}
 			}
 		}
-		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil {
+		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil { // #nosec G703 -- only a stat of a fixed name under the app dir the operator named; nothing is read or written
 			fatalHint("io_error",
 				"the app crashed repeatedly and was suspended: `pilotctl appstore audit "+appID+"` shows the exits, the app's own error output is in the daemon's log; `pilotctl appstore restart "+appID+"` retries it",
 				"app %s is suspended", appID)
@@ -2814,14 +2814,14 @@ const appSocketWait = 15 * time.Second
 func waitForAppSocket(appDir, sockPath string, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	for {
-		_, err := os.Stat(sockPath)
+		_, err := os.Stat(sockPath) // #nosec G703 -- only a stat of app.sock under the app dir the operator named; nothing is read or written
 		if err == nil {
 			return nil
 		}
-		if _, merr := os.Stat(filepath.Join(appDir, "manifest.json")); merr != nil {
+		if _, merr := os.Stat(filepath.Join(appDir, "manifest.json")); merr != nil { // #nosec G703 -- only a stat of a fixed name under the app dir; nothing is read or written
 			return err // not installed
 		}
-		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil {
+		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil { // #nosec G703 -- only a stat of a fixed name under the app dir; nothing is read or written
 			return err
 		}
 		if time.Now().After(deadline) {
