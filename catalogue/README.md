@@ -80,12 +80,33 @@ and `publisher` (so existing installs keep their pin and keep running), set
 `"renamed_to": "<new id>"`, set `"hidden": true`, drop `bundle_url` / `bundles` /
 `metadata_url` (the tombstone is not installable), and delete the old
 `apps/<old-id>/` detail dir. The full new entry lives under the new id, and the
-catalogue is re-signed. A bundles-aware `pilotctl` then omits the old id from the
-listing and, on `install`/`view`/`call`, prints a deprecation warning and routes
-to `renamed_to`. `hidden` alone (without `renamed_to`) just omits an entry from
-the listing while keeping it resolvable. Older clients ignore both fields. One
-hop only — a `renamed_to` that points at another tombstone is a bug and is not
-chased.
+catalogue is re-signed. A `pilotctl` that knows the fields (this repo's, from
+the release after v1.13.10) then:
+
+- omits the old id from `catalogue` (text and `--json`);
+- on `install <old>`, warns and installs `renamed_to` instead. With
+  `--version` (a pin, as the managed-fleet reconcile passes) it refuses, naming
+  the new id: a pin names a release of one app, and the old id has none;
+- reports an installed old id in `outdated` as `renamed` (AVAILABLE is the new
+  id). `upgrade --all` skips it, since the hourly updater runs it and the new id
+  has its own publisher key and method names; `upgrade <old>` exits 1 with the
+  install-then-uninstall steps;
+- on `view <old>` warns, and on `call` of an old id that is not installed says
+  it was renamed.
+
+Moving a node over is `pilotctl appstore install <new>` then `pilotctl appstore
+uninstall <old> --yes`; uninstall also stops anything still running from the
+old app's files (see "What install and upgrade do with app state" below).
+Older clients ignore both fields: they list the tombstone and fail its install
+with "placeholder sha256". `hidden` alone (without `renamed_to`) just omits an
+entry from the listing while keeping it resolvable. One hop only — a
+`renamed_to` that points at another tombstone is a bug and is not chased.
+`catalogue/lint` checks every tombstone's shape on every PR.
+
+Keep the tombstone while any install of the old id may exist, and keep any
+native-tool assets the new id's `install.json` still downloads from the old
+id's R2 prefix (io.pilot.smol 1.2.0 stages smolvm from
+`io.pilot.smolmachines/1.2.0/`).
 
 ## Detail schema (`apps/<id>/metadata.json`)
 
@@ -310,6 +331,16 @@ git show origin/main:catalogue/catalogue.json > /tmp/base.json
   app empty. It warns loudly and still keeps the backup.
 - `upgrade --all` goes on to the next app when one fails, and exits 1 at the
   end naming the apps that were not upgraded.
+- `uninstall` first stops every process whose executable lives in the app's
+  dir or in one of its backups (SIGTERM, then SIGKILL after 5 s), then deletes
+  the dir, then stops anything the supervisor respawned in between. That is
+  the app itself, an instance orphaned by a daemon that died hard, and what the
+  app started that detached from it: a smolvm microVM, a daemonized
+  redis/postgres/mysql server. Nothing could manage those once the dir is
+  gone. The output (and `--json` `stopped_processes`) names them.
+- `install` refuses a bundle whose `install.json` lists native tools but none
+  for this host's os/arch: the adapter would exit at every start and the
+  supervisor would suspend it.
 
 ## Catalogue signing key
 

@@ -5,7 +5,12 @@ package main
 import (
 	"debug/macho"
 	"debug/pe"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -91,4 +96,51 @@ func peMachineArch(machine uint16) string {
 	default:
 		return fmt.Sprintf("machine %#x", machine)
 	}
+}
+
+// checkBundleAssetsPlatform refuses a bundle whose install.json lists native
+// tools but none for goos/goarch. A "cli" app's adapter is portable Go, so the
+// binary check above passes, but at its first start the adapter stages the
+// fronted tool from install.json and exits 1 when this host is not listed
+// ("install assets: stage: no asset for darwin/amd64; available: ..."). The
+// supervisor restarts it until the crash-loop limit suspends it, so the
+// install "succeeds" and the app never runs. io.pilot.smolmachines 1.2.0 was
+// published for darwin/amd64 like that (upstream smolvm has no macOS x86_64
+// build). An install.json that does not parse, or lists no assets, is left to
+// the app, as before.
+func checkBundleAssetsPlatform(bundleDir, goos, goarch string) error {
+	raw, err := os.ReadFile(filepath.Join(bundleDir, "install.json")) // #nosec G304 G703 -- install.json of the bundle being installed (the dir pilotctl unpacked, or the --local dir the operator named); only read and parsed
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read install.json: %w", err)
+	}
+	var spec struct {
+		Command string `json:"command"`
+		Assets  []struct {
+			OS   string `json:"os"`
+			Arch string `json:"arch"`
+		} `json:"assets"`
+	}
+	if json.Unmarshal(raw, &spec) != nil || len(spec.Assets) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var avail []string
+	for _, a := range spec.Assets {
+		if a.OS == goos && a.Arch == goarch {
+			return nil
+		}
+		if p := a.OS + "/" + a.Arch; !seen[p] {
+			seen[p] = true
+			avail = append(avail, p)
+		}
+	}
+	sort.Strings(avail)
+	tool := spec.Command
+	if tool == "" {
+		tool = "its native tool"
+	}
+	return fmt.Errorf("the bundle ships %s only for %s, not for %s/%s", tool, strings.Join(avail, ", "), goos, goarch)
 }
