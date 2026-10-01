@@ -2064,6 +2064,12 @@ func (tm *TunnelManager) clearRelayOnDirectLocked(peerNodeID uint32, from *net.U
 	return tm.routing.ClearRelayOnDirect(peerNodeID, from)
 }
 
+// UnpinRelayPeer clears a peer's relay pin and keeps it on the relay.
+// Thin shim over routing.Manager.UnpinRelayPeer.
+func (tm *TunnelManager) UnpinRelayPeer(nodeID uint32) {
+	tm.routing.UnpinRelayPeer(nodeID)
+}
+
 // SetRelayPeerPinned is like SetRelayPeer but also marks the relay flag
 // as authoritative — ClearRelayOnDirect will never auto-flip a pinned
 // peer back to direct based on observed packet sources. Thin shim over
