@@ -251,6 +251,13 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **A node on a private network no longer reports a loopback endpoint.** With
+  the beacon and registry on the node's own private network (a container on
+  a Docker bridge, a lab LAN) the daemon logged `daemon registered ...
+  endpoint=[::1]:<port>` and `pilotctl info` showed the same, although the
+  registry had recorded — and peers resolved — the node's private address
+  with the real tunnel port. The daemon now reports that address. Nothing
+  sent to the registry changes.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's
