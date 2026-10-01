@@ -40,7 +40,7 @@ jobs:
         # ./tests/ integration suite (daemons + network round-trips)
         # was structurally too heavy for the 15m public-runner budget
         # (sustained 15m timeouts even with per-test deadline bumps in
-        # PR #120). Integration is now exclusively in nightly.yml.
+        # PR #120). The integration suite runs locally: `go test ./tests/`.
         # -short skips 3 known-slow stress tests in pkg/daemon and
         # pkg/daemon/udpio; everything else runs.
         #

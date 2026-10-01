@@ -10,11 +10,21 @@ import (
 // SendKeyExchangeToNode sends an authenticated key exchange if identity
 // is available, otherwise falls back to unauthenticated.
 //
+// When we hold no session key for the peer and either an earlier send is
+// still unanswered (KeyRequestAfterSends) or MarkKeyRequestDue flagged
+// the peer, the authenticated frame is followed by an unauthenticated
+// one (PILK) acting as a key request: a peer that already knows our
+// identity rejects it and answers with its own PILA, retransmitted until
+// ours arrives. This breaks the first-contact deadlock where the peer's
+// single reply was lost and it treats our same-key retransmits as
+// keepalives. keyRequest reports whether that PILK was sent, so the
+// tunnel can give it the same relay copy as the PILA.
+//
 // This function carries the single annotated bootstrap-exception site
 // (see the marker comment inside the body). After Stage 2 sub-pass 2,
 // the canonical home for the marker is here in keyexchange/bootstrap.go;
 // layers.yaml's bootstrap_exception.allowed_call_sites tracks this path.
-func (m *Manager) SendKeyExchangeToNode(peerNodeID uint32) {
+func (m *Manager) SendKeyExchangeToNode(peerNodeID uint32) (keyRequest bool) {
 	// BOOTSTRAP-EXCEPTION: bypasses L6 envelope
 	// The peer key is not yet established, so the L6 AEAD wrap is
 	// impossible here. This is the single annotated bootstrap site
@@ -23,7 +33,7 @@ func (m *Manager) SendKeyExchangeToNode(peerNodeID uint32) {
 	// marker elsewhere — the checker fails if more than one site
 	// carries it. See docs/architecture/05-VERIFICATION.md §3 P8.
 	if m.sender == nil {
-		return
+		return false
 	}
 
 	var addr *net.UDPAddr
@@ -32,25 +42,40 @@ func (m *Manager) SendKeyExchangeToNode(peerNodeID uint32) {
 	}
 
 	hasIdentity := m.HasIdentity()
-	frame := m.BuildUnauthFrame()
-	if frame == nil {
-		return
+	unauthFrame := m.BuildUnauthFrame()
+	if unauthFrame == nil {
+		return false
 	}
-
+	frame := unauthFrame
+	authed := false
 	if hasIdentity {
-		authFrame := m.BuildAuthFrame()
-		if authFrame != nil {
+		if authFrame := m.BuildAuthFrame(); authFrame != nil {
 			frame = authFrame
+			authed = true
 		}
 	}
+	// Decide before MarkPendingRekey bumps the attempt count: the key
+	// request rides on retransmits, never on the first send.
+	keyRequest = authed && !m.env.Has(peerNodeID) && m.takeKeyRequest(peerNodeID)
 
 	if err := m.sender(peerNodeID, addr, frame); err != nil {
 		slog.Error("send key exchange failed", "peer_node_id", peerNodeID, "error", err)
-		return
+		return false
+	}
+	if keyRequest {
+		if err := m.sender(peerNodeID, addr, unauthFrame); err != nil {
+			slog.Debug("key request send failed", "peer_node_id", peerNodeID, "error", err)
+			keyRequest = false
+		} else {
+			m.keyRequestsSent.Add(1)
+			slog.Debug("key request sent (no session key, key exchange unanswered)",
+				"peer_node_id", peerNodeID)
+		}
 	}
 
 	// P1-010 tunnel-state half: register that we're waiting on a reply,
 	// so rekeyRetransmitLoop can retransmit if the peer's response (or
 	// our request) was dropped under loss.
 	m.MarkPendingRekey(peerNodeID)
+	return keyRequest
 }

@@ -53,4 +53,4 @@ jobs:
         run: go test -race -count=1 -timeout 10m -run TestConcurrentDialEncryptDecrypt ./tests/...
 
       - name: P4/P9 - goroutine reaping
-        run: go test ./tests -run "TestDaemonShutdown|TestStreamLifecycleGoroutines|TestPluginShutdown"
+        run: go test ./tests -run "TestDaemonShutdown|TestStreamLifecycleGoroutines|TestPluginShutdown|TestPeerChurnDoesNotLeakGoroutines"

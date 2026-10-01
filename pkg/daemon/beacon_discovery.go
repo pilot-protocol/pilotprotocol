@@ -212,7 +212,9 @@ func (d *Daemon) beaconRefreshTick(firstTick bool) {
 	// per refresh tick is bounded by one probe round-trip (~200ms typical,
 	// 2s max). The override is logged at Debug so ablation tests can grep
 	// for "beacon RTT probe".
-	if d.config.BeaconRTTProbe && len(decision.NewList) > 1 {
+	// Compat mode has no UDP path (the probes would only time out or trip
+	// an egress guard), so Start logs once and the probe never runs.
+	if d.config.BeaconRTTProbe && d.config.TransportMode != "compat" && len(decision.NewList) > 1 {
 		rttMap := d.probeBeaconsParallel(decision.NewList, 2*time.Second)
 		if len(rttMap) > 0 {
 			rttPick := routing.PickBeaconWithRTT(decision.NewList, identityPubKey, rttMap)

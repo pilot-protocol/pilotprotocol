@@ -120,7 +120,9 @@ func TestCmdSendMessageJSONWaitSingleDoc(t *testing.T) {
 	sd := newStreamDaemon(t)
 	home := sd.useDaemonNoRegistry(t)
 
-	// Seed an inbox reply whose "from" matches the resolved target address.
+	// The reply lands in the inbox after the request is sent, as a real
+	// one does: --wait ignores files that were already there before the
+	// send (an earlier request's reply, or a service's late duplicate).
 	inbox := filepath.Join(home, ".pilot", "inbox")
 	if err := os.MkdirAll(inbox, 0o700); err != nil {
 		t.Fatalf("mkdir inbox: %v", err)
@@ -131,14 +133,13 @@ func TestCmdSendMessageJSONWaitSingleDoc(t *testing.T) {
 	}
 	body, _ := json.Marshal(reply)
 	replyPath := filepath.Join(inbox, "TEXT-reply.json")
-	if err := os.WriteFile(replyPath, body, 0o600); err != nil {
-		t.Fatalf("write reply: %v", err)
-	}
-	// Ensure mtime is after the cutoff send-message computes (now-1s).
-	future := time.Now().Add(2 * time.Second)
-	if err := os.Chtimes(replyPath, future, future); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for sd.sendCount.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(replyPath, body, 0o600)
+	}()
 
 	out := captureStdout(t, func() {
 		withJSON(func() {
