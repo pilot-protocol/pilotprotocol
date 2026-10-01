@@ -2689,7 +2689,7 @@ func cmdAppStoreCall(args []string) {
 		}
 		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil {
 			fatalHint("io_error",
-				"the app crashed repeatedly and was suspended: `pilotctl appstore audit "+appID+"` shows why, `pilotctl appstore restart "+appID+"` retries it",
+				"the app crashed repeatedly and was suspended: `pilotctl appstore audit "+appID+"` shows the exits, the app's own error output is in the daemon's log; `pilotctl appstore restart "+appID+"` retries it",
 				"app %s is suspended", appID)
 		}
 		fatalHint("io_error",
