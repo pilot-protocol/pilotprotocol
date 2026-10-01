@@ -192,7 +192,6 @@ func printUpdateState(st updater.Status, restart daemonRestart) {
 	case restart.recorded == "":
 	case restart.resolved():
 		fmt.Printf("Daemon restart:    not needed — the daemon runs the installed %s\n", restart.daemonVersion)
-		fmt.Printf("%s(the recorded restart error is out of date: %s)\n", indent, restart.recorded)
 	case restart.daemonDown():
 		fmt.Printf("Daemon restart:    daemon not running — %s runs when it starts\n", orDash(restart.installed))
 		fmt.Printf("%slast restart attempt: %s\n", indent, restart.recorded)
@@ -616,6 +615,14 @@ func cmdUpdate(args []string) {
 	}
 	restart := checkDaemonRestart(st, wait)
 
+	// A pinned older release may predate settings config.json holds.
+	note := ""
+	if bin := filepath.Join(installDir, "pilot-daemon"); pin != "" {
+		if _, err := os.Stat(bin); err == nil {
+			note = fitTransportToDaemon(bin)
+		}
+	}
+
 	if jsonOutput {
 		out := map[string]interface{}{
 			"install_dir":     installDir,
@@ -631,11 +638,17 @@ func cmdUpdate(args []string) {
 			"daemon_version":  restart.daemonVersion,
 			"status_file":     statusPath,
 		}
+		if note != "" {
+			out["note"] = note
+		}
 		outputOK(out)
 		return
 	}
 	fmt.Printf("Update check complete. Install dir: %s\n", installDir)
 	printUpdateResult(st, restart)
+	if note != "" {
+		fmt.Printf("Note: %s\n", note)
+	}
 
 	// In manual mode (no daemon running), re-run skill install so skills
 	// match the (possibly updated) binaries.

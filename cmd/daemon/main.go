@@ -11,7 +11,6 @@ import (
 	"log"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -22,10 +21,10 @@ import (
 	"github.com/pilot-protocol/common/config"
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/logging"
-	"github.com/pilot-protocol/pilotprotocol/internal/enterprisecontrol"
+	"github.com/pilot-protocol/common/netproxy"
 	"github.com/pilot-protocol/pilotprotocol/internal/logcap"
-	"github.com/pilot-protocol/pilotprotocol/internal/managedsdk/authority"
 	"github.com/pilot-protocol/pilotprotocol/internal/motd"
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
 
 	// L11 plugin imports — cmd/daemon (L12) is the only place these
@@ -48,18 +47,16 @@ import (
 
 var version = "dev"
 
-var remoteLifecycleRequests = make(chan string, 1)
-
 func main() {
 	configPath := flag.String("config", "", "path to config file (JSON)")
 	securityProfile := flag.String("security-profile", envString("PILOT_SECURITY_PROFILE", securityProfileCompatible), "locked security profile: compatible or enterprise")
-	registryDefault := "34.71.57.205:9000"
+	registryDefault := defaultRegistryAddr
 	registryFromEnv := false
 	if v := os.Getenv("PILOT_REGISTRY"); v != "" {
 		registryDefault = v
 		registryFromEnv = true
 	}
-	beaconDefault := "34.71.57.205:9001"
+	beaconDefault := defaultBeaconAddr
 	beaconFromEnv := false
 	if v := os.Getenv("PILOT_BEACON"); v != "" {
 		beaconDefault = v
@@ -73,8 +70,8 @@ func main() {
 	advertiseEndpoint := flag.String("advertise-endpoint", "", "override STUN-discovered endpoint for registry advertisement (host:port) — for k8s pods where STUN returns unreachable IPs. When set, STUN still runs but the advertised address uses this value")
 	encrypt := flag.Bool("encrypt", true, "enable tunnel-layer encryption (X25519 + AES-256-GCM)")
 	registryTLS := flag.Bool("registry-tls", false, "use TLS for registry connection")
-	registryFingerprint := flag.String("registry-fingerprint", "", "hex SHA-256 fingerprint of registry TLS certificate (required when -registry-trust=pinned)")
-	registryTrust := flag.String("registry-trust", "pinned", "trust store for -registry-tls: 'pinned' (verify cert against -registry-fingerprint) or 'system' (OS x509 root store — used for compat-mode registry on registry.pilotprotocol.network:443 with Let's Encrypt)")
+	registryFingerprint := flag.String("registry-fingerprint", "", "hex SHA-256 fingerprint of registry TLS certificate (required when -registry-trust=pinned). With compat mode and no -registry-trust, a fingerprint selects pinned trust — the fallback for hosts without a CA bundle. Precedence: this flag, $PILOT_REGISTRY_FINGERPRINT, config.json \"registry_fingerprint\".")
+	registryTrust := flag.String("registry-trust", "pinned", "trust store for -registry-tls: 'pinned' (verify cert against -registry-fingerprint) or 'system' (OS x509 root store; set SSL_CERT_FILE/SSL_CERT_DIR where the host has no CA bundle — used for compat-mode registry on registry.pilotprotocol.network:443 with Let's Encrypt). Precedence: this flag, $PILOT_REGISTRY_TRUST, config.json \"registry_trust\".")
 	identityPath := flag.String("identity", "", "path to persist Ed25519 identity (enables stable identity across restarts)")
 	email := flag.String("email", "", "email address for account identification and key recovery")
 	owner := flag.String("owner", "", "(deprecated: use -email) owner identifier for key rotation recovery")
@@ -99,7 +96,6 @@ func main() {
 	noDataExchange := flag.Bool("no-dataexchange", false, "disable built-in data exchange service (port 1001)")
 	dataExchangeB64 := flag.Bool("dataexchange-b64", false, "write inbox message payloads as a raw base64 `data_b64` field in place of the UTF-8 `data` field — needed only for binary payloads (e.g. zlib-compressed envelopes)")
 	noEventStream := flag.Bool("no-eventstream", false, "disable built-in event stream service (port 1002)")
-	enterpriseControlPath := flag.String("enterprise-control", "", "path to signed enterprise control attachment (root pin, trust bundle, policy bundle, and governed transport rules)")
 	noSkillinject := flag.Bool("no-skillinject", false, "disable built-in skill-injection service (agent context injection). Env: PILOT_NO_SKILLINJECT=1.")
 	webhookURL := flag.String("webhook", "", "HTTP(S) endpoint for event notifications (empty = disabled)")
 	webhookSecret := flag.String("webhook-secret", "", "HMAC-SHA256 pre-shared secret for webhook payload signing (empty = no signature). Env: PILOT_WEBHOOK_SECRET.")
@@ -109,9 +105,15 @@ func main() {
 	beaconRTTProbe := flag.Bool("beacon-rtt-probe", false, "probe beacon RTT before selection; override hash pick when >2× slower than best (ablation test, default off)")
 	noRxWatchdog := flag.Bool("no-rx-watchdog", false, "disable the inbound-path watchdog that soft-recovers (beacon+registry re-registration) and, on a persistent wedge, exits non-zero for supervisor respawn")
 	noPathWatch := flag.Bool("no-path-watch", false, "disable the per-peer path watchdog that probes inbound-silent peers and resets a dead peer path in place (prefer-direct sequence) without a daemon restart")
-	transportMode := flag.String("transport", "udp", "tunnel transport: 'udp' (default) or 'compat' (WSS to beacon, opt-in, for UDP-blocked environments)")
-	compatBeacon := flag.String("compat-beacon", "wss://beacon.pilotprotocol.network/v1/compat", "beacon WSS URL for -transport=compat")
-	tlsTrust := flag.String("tls-trust", "system", "TLS trust store for -transport=compat: 'system' (OS trust store; current default while compat mode uses Let's Encrypt certs on beacon.pilotprotocol.network) or 'pinned' (Pilot CA root embedded in the daemon binary; will become the default in a future release once production root ships)")
+	// -transport and -proxy have literal defaults: their environment
+	// variables beat config.json (see flagSources.envOverConfig), and -help
+	// must never print an environment value — PILOT_PROXY can hold proxy
+	// credentials.
+	transportMode := flag.String("transport", "", "tunnel transport: 'udp' (the default), 'compat' (registry over TLS and beacon over WSS, TCP 443 only, for UDP-blocked or proxy-only hosts) or 'auto' (udp when the beacon answers over UDP, otherwise compat when TCP 443 is reachable, through the proxy if there is one — also when a configured proxy refuses the check, so nothing is dialed past the proxy). Precedence: this flag, $PILOT_TRANSPORT, config.json \"transport\", udp.")
+	proxySpec := flag.String("proxy", "", "outbound proxy for registry, beacon and HTTP connections: 'auto' (the default: with compat, HTTPS_PROXY/ALL_PROXY from the environment, honoring NO_PROXY; nothing with udp), 'off' (also none, no, false, direct), or an http:// or https:// proxy URL, http://[user:pass@]host:port, used for every connection except loopback. Precedence: this flag, $PILOT_PROXY, config.json \"proxy\", auto.")
+	proxyCmd := flag.String("proxy-cmd", "", "command (run with sh -c) whose output is the current proxy URL, for egress proxies that rotate their credentials: it supplies the URL -proxy would use (the explicit URL, or with auto and compat the environment's proxy) and is re-run once 60s have passed and whenever the proxy rejects the credentials (407, or a CONNECT answer that cannot be parsed), after which that connection is retried once, so new connections always carry fresh credentials; the apps the daemon starts get HTTPS_PROXY pointing at a loopback relay in the daemon that adds them. Runs in the environment the daemon was started with. Example: bash -c 'printf %s \"$https_proxy\"'. Precedence: this flag, $PILOT_PROXY_CMD, config.json \"proxy_cmd\".")
+	compatBeacon := flag.String("compat-beacon", defaultCompatBeacon, "beacon WSS URL for -transport=compat")
+	tlsTrust := flag.String("tls-trust", "system", "TLS trust store for -transport=compat: 'system' (OS trust store; current default while compat mode uses Let's Encrypt certs on beacon.pilotprotocol.network — on a host without a CA bundle set SSL_CERT_FILE or SSL_CERT_DIR) or 'pinned' (Pilot CA root embedded in the daemon binary; will become the default in a future release once production root ships)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
@@ -165,64 +167,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("load config: %v", err)
 		}
-		config.ApplyToFlags(cfg)
 		fileConfig = cfg
 	}
-	if *enterpriseControlPath == "" {
-		if discovered, ok := discoverManagedEnterpriseControl(); ok {
-			*enterpriseControlPath = discovered
-		}
+	// Record which flags the command line and config.json set before
+	// ApplyToFlags makes config values indistinguishable from defaults.
+	sources := newFlagSources(flag.CommandLine, fileConfig)
+	if fileConfig != nil {
+		config.ApplyToFlags(fileConfig)
 	}
-
-	// Compat-mode 443-only defaults. When -transport=compat is selected
-	// and the operator hasn't explicitly overridden -registry/-registry-tls/
-	// -registry-trust, route the registry to its TLS hostname (TCP/443
-	// via nginx SNI routing on the production rendezvous box) so the
-	// daemon really does use a single port. The TCP/9000 fallback is
-	// still available to anyone who passes -registry explicitly.
-	if *transportMode == "compat" {
-		explicit := map[string]bool{}
-		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-		if !explicit["registry"] && os.Getenv("PILOT_REGISTRY") == "" {
-			v := "registry.pilotprotocol.network:443"
-			registryAddr = &v
-		}
-		if !explicit["registry-tls"] {
-			v := true
-			registryTLS = &v
-		}
-		if !explicit["registry-trust"] {
-			v := "system"
-			registryTrust = &v
-			slog.Warn("compat-mode registry-trust defaulted to 'system' (Let's Encrypt validation). Override with -registry-trust=pinned if using pinned certificates (supply -registry-fingerprint).")
-		}
-	}
-
-	profileOptions := daemonSecurityOptions{
-		RegistryAddr:                    *registryAddr,
-		RegistryTLS:                     *registryTLS,
-		RegistryFingerprint:             *registryFingerprint,
-		RegistryTrust:                   *registryTrust,
-		Encrypt:                         *encrypt,
-		StrictDataPlaneTrust:            *strictDataplaneTrust || os.Getenv("PILOT_STRICT_DATAPLANE_TRUST") == "1",
-		IdentityPath:                    *identityPath,
-		TrustAutoApprove:                *trustAutoApprove,
-		DisableSkillinject:              *noSkillinject || os.Getenv("PILOT_NO_SKILLINJECT") == "1",
-		SkillinjectVerificationKeyFound: os.Getenv("PILOT_SKILLINJECT_MANIFEST_PUBKEY") != "" || os.Getenv("PILOT_SKILLINJECT_PUBKEY") != "",
-		MOTDFeedURL:                     *motdFeedURL,
-		WebhookURL:                      *webhookURL,
-		EnterpriseControlPath:           *enterpriseControlPath,
-		DisableDataExchange:             *noDataExchange,
-		DisableEventStream:              *noEventStream,
-	}
-	if err := applyDaemonSecurityProfile(*securityProfile, &profileOptions); err != nil {
-		log.Fatalf("security profile: %v", err)
-	}
-	*registryTLS = profileOptions.RegistryTLS
-	*encrypt = profileOptions.Encrypt
-	*strictDataplaneTrust = profileOptions.StrictDataPlaneTrust
-	*noSkillinject = profileOptions.DisableSkillinject
-	*motdFeedURL = profileOptions.MOTDFeedURL
 
 	logging.Setup(*logLevel, *logFormat)
 	// launchd never rotates StandardOutPath/StandardErrorPath (daemon.log
@@ -238,6 +190,140 @@ func main() {
 		Within:     pilotDirs(),
 		Files:      pilotLogFiles(),
 	}, time.Minute)
+
+	// Launch-time settings: flag, then environment, then config.json.
+	configTransport := *transportMode
+	var transportSrc string
+	*transportMode, transportSrc = sources.envOverConfig("transport", *transportMode, "PILOT_TRANSPORT")
+	*proxySpec, _ = sources.envOverConfig("proxy", *proxySpec, "PILOT_PROXY")
+	*proxyCmd, _ = sources.envOverConfig("proxy-cmd", *proxyCmd, "PILOT_PROXY_CMD")
+	var trustSrc string
+	*registryTrust, trustSrc = sources.envOverConfig("registry-trust", *registryTrust, "PILOT_REGISTRY_TRUST")
+	*registryFingerprint, _ = sources.envOverConfig("registry-fingerprint", *registryFingerprint, "PILOT_REGISTRY_FINGERPRINT")
+
+	transport, err := daemon.NormalizeTransport(*transportMode)
+	if err != nil && transportSrc == srcEnv {
+		// A stray environment variable never stops the daemon.
+		slog.Warn("ignoring unknown PILOT_TRANSPORT value", "value", *transportMode, "valid", "udp, compat, auto")
+		transportSrc = srcDefault
+		if sources.config["transport"] {
+			transportSrc = srcConfig
+		}
+		transport, err = daemon.NormalizeTransport(configTransport)
+	}
+	if err != nil {
+		fatalf("-transport: %v", err)
+	}
+	if transport == "" {
+		// Nothing chosen: $PILOT_TRANSPORT_DEFAULT (auto in the service
+		// units install.sh writes), else udp.
+		transport = defaultTransport()
+		if strings.TrimSpace(getenv(transportDefaultEnv)) != "" {
+			transportSrc = transportDefaultEnv
+		}
+	}
+	if _, err := proxyconf.Normalize(*proxySpec); err != nil {
+		fatalf("-proxy: %v", err)
+	}
+	// The proxy resolver depends on the transport only; each is resolved
+	// once (running -proxy-cmd once) and shared by the auto probe and the
+	// daemon, so the credentials it refreshes stay in one place.
+	proxyResolvers := map[string]*netproxy.Resolver{}
+	proxyFor := func(transport string) (*netproxy.Resolver, error) {
+		if r, ok := proxyResolvers[transport]; ok {
+			return r, nil
+		}
+		r, err := resolveProxy(*proxySpec, *proxyCmd, transport)
+		if err == nil {
+			proxyResolvers[transport] = r
+		}
+		return r, err
+	}
+
+	reg := registrySettings{
+		Addr:          *registryAddr,
+		AddrExplicit:  sources.explicit("registry") || registryFromEnv,
+		TLS:           *registryTLS,
+		TLSExplicit:   sources.explicit("registry-tls"),
+		Trust:         *registryTrust,
+		TrustExplicit: sources.explicit("registry-trust") || trustSrc == srcEnv,
+		Fingerprint:   *registryFingerprint,
+	}
+
+	// -transport=auto: probe once, before anything depends on the mode.
+	if transport == daemon.TransportAuto {
+		mode, reason, proxyErr, err := resolveAutoTransport(reg, *beaconAddr, sources.explicit("beacon") || beaconFromEnv,
+			*compatBeacon, sources.explicit("compat-beacon"), proxyFor)
+		if err != nil {
+			fatalf("-proxy: %v", err)
+		}
+		if proxyErr != nil {
+			slog.Warn("transport auto-selected", "transport", mode, "reason", reason,
+				"hint", proxyErrorHint(proxyErr))
+		} else {
+			slog.Info("transport auto-selected", "transport", mode, "reason", reason)
+		}
+		transport = mode
+	}
+	*transportMode = transport
+
+	// Outbound proxy: resolved once, after -transport is final, and shared
+	// by everything that dials out — the registry client, the compat WSS
+	// beacon, pkg/daemon's own HTTP fetches (via daemon.Config.Proxy) and
+	// every plugin HTTP client (via http.DefaultTransport).
+	proxyResolver, err := proxyFor(transport)
+	if err != nil {
+		fatalf("-proxy: %v", err)
+	}
+
+	// Registry defaults for the transport and proxy (see
+	// applyRegistryDefaults): compat, or a proxied registry dial, moves
+	// the compiled-in raw-TCP registry to registry.pilotprotocol.network:443
+	// over TLS, so the daemon really uses a single port that a CONNECT
+	// proxy carries; an explicit non-default -registry, or an explicit
+	// -registry-tls=false (the TCP/9000 fallback), is kept. -beacon needs
+	// no such rule: in compat mode the UDP beacon address is only the
+	// relay-wrap destination on the WSS pipe and is never dialed.
+	final := applyRegistryDefaults(transport, reg, func(addr string) bool { return proxyconf.Proxies(proxyResolver, addr) })
+	if final.Addr != reg.Addr {
+		registryFromEnv = false
+	}
+	if final.Trust != reg.Trust {
+		slog.Info("registry trust defaulted for the TLS registry", "registry_trust", final.Trust,
+			"hint", "override with -registry-trust (config registry_trust, env PILOT_REGISTRY_TRUST); pinned needs -registry-fingerprint")
+	}
+	*registryAddr, *registryTLS, *registryTrust = final.Addr, final.TLS, final.Trust
+
+	profileOptions := daemonSecurityOptions{
+		RegistryAddr:                    *registryAddr,
+		RegistryTLS:                     *registryTLS,
+		RegistryFingerprint:             *registryFingerprint,
+		RegistryTrust:                   *registryTrust,
+		Encrypt:                         *encrypt,
+		StrictDataPlaneTrust:            *strictDataplaneTrust || os.Getenv("PILOT_STRICT_DATAPLANE_TRUST") == "1",
+		IdentityPath:                    *identityPath,
+		TrustAutoApprove:                *trustAutoApprove,
+		DisableSkillinject:              *noSkillinject || os.Getenv("PILOT_NO_SKILLINJECT") == "1",
+		SkillinjectVerificationKeyFound: os.Getenv("PILOT_SKILLINJECT_MANIFEST_PUBKEY") != "" || os.Getenv("PILOT_SKILLINJECT_PUBKEY") != "",
+		MOTDFeedURL:                     *motdFeedURL,
+		WebhookURL:                      *webhookURL,
+	}
+	if err := applyDaemonSecurityProfile(*securityProfile, &profileOptions); err != nil {
+		log.Fatalf("security profile: %v", err)
+	}
+	*registryTLS = profileOptions.RegistryTLS
+	*encrypt = profileOptions.Encrypt
+	*strictDataplaneTrust = profileOptions.StrictDataPlaneTrust
+	*noSkillinject = profileOptions.DisableSkillinject
+	*motdFeedURL = profileOptions.MOTDFeedURL
+
+	// The proxy relay first: DefaultTransport tunnels through it, and with
+	// -proxy-cmd the apps the app store spawns inherit the environment it
+	// exports.
+	proxyRelay := startProxyRelay(proxyResolver, proxyCommandFor(*proxySpec, *proxyCmd, transport, false))
+	installDefaultTransportProxy(proxyResolver, proxyRelay)
+	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyResolver),
+		"transport_from", transportSrc, "registry", *registryAddr, "registry_tls", *registryTLS)
 
 	// Sandbox: validate all configured file paths are under the confinement
 	// root before the daemon touches the filesystem. Network paths are unaffected.
@@ -270,21 +356,6 @@ func main() {
 		checkSandbox("config", *configPath)
 		checkSandbox("identity", *identityPath)
 		checkSandbox("socket", *socketPath)
-		checkSandbox("enterprise-control", *enterpriseControlPath)
-	}
-
-	var enterpriseControls *enterprisecontrol.Runtime
-	if *enterpriseControlPath != "" {
-		var err error
-		enterpriseControls, err = enterprisecontrol.Load(*enterpriseControlPath)
-		if err != nil {
-			log.Fatalf("enterprise control: %v", err)
-		}
-	}
-	if strings.EqualFold(strings.TrimSpace(*securityProfile), securityProfileEnterprise) {
-		if err := enterpriseControls.RequireEnabledServiceGates(!*noDataExchange, !*noEventStream); err != nil {
-			log.Fatalf("enterprise control: %v", err)
-		}
 	}
 
 	if registryFromEnv {
@@ -332,6 +403,7 @@ func main() {
 		TransportMode:         *transportMode,
 		CompatBeaconURL:       *compatBeacon,
 		CompatTLSTrust:        *tlsTrust,
+		Proxy:                 proxyResolver,
 		MOTDFeedURL:           *motdFeedURL,
 		MOTDInterval:          *motdInterval,
 		TelemetryURL:          *telemetryURL,
@@ -393,20 +465,13 @@ func main() {
 		dataExchangeConfig := dataexchange.ServiceConfig{
 			IncludeBase64: *dataExchangeB64,
 		}
-		if err := enterpriseControls.ApplyDataExchange(&dataExchangeConfig); err != nil {
-			log.Fatalf("configure dataexchange enterprise control: %v", err)
-		}
 		if err := rt.Register(dataexchange.NewService(dataExchangeConfig)); err != nil {
 			log.Fatalf("register dataexchange: %v", err)
 		}
 	}
 
 	if !*noEventStream {
-		eventStreamService := eventstream.NewService()
-		if err := enterpriseControls.ApplyEventStream(eventStreamService); err != nil {
-			log.Fatalf("configure eventstream enterprise control: %v", err)
-		}
-		if err := rt.Register(eventStreamService); err != nil {
+		if err := rt.Register(eventstream.NewService()); err != nil {
 			log.Fatalf("register eventstream: %v", err)
 		}
 	}
@@ -419,9 +484,6 @@ func main() {
 
 	// Manual trust-handshake (port 444) — extracted from pkg/daemon in T3.3.
 	hsSvc := handshake.NewService(runtime.NewHandshakeRuntime(dapi))
-	if actionHook := enterpriseControls.ActionHook(); actionHook != nil {
-		hsSvc.Manager().SetActionHook(actionHook)
-	}
 	if err := rt.Register(hsSvc); err != nil {
 		log.Fatalf("register handshake: %v", err)
 	}
@@ -540,297 +602,18 @@ func main() {
 		fatalAfterPluginStart(rt.StopPlugins, "daemon start: %v", err)
 	}
 
-	rolloutRefreshCtx, rolloutRefreshCancel := context.WithCancel(context.Background())
-	if enterpriseControls.HasRollout() {
-		if err := enterpriseControls.RefreshRollout(rolloutRefreshCtx); err != nil {
-			slog.Warn("enterprise rollout refresh failed; retaining current local policy", "err", err)
-		}
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.RolloutInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-rolloutRefreshCtx.Done():
-					return
-				case <-ticker.C:
-					if err := enterpriseControls.RefreshRollout(rolloutRefreshCtx); err != nil {
-						slog.Warn("enterprise rollout refresh failed; retaining current local policy", "err", err)
-					}
-				}
-			}
-		}()
-	}
-
-	fleetControlCtx, fleetControlCancel := context.WithCancel(context.Background())
-	if enterpriseControls.HasFleetControl() {
-		synchronizeFleetControl(fleetControlCtx, enterpriseControls, d)
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.FleetReportInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-fleetControlCtx.Done():
-					return
-				case <-ticker.C:
-					synchronizeFleetControl(fleetControlCtx, enterpriseControls, d)
-				}
-			}
-		}()
-	}
-	if enterpriseControls.HasFleetStateSync() {
-		synchronizeFleetState(fleetControlCtx, enterpriseControls)
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.FleetStateSyncInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-fleetControlCtx.Done():
-					return
-				case <-ticker.C:
-					synchronizeFleetState(fleetControlCtx, enterpriseControls)
-				}
-			}
-		}()
-	}
-
-	if enterpriseControls.HasAppReconcile() {
-		appInstaller := enterprisecontrol.PilotctlInstaller{BinaryPath: pilotctlBinaryPath()}
-		reconcileApps(fleetControlCtx, enterpriseControls, appInstaller)
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.AppReconcileInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-fleetControlCtx.Done():
-					return
-				case <-ticker.C:
-					reconcileApps(fleetControlCtx, enterpriseControls, appInstaller)
-				}
-			}
-		}()
-	}
-
-	receiptExportCtx, receiptExportCancel := context.WithCancel(context.Background())
-	if enterpriseControls.HasReceiptExport() {
-		if err := enterpriseControls.ExportReceiptsOnce(receiptExportCtx); err != nil {
-			slog.Warn("enterprise receipt export failed; local evidence remains durable", "err", err)
-		}
-		go func() {
-			ticker := time.NewTicker(enterpriseControls.ReceiptExportInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-receiptExportCtx.Done():
-					return
-				case <-ticker.C:
-					if err := enterpriseControls.ExportReceiptsOnce(receiptExportCtx); err != nil {
-						slog.Warn("enterprise receipt export failed; local evidence remains durable", "err", err)
-					}
-				}
-			}
-		}()
-	}
-
-	// SIGHUP advances only the already-pinned signed authority state. It does
-	// not reload daemon flags, root pins, or resource mappings, which remain a
-	// deliberate restart-time administrative change.
+	// SIGHUP is caught and ignored, so a closed terminal does not stop a
+	// foreground daemon.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	cause := awaitShutdown(sig, remoteLifecycleRequests, supervisorExitRequests, func() {
-		if enterpriseControls == nil {
-			slog.Warn("enterprise control reload ignored: no attachment is configured")
-		} else if err := enterpriseControls.Reload(); err != nil {
-			slog.Error("enterprise control reload rejected; keeping current signed state", "err", err)
-		} else {
-			slog.Info("enterprise control reloaded")
-		}
-	})
+	cause := awaitShutdown(sig, supervisorExitRequests)
 	signal.Stop(sig)
-	rolloutRefreshCancel()
-	receiptExportCancel()
-	fleetControlCancel()
 
 	// Daemon.Stop then StopPlugins (see teardown for why the order
 	// matters). A daemon-requested exit leaves here via os.Exit with its
 	// code once the teardown finishes.
 	shutdown(cause, func() { d.Stop() }, rt.StopPlugins, os.Exit)
-	if cause.restart {
-		executable, err := os.Executable()
-		if err != nil {
-			slog.Error("resolve daemon executable for remote restart", "err", err)
-			return
-		}
-		slog.Info("restarting daemon after graceful shutdown")
-		// #nosec G204,G702 -- restart re-execs the current OS-resolved daemon directly; signed fleet commands cannot supply a path or arguments.
-		if err := syscall.Exec(executable, os.Args, os.Environ()); err != nil {
-			slog.Error("remote daemon restart failed", "err", err)
-		}
-	}
-}
-
-func discoverManagedEnterpriseControl() (string, bool) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", false
-	}
-	path := filepath.Join(home, ".pilot", "managed", "enterprise-control.json")
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return "", false
-	}
-	return path, true
-}
-
-// synchronizeFleetControl reports bounded local health and runs only the
-// fixed, authority-signed maintenance commands. It intentionally has no
-// generic process execution, file access, shell, or network-dial capability.
-func synchronizeFleetControl(ctx context.Context, controls *enterprisecontrol.Runtime, daemonInstance *daemon.Daemon) {
-	health := daemonInstance.HealthSnapshot()
-	info := daemonInstance.Info()
-	reconciliation, reconciliationErr := controls.ReconcileFleetControl(ctx, info.Version)
-	if reconciliationErr != nil {
-		slog.Warn("fleet desired-state reconciliation failed", "err", reconciliationErr)
-	} else if reconciliation.Found && reconciliation.Status != "applied" {
-		slog.Warn("fleet desired state requires attention", "revision", reconciliation.Control.Revision, "detail", reconciliation.DetailCode)
-	}
-	if reconciliation.Found {
-		if err := controls.ReportFleetControlAcknowledgement(ctx, reconciliation, info.Version); err != nil {
-			slog.Warn("fleet desired-state acknowledgement failed", "revision", reconciliation.Control.Revision, "err", err)
-		}
-	}
-	status := enterprisecontrol.FleetNodeStatus{
-		NodeID:        info.NodeID,
-		AgentVersion:  info.Version,
-		UptimeSeconds: uint64(health.Uptime.Seconds()),
-		// #nosec G115 -- daemon counters are non-negative in-memory collection sizes and cannot exceed the process address space.
-		Connections: uint32(health.Connections),
-		// #nosec G115 -- daemon counters are non-negative in-memory collection sizes and cannot exceed the process address space.
-		Peers: uint32(health.Peers),
-		// #nosec G115 -- daemon counters are non-negative in-memory collection sizes and cannot exceed the process address space.
-		EncryptedPeers: uint32(health.EncryptedPeers),
-		BytesSent:      health.BytesSent,
-		BytesReceived:  health.BytesRecv,
-		PolicyRevision: controls.CurrentPolicyRevision(ctx),
-	}
-	if err := controls.ReportFleetStatus(ctx, status); err != nil {
-		slog.Warn("fleet status report failed", "err", err)
-	}
-	commands, err := controls.FleetCommands(ctx)
-	if err != nil {
-		slog.Warn("fleet command poll failed", "err", err)
-		return
-	}
-	for _, command := range commands {
-		outcome, detail := "succeeded", ""
-		lifecycle := ""
-		switch command.Kind {
-		case authority.FleetCommandRefreshPolicy:
-			if err := controls.RefreshRollout(ctx); err != nil {
-				outcome, detail = "failed", "rollout_refresh_failed"
-			}
-		case authority.FleetCommandExportReceipts:
-			if !controls.HasReceiptExport() {
-				outcome, detail = "rejected", "receipt_export_unconfigured"
-			} else if err := controls.ExportReceiptsOnce(ctx); err != nil {
-				outcome, detail = "failed", "receipt_export_failed"
-			}
-		case authority.FleetCommandReloadControl:
-			if err := controls.Reload(); err != nil {
-				outcome, detail = "failed", "control_reload_failed"
-			}
-		case authority.FleetCommandSyncState:
-			if !controls.HasFleetStateSync() {
-				outcome, detail = "rejected", "state_sync_unconfigured"
-			} else if _, err := controls.SyncFleetState(ctx); err != nil {
-				outcome, detail = "failed", "state_sync_failed"
-			}
-		case authority.FleetCommandDiagnostics:
-			// The signed health report above is the bounded diagnostic
-			// payload. Include the .pilot mirror when that optional channel
-			// is enabled, without returning logs or environment values.
-			if controls.HasFleetStateSync() {
-				if _, err := controls.SyncFleetState(ctx); err != nil {
-					outcome, detail = "failed", "diagnostics_sync_failed"
-				}
-			}
-		case authority.FleetCommandRestartRuntime:
-			if controls.LifecycleCommandAlreadyApplied(command) {
-				outcome, detail = "rejected", "already_applied"
-			} else {
-				lifecycle = "restart"
-			}
-		case authority.FleetCommandShutdownRuntime:
-			if controls.LifecycleCommandAlreadyApplied(command) {
-				outcome, detail = "rejected", "already_applied"
-			} else {
-				lifecycle = "shutdown"
-			}
-		default:
-			outcome, detail = "rejected", "command_not_allowlisted"
-		}
-		if err := controls.ReportFleetCommandResult(ctx, command.ID, outcome, detail); err != nil {
-			slog.Warn("fleet command result report failed", "command_id", command.ID, "err", err)
-			continue
-		}
-		if outcome == "succeeded" && lifecycle != "" {
-			// Persist the idempotency record BEFORE acting, and fail closed if
-			// it can't be written — otherwise a replayed signed command could
-			// loop across every poll and across the restart it triggers.
-			if err := controls.MarkLifecycleCommandApplied(command); err != nil {
-				slog.Error("persist lifecycle idempotency record failed; refusing to act to avoid a replay loop", "command_id", command.ID, "err", err)
-				continue
-			}
-			select {
-			case remoteLifecycleRequests <- lifecycle:
-			default:
-				slog.Warn("fleet lifecycle request already pending", "command_id", command.ID)
-			}
-		}
-	}
-}
-
-// pilotctlBinaryPath resolves the pilotctl that ships beside this daemon.
-// Preferring the sibling binary over $PATH keeps the verified install path
-// pinned to the same release as the daemon rather than to whatever a user
-// happens to have earlier in their environment.
-func pilotctlBinaryPath() string {
-	if executable, err := os.Executable(); err == nil {
-		sibling := filepath.Join(filepath.Dir(executable), "pilotctl")
-		if info, statErr := os.Stat(sibling); statErr == nil && !info.IsDir() {
-			return sibling
-		}
-	}
-	if resolved, err := exec.LookPath("pilotctl"); err == nil {
-		return resolved
-	}
-	return "pilotctl"
-}
-
-// reconcileApps converges installed apps toward the authority's desired set.
-// A failure here must never disturb policy enforcement or the state mirror, so
-// it is logged and retried on the next tick rather than propagated.
-func reconcileApps(ctx context.Context, controls *enterprisecontrol.Runtime, installer enterprisecontrol.AppInstaller) {
-	result, err := controls.ReconcileApps(ctx, installer)
-	if err != nil {
-		slog.Warn("managed app reconcile failed", "err", err)
-		return
-	}
-	if result.Installed+result.Staged+result.Removed+result.Failed > 0 {
-		slog.Info("managed apps reconciled",
-			"desired", result.Desired, "installed", result.Installed,
-			"awaiting_grants", result.Staged, "removed", result.Removed, "failed", result.Failed)
-	}
-}
-
-func synchronizeFleetState(ctx context.Context, controls *enterprisecontrol.Runtime) {
-	result, err := controls.SyncFleetState(ctx)
-	if err != nil {
-		slog.Warn("fleet .pilot state synchronization failed", "err", err)
-		return
-	}
-	if result.AppliedMutations > 0 || result.RejectedMutations > 0 {
-		slog.Info("fleet .pilot state synchronized", "revision", result.Revision, "entries", result.Entries, "applied_mutations", result.AppliedMutations, "rejected_mutations", result.RejectedMutations)
-	}
+	_ = proxyRelay.Close() // the plugins and apps are stopped
 }
 
 func envString(name, fallback string) string {

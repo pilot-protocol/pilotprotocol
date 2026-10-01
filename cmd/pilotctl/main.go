@@ -4,7 +4,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"encoding/json"
@@ -25,12 +24,12 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/common/consent"
-	"github.com/pilot-protocol/common/decision"
 	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/protocol"
 	registry "github.com/pilot-protocol/common/registry/client"
 	"github.com/pilot-protocol/dataexchange"
 	"github.com/pilot-protocol/eventstream"
+	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/policy/policylang"
 	"github.com/pilot-protocol/trustedagents"
 )
@@ -287,7 +286,7 @@ func getRegistry() string {
 	if s, ok := cfg["registry"].(string); ok && s != "" {
 		return s
 	}
-	return "34.71.57.205:9000"
+	return productionRegistryAddr
 }
 
 // getBeacon mirrors getRegistry for the beacon address: env override,
@@ -304,7 +303,7 @@ func getBeacon() string {
 	if s, ok := cfg["beacon"].(string); ok && s != "" {
 		return s
 	}
-	return "34.71.57.205:9001"
+	return productionBeaconAddr
 }
 
 func loadConfig() map[string]interface{} {
@@ -600,15 +599,11 @@ func nodeIDFromDaemon() int64 {
 	return int64(nid)
 }
 
+// connectRegistry dials the configured registry along the same network
+// the daemon uses (see registryRoute: egress proxy, compat TLS registry),
+// or exits with a hint.
 func connectRegistry() *registry.Client {
-	addr := getRegistry()
-	rc, err := registry.Dial(addr)
-	if err != nil {
-		fatalHint("connection_failed",
-			fmt.Sprintf("check that the registry is running at %s, or set PILOT_REGISTRY", addr),
-			"cannot reach registry at %s", addr)
-	}
-	return rc
+	return connectRegistryAt(getRegistry(), "registry")
 }
 
 func resolveHostnameToAddr(d *driver.Driver, hostname string) (protocol.Addr, uint32, error) {
@@ -653,6 +648,16 @@ func resolveHostnameToAddr(d *driver.Driver, hostname string) (protocol.Addr, ui
 //
 // Skip with --no-auto-handshake. Pre-#99 daemons don't have SubHandshakeWait;
 // we treat the IPC error as "wait unsupported" and proceed best-effort.
+//
+// With a daemon that has the reply window (feature "reply_window"), trust
+// is no longer a precondition for a reply: the daemon admits the dial-back
+// reply from a peer it just contacted. Branches 2 and 3 then no longer
+// block. Measured on clean runners, that block cost ~17-22 s of every
+// first query to list-agents (a direct handshake dial that times out, a
+// registry-relayed fallback, then the 5 s wait) before the data dial even
+// started. For a trusted agent the daemon still fires the handshake itself,
+// in parallel with the dial (DialConnection's inline auto-handshake). A
+// private peer we don't trust is still refused up front.
 func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 	if skip {
 		return
@@ -664,6 +669,7 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 			return
 		}
 	}
+	replyWindow := daemonHasFeature(d, "reply_window")
 
 	// Branch 2 — peer is in the embedded trusted-agents allowlist.
 	//
@@ -675,6 +681,9 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 	// at the inbound auto-accept path inside its NewService(), where the
 	// presented key IS available. See that repo, not this call site.
 	if name, ok := trustedagents.IsTrusted(addr.Node); ok {
+		if replyWindow {
+			return
+		}
 		if !jsonOutput {
 			fmt.Fprintf(os.Stderr, "establishing handshake with Trusted Agent %s (%s)...\n", name, addr)
 		}
@@ -703,14 +712,20 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 		return
 	}
 
-	// Branch 3 — unknown peer, not trusted. Refuse if private.
-	rc, err := registry.Dial(getRegistry())
+	// Branch 3 — unknown peer, not trusted. Refuse if private. The
+	// visibility check reaches the registry the way connectRegistry does
+	// (through the egress proxy when there is one).
+	rc, route, err := dialRegistry(getRegistry())
 	if err != nil {
 		// Registry unreachable — be conservative and refuse rather than
 		// silently let an untrusted tunnel attempt go through to a peer
 		// we can't characterise.
+		hint := fmt.Sprintf("run: pilotctl handshake %s", addr)
+		if route.Addr != "" {
+			hint += "; " + registryDialHint(route)
+		}
 		fatalHint("trust_required",
-			fmt.Sprintf("run: pilotctl handshake %s", addr),
+			hint,
 			"cannot verify peer visibility (registry unreachable: %v); refusing tunnel to untrusted node", err)
 	}
 	defer rc.Close()
@@ -725,6 +740,10 @@ func maybeAutoHandshake(d *driver.Driver, addr protocol.Addr, skip bool) {
 		fatalHint("trust_required",
 			fmt.Sprintf("run: pilotctl handshake %s", addr),
 			"refusing tunnel to private node %s without trust", addr)
+	}
+	if replyWindow {
+		// Public peer: it accepts our SYN, and our daemon admits its reply.
+		return
 	}
 	// Public peer — best-effort handshake so replies survive our local
 	// trust gate. Without this, a request/reply pattern (e.g. send-message
@@ -871,7 +890,6 @@ func hasHelpFlag(args []string) bool {
 // commandHelp holds concise usage text for each command. Looked up by
 // printCommandHelp when the user passes -h / --help after a command name.
 var commandHelp = map[string]string{
-	"enterprise": enterpriseHelpText,
 	"send-message": `Usage: pilotctl send-message <address|hostname> --data <text> [flags]
 
 Send a message to a remote agent and optionally wait for the reply.
@@ -881,11 +899,14 @@ Flags:
   --type text|json|binary  payload encoding (default: text)
   --count <n>           send N times (default: 1)
   --reuse-conn          reuse the connection across --count sends (saves ~1 RTT)
-  --wait [<dur>]        wait for a reply in the inbox (default timeout: 30s)
+  --wait [<dur>]        wait for a reply in the inbox (default timeout: 30s,
+                        counted from the receiver's acknowledgement)
+  --no-resend           on first contact, never send the request a second
+                        time (by default a request with no reply by mid-wait
+                        is re-sent once on a new stream)
+  --timeout <dur>       total wall time, including connect, handshake and reply
   --trace               print per-step timing breakdown to stderr
   --no-auto-handshake   skip automatic trust handshake with known agents
-  --enterprise-control <path>  request a signed enterprise decision before sending
-  --governed-resource <resource> exact receiver-owned resource bound in that decision
 
 Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
@@ -1052,10 +1073,63 @@ Flags:
   --log-format <fmt>           log format: text, json (default: text)
   --no-encrypt                 disable tunnel encryption
   --foreground                 run in foreground (no fork; for systemd / shell wrappers)
-  --wait <duration>            how long to wait for daemon to become ready (default: 15s)
+  --wait <duration>            how long to wait for daemon to become ready (default:
+                               15s; 30s with --transport compat or auto)
   --motd-feed-url <url>        message-of-the-day feed (empty to disable; env PILOT_MOTD_URL)
   --motd-interval <duration>   message-of-the-day poll interval (default: 15m)
-  --enterprise-control <path>  owner-only managed control attachment
+  --transport <udp|compat|auto>
+                               tunnel transport. Precedence: this flag,
+                               $PILOT_TRANSPORT, config "transport", else auto when
+                               the daemon supports it (older daemons: udp).
+                               udp = UDP tunnels; compat = registry over TLS and
+                               beacon over WSS, TCP 443 only (UDP-blocked or
+                               proxy-only hosts); auto = udp when the beacon
+                               answers over UDP, else compat when TCP 443 is
+                               reachable (through the proxy, if any)
+  --proxy <auto|off|URL>       outbound proxy. Precedence: this flag, $PILOT_PROXY,
+                               config "proxy", else auto. auto = with compat, use
+                               $HTTPS_PROXY/$ALL_PROXY (honoring $NO_PROXY);
+                               off (or none) = never; http(s)://[user:pass@]host:port
+                               = every connection except loopback. A URL with
+                               credentials is passed via env, never on argv
+  --proxy-cmd <command>        command whose output is the current proxy URL, for
+                               proxies that rotate their credentials (see below).
+                               Precedence: this flag, $PILOT_PROXY_CMD, config
+                               "proxy_cmd". Passed via env, never on argv
+  --compat-beacon <url>        beacon WSS URL for compat mode
+  --registry-trust <mode>      registry TLS trust: pinned or system
+  --registry-fingerprint <hex> registry certificate SHA-256 (pins the compat registry;
+                               for hosts without a CA bundle)
+  --tls-trust <mode>           compat beacon TLS trust: system or pinned
+
+Environment passed through to the daemon (never scrubbed):
+  HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
+  NO_PROXY no_proxy PILOT_PROXY PILOT_PROXY_CMD PILOT_TRANSPORT
+  PILOT_REGISTRY_TRUST PILOT_REGISTRY_FINGERPRINT SSL_CERT_FILE SSL_CERT_DIR
+
+A pilot-daemon too old for --transport, --transport auto or --proxy gets the
+flag dropped (auto becomes udp) with a warning instead of crashing it.
+Behind an HTTPS proxy with UDP blocked (e.g. hosted agent sandboxes), plain
+"pilotctl daemon start" picks compat by itself — also when the proxy refuses
+the check (a 407, say): auto never falls back to direct connections past a
+configured proxy. To skip the UDP probe:
+  pilotctl config --set transport=compat && pilotctl daemon start
+If the proxy rotates its credentials, give the daemon a command that prints
+the current proxy URL; the daemon re-runs it every 60s and whenever the proxy
+rejects the credentials (407, or an answer that cannot be parsed), and
+retries that connection once with the new credentials (pilotctl's own
+registry commands use the same command):
+  pilotctl config --set proxy_cmd="bash -c 'printf %s \"\$https_proxy\"'"
+On Linux without systemd (containers, hosted agent sandboxes), when
+$HTTPS_PROXY or $https_proxy carries credentials and no proxy_cmd is
+configured, daemon start passes the daemon a PILOT_PROXY_CMD by itself that
+prints a fresh bash's $https_proxy ($HTTPS_PROXY when only that one carries
+credentials). With a proxy command, the apps the daemon starts reach the
+proxy through a loopback relay in the daemon that adds the current
+credentials, so they keep working across rotations too.
+If the daemon exits during startup or does not become ready in time, daemon
+start reports the daemon's last error — the proxy's answer (e.g. "407 Proxy
+Authentication Required") when a proxy is involved — with the log path.
 `,
 	"daemon stop": `Usage: pilotctl daemon stop
 
@@ -1308,6 +1382,11 @@ Common keys:
   beacon       beacon address (overrides $PILOT_BEACON)
   socket       daemon socket path (overrides $PILOT_SOCKET)
   hostname     default hostname passed to daemon start
+  transport    daemon transport: udp, compat or auto ($PILOT_TRANSPORT overrides)
+  proxy        daemon proxy: auto, off, or http(s)://[user:pass@]host:port
+               ($PILOT_PROXY overrides; credentials are redacted when shown)
+  registry_fingerprint / registry_trust
+               pin the TLS registry (hosts without a CA bundle)
 `,
 	"version": `Usage: pilotctl version
 
@@ -1508,7 +1587,12 @@ func printCommandHelp(cmd string, cmdArgs []string) {
 // --- Usage ---
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `pilotctl — Pilot Protocol CLI
+	printUsage(os.Stderr)
+	os.Exit(2)
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, `pilotctl — Pilot Protocol CLI
 
 Global flags:
   --json                        Output structured JSON (for agent/programmatic use)
@@ -1521,7 +1605,7 @@ Bootstrap:
   pilotctl config [--set key=value]
 
 Daemon lifecycle:
-  pilotctl daemon start [--config <path>] [--registry <addr>] [--beacon <addr>] [--email <addr>] [--webhook <url>] [--trust-auto-approve]
+  pilotctl daemon start [--config <path>] [--registry <addr>] [--beacon <addr>] [--email <addr>] [--webhook <url>] [--trust-auto-approve] [--transport <udp|compat|auto>] [--proxy <auto|off|URL>]
   pilotctl daemon stop
   pilotctl daemon status
 
@@ -1543,7 +1627,7 @@ Communication commands:
   pilotctl connect <address|hostname> [port] [--message <msg>] [--timeout <dur>]
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
-  pilotctl send-file <address|hostname> <filepath> [--enterprise-control <path> --governed-resource <resource>]
+  pilotctl send-file <address|hostname> <filepath>
   pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
@@ -1601,7 +1685,6 @@ Updates:
   pilotctl updates [--count <n>] [--scope <scope>]        read the Pilot changelog feed
 
 Operator / admin (run 'pilotctl extras' or 'pilotctl context' for the full list):
-  pilotctl enterprise status|dashboard-url|policy|mandate|receipt --endpoint <URL> --tenant <tenant>  inspect or submit signed enterprise control state
   pilotctl extras <cmd>              network / managed / policy / member-tags / enterprise / low-level plumbing
   pilotctl extras gateway start|stop|map|unmap|list       IP gateway (requires root — creates loopback interface aliases)
 
@@ -1618,6 +1701,9 @@ Diagnostic commands:
 Environment:
   PILOT_REGISTRY     Registry address (default: 34.71.57.205:9000)
   PILOT_SOCKET       Daemon socket path (default: /tmp/pilot.sock)
+  PILOT_TRANSPORT    daemon start transport: udp, compat (TCP 443 only) or auto
+  PILOT_PROXY        proxy policy: auto, off, or http(s)://[user:pass@]host:port
+  HTTPS_PROXY        proxy for compat mode (proxy=auto) and pilotctl's own connections
 
 Version:
   pilotctl version
@@ -1632,7 +1718,6 @@ Companion binaries:
   $PILOT_DAEMON_BIN / $PILOT_GATEWAY_BIN, next to the pilotctl
   executable, then $PATH.
 `)
-	os.Exit(2)
 }
 
 // --- Main ---
@@ -1668,8 +1753,9 @@ func main() {
 	cmdArgs := args[1:]
 
 	// Top-level help
-	if cmd == "-h" || cmd == "--help" {
-		usage()
+	if cmd == "help" || cmd == "-h" || cmd == "--help" {
+		printUsage(os.Stdout)
+		return
 	}
 	// Per-command help: pilotctl <cmd> -h / --help
 	if hasHelpFlag(cmdArgs) {
@@ -1691,7 +1777,7 @@ dispatch:
 		cmdArgs = cmdArgs[1:]
 		goto dispatch
 
-	case "version":
+	case "version", "--version":
 		fmt.Println(version)
 		return
 
@@ -1717,10 +1803,6 @@ dispatch:
 
 	case "review":
 		cmdReview(cmdArgs)
-		return
-
-	case "enterprise":
-		cmdEnterprise(cmdArgs)
 		return
 
 	// Bootstrap
@@ -2094,15 +2176,38 @@ func cmdConfig(args []string) {
 		if len(parts) != 2 {
 			fatalCode("invalid_argument", "usage: pilotctl config --set key=value")
 		}
+		parts[0] = strings.ReplaceAll(parts[0], "-", "_")
+		value, err := validateConfigValue(parts[0], parts[1])
+		if err != nil {
+			fatalCode("invalid_argument", "config: %v", err)
+		}
 		cfg := loadConfig()
-		cfg[parts[0]] = parts[1]
+		cfg[parts[0]] = value
+		if value == "" && clearableConfigKeys[parts[0]] {
+			// Empty clears the key: the default applies again (for
+			// transport, pilotctl's auto), and nothing is left for an
+			// older pilot-daemon to trip over.
+			delete(cfg, parts[0])
+		}
+		result := map[string]interface{}{"key": parts[0], "value": value}
+		// Leaving compat: an install made with a pilotctl that predated
+		// --transport pointed the registry at the compat TLS host
+		// (install.sh --transport compat). A udp daemon needs the raw-TCP
+		// registry back (current daemons cope either way; older ones
+		// would dial :443 without TLS).
+		if parts[0] == "transport" && value != "compat" {
+			if r, _ := cfg["registry"].(string); strings.EqualFold(strings.TrimSpace(r), compatRegistryAddr) {
+				cfg["registry"] = productionRegistryAddr
+				result["registry"] = productionRegistryAddr
+			}
+		}
 		if err := saveConfig(cfg); err != nil {
 			fatalCode("internal", "save config: %v", err)
 		}
-		outputOK(map[string]interface{}{
-			"key":   parts[0],
-			"value": parts[1],
-		})
+		if parts[0] == "proxy" {
+			result["value"] = redactProxyURL(value.(string))
+		}
+		outputOK(result)
 		return
 	}
 
@@ -2117,6 +2222,10 @@ func cmdConfig(args []string) {
 	}
 	if _, ok := cfg["socket"]; !ok {
 		cfg["socket"] = getSocket()
+	}
+	// config.json is 0600 for a reason; a proxy URL may carry credentials.
+	if p, ok := cfg["proxy"].(string); ok {
+		cfg["proxy"] = redactProxyURL(p)
 	}
 	if jsonOutput {
 		output(cfg)
@@ -2208,9 +2317,9 @@ func contextCatalog() map[string]interface{} {
 
 			// Daemon lifecycle
 			"daemon start": map[string]interface{}{
-				"args":        []string{"[--registry <addr>]", "[--beacon <addr>]", "[--listen <addr>]", "[--identity <path>]", "[--email <addr>]", "[--hostname <name>]", "[--log-level <level>]", "[--public]", "[--foreground]", "[--socket <path>]"},
-				"description": "Start the daemon as a background process. Blocks until registered, then exits",
-				"returns":     "node_id, address, pid, socket, hostname, log_file",
+				"args":        []string{"[--registry <addr>]", "[--beacon <addr>]", "[--listen <addr>]", "[--identity <path>]", "[--email <addr>]", "[--hostname <name>]", "[--log-level <level>]", "[--public]", "[--foreground]", "[--socket <path>]", "[--transport <udp|compat|auto>]", "[--proxy <auto|off|URL>]"},
+				"description": "Start the daemon as a background process. Blocks until registered, then exits. The default transport is auto: UDP when it works, else compat (TLS/WSS over TCP 443 only, through $HTTPS_PROXY when set) — so UDP-blocked and proxy-only hosts work without flags. --transport udp|compat (or config transport / $PILOT_TRANSPORT) forces one",
+				"returns":     "node_id, address, pid, socket, hostname, log_file, transport (as the daemon reported it), transport_auto (when auto chose it), proxy (when set, credentials redacted)",
 			},
 			"daemon stop": map[string]interface{}{
 				"args":        []string{},
@@ -2378,7 +2487,7 @@ func contextCatalog() map[string]interface{} {
 
 			// Messaging
 			"send-message": map[string]interface{}{
-				"args":        []string{"<address|hostname>", "--data <text>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]"},
+				"args":        []string{"<address|hostname>", "--data <text>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]"},
 				"description": "Send a typed message to a node via data exchange (port 1001). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Default type: text",
 				"returns":     "target, to, type, bytes, ack, reuse_conn",
 			},
@@ -2550,8 +2659,11 @@ func contextCatalog() map[string]interface{} {
 			"--json": "Output structured JSON for all commands. Success: {status:ok, data:{...}}. Error: {status:error, code:string, message:string}",
 		},
 		"environment": map[string]interface{}{
-			"PILOT_REGISTRY": "Registry address (default: 34.71.57.205:9000)",
-			"PILOT_SOCKET":   "Daemon socket path (default: /tmp/pilot.sock)",
+			"PILOT_REGISTRY":  "Registry address (default: 34.71.57.205:9000)",
+			"PILOT_SOCKET":    "Daemon socket path (default: /tmp/pilot.sock)",
+			"PILOT_TRANSPORT": "daemon start transport: udp, compat (TCP 443 only) or auto",
+			"PILOT_PROXY":     "proxy policy: auto, off, or http(s)://[user:pass@]host:port (beats config.json)",
+			"HTTPS_PROXY":     "proxy for compat mode (proxy=auto) and pilotctl's own connections; forwarded to the daemon",
 		},
 		"config_file": "~/.pilot/config.json",
 	}
@@ -2669,17 +2781,56 @@ func gatewayBinaryPath() string {
 	return path
 }
 
+// daemonLaunchPlan is everything `pilotctl daemon start` hands to
+// pilot-daemon: its argv (without argv[0]) plus the values that travel in
+// the child environment instead of on the command line.
+type daemonLaunchPlan struct {
+	Args       []string
+	SocketPath string
+	// AdminToken is passed as $PILOT_ADMIN_TOKEN, never on argv (PILOT-290).
+	AdminToken string
+	// Transport is the resolved --transport ("" = not configured:
+	// cmdDaemonStart asks a daemon that supports it for auto).
+	Transport string
+	// Proxy is the resolved --proxy ("" = daemon default, auto).
+	Proxy string
+	// ProxyEnv is non-empty when Proxy carries credentials: it is handed to
+	// the daemon as $PILOT_PROXY instead of -proxy on argv (PILOT-290).
+	ProxyEnv string
+	// ProxyCmd is --proxy-cmd: handed to the daemon as $PILOT_PROXY_CMD
+	// (never on argv), where it beats config.json "proxy_cmd".
+	ProxyCmd string
+}
+
 // buildDaemonArgs translates pilotctl-style flags into pilot-daemon CLI
 // args, applying defaults from ~/.pilot/config.json when CLI flags are
 // unset. This keeps existing pilotctl invocations working unchanged —
 // the only difference is that the daemon runs in a separate
 // `pilot-daemon` process rather than re-execing pilotctl.
 func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adminToken string) {
+	plan := planDaemonLaunch(args)
+	return plan.Args, plan.SocketPath, plan.AdminToken
+}
+
+// planDaemonLaunch resolves pilotctl flags, environment and config.json into
+// a daemonLaunchPlan. Precedence for every setting is CLI flag, then (where
+// one exists) its environment variable, then config.json, then the daemon's
+// own default.
+func planDaemonLaunch(args []string) daemonLaunchPlan {
 	flags, _ := parseFlags(args)
 
 	cfg := loadConfig()
 
-	socketPath = flagString(flags, "socket", "")
+	transport, err := resolveDaemonTransport(flags, cfg)
+	if err != nil {
+		fatalCode("invalid_argument", "daemon start: %v", err)
+	}
+	proxy, err := resolveDaemonProxy(flags, cfg)
+	if err != nil {
+		fatalCode("invalid_argument", "daemon start: %v", err)
+	}
+
+	socketPath := flagString(flags, "socket", "")
 	if socketPath == "" {
 		socketPath = getSocket()
 	}
@@ -2707,7 +2858,17 @@ func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adm
 			hostname = h
 		}
 	}
-	encrypt := !flagBool(flags, "no-encrypt")
+	encrypt := true
+	if value, ok := cfg["encrypt"]; ok {
+		parsed, err := strconv.ParseBool(fmt.Sprint(value))
+		if err != nil {
+			fatalCode("invalid_argument", "config: encrypt must be true or false")
+		}
+		encrypt = parsed
+	}
+	if flagBool(flags, "no-encrypt") {
+		encrypt = false
+	}
 	identityPath := flagString(flags, "identity", "")
 	if identityPath == "" {
 		identityPath = configDir() + "/identity.json"
@@ -2732,7 +2893,7 @@ func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adm
 			webhookURL = w
 		}
 	}
-	adminToken = flagString(flags, "admin-token", "")
+	adminToken := flagString(flags, "admin-token", "")
 	if adminToken == "" {
 		if a, ok := cfg["admin_token"].(string); ok {
 			adminToken = a
@@ -2745,24 +2906,27 @@ func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adm
 		}
 	}
 	trustAutoApprove := flagBool(flags, "trust-auto-approve")
-	enterpriseControl := flagString(flags, "enterprise-control", "")
-	if enterpriseControl == "" {
-		if value, ok := cfg["enterprise_control"].(string); ok {
-			enterpriseControl = strings.TrimSpace(value)
-		}
-	}
 
-	daemonArgs = []string{
-		"--registry", registryAddr,
-		"--beacon", beaconAddr,
+	var daemonArgs []string
+	// In compat mode the raw-TCP production registry/beacon defaults are
+	// left off argv so pilot-daemon applies its 443-only compat defaults
+	// (registry.pilotprotocol.network:443 over TLS). Any other address is
+	// an operator choice and is forwarded verbatim.
+	if !compatSkipsDefault(transport, registryAddr, productionRegistryAddr) {
+		daemonArgs = append(daemonArgs, "--registry", registryAddr)
+	}
+	if !compatSkipsDefault(transport, beaconAddr, productionBeaconAddr) {
+		daemonArgs = append(daemonArgs, "--beacon", beaconAddr)
+	}
+	daemonArgs = append(daemonArgs,
 		"--listen", listenAddr,
 		"--socket", socketPath,
 		"--identity", identityPath,
 		"--log-level", logLevel,
 		"--log-format", logFormat,
-	}
+	)
 	// pilot-daemon's encrypt flag defaults to true; pass `=false`
-	// only when --no-encrypt was supplied.
+	// when disabled through config or --no-encrypt.
 	if !encrypt {
 		daemonArgs = append(daemonArgs, "--encrypt=false")
 	}
@@ -2789,10 +2953,37 @@ func buildDaemonArgs(args []string) (daemonArgs []string, socketPath string, adm
 	if trustAutoApprove {
 		daemonArgs = append(daemonArgs, "--trust-auto-approve")
 	}
-	if enterpriseControl != "" {
-		daemonArgs = append(daemonArgs, "--enterprise-control", enterpriseControl)
+	// Daemon flags that are forwarded only when given, so a plain
+	// `daemon start` keeps the daemon's own defaults. --endpoint and the
+	// motd pair were documented here for a long time but never forwarded.
+	for _, name := range []string{"endpoint", "compat-beacon", "registry-trust", "registry-fingerprint", "tls-trust", "motd-feed-url", "motd-interval"} {
+		if v, ok := flags[name]; ok {
+			daemonArgs = append(daemonArgs, "--"+name, v)
+		}
 	}
-	return daemonArgs, socketPath, adminToken
+	// --transport / --proxy are passed only when set, so a new pilotctl
+	// still starts an older daemon that predates them (cmdDaemonStart
+	// additionally drops any the daemon binary does not define).
+	if transport != "" {
+		daemonArgs = append(daemonArgs, "--transport", transport)
+	}
+	proxyEnv := ""
+	if proxy != "" {
+		if proxyHasCredentials(proxy) {
+			proxyEnv = proxy
+		} else {
+			daemonArgs = append(daemonArgs, "--proxy", proxy)
+		}
+	}
+	return daemonLaunchPlan{
+		Args:       daemonArgs,
+		SocketPath: socketPath,
+		AdminToken: adminToken,
+		Transport:  transport,
+		Proxy:      proxy,
+		ProxyEnv:   proxyEnv,
+		ProxyCmd:   strings.TrimSpace(flagString(flags, "proxy-cmd", "")),
+	}
 }
 
 // launchdAgentLabels enumerates known launchd labels for the daemon.
@@ -2850,11 +3041,27 @@ func launchdAgentLoaded(label string) bool {
 func cmdDaemonStart(args []string) {
 	flags, _ := parseFlags(args)
 
+	// Resolve (and validate) the launch before touching the PID file, so a
+	// bad --transport / --proxy fails fast with nothing to clean up.
+	plan := planDaemonLaunch(args)
+
 	// macOS install.sh installs a launchd plist. When present, route start
 	// through launchctl so the agent is registered and KeepAlive supervises
 	// the process; otherwise `pilotctl daemon stop` would have nothing to
 	// stop (KeepAlive immediately respawns) and the user sees flapping.
 	if plist, label := launchdAgentPlist(); plist != "" {
+		// launchd starts the daemon from the plist's ProgramArguments and
+		// its own environment: neither CLI flags nor this shell's proxy
+		// variables reach it. The daemon does read config.json itself.
+		if _, ok := flags["transport"]; ok && !jsonOutput {
+			fmt.Fprintf(os.Stderr, "warning: --transport is not applied to the launchd-managed daemon; persist it with: pilotctl config --set transport=%s\n", plan.Transport)
+		}
+		if _, ok := flags["proxy"]; ok && !jsonOutput {
+			fmt.Fprintf(os.Stderr, "warning: --proxy is not applied to the launchd-managed daemon; persist it with: pilotctl config --set proxy=<auto|off|URL>\n")
+		}
+		if _, ok := flags["proxy-cmd"]; ok && !jsonOutput {
+			fmt.Fprintf(os.Stderr, "warning: --proxy-cmd is not applied to the launchd-managed daemon; persist it with: pilotctl config --set proxy_cmd=<command>\n")
+		}
 		if launchdAgentLoaded(label) {
 			fatalHint("already_exists",
 				"stop it first with: pilotctl daemon stop",
@@ -2913,6 +3120,10 @@ func cmdDaemonStart(args []string) {
 	// Atomically claim the PID file to prevent concurrent daemon starts.
 	// O_CREAT|O_EXCL ensures only one pilotctl daemon start can succeed;
 	// a second concurrent invocation fails here before spawning a daemon.
+	// The config dir must exist first: on a fresh HOME (no `pilotctl init`,
+	// no ~/.pilot/bin) the open failed with ENOENT and was misreported as
+	// "PID file locked" on every attempt.
+	_ = os.MkdirAll(configDir(), 0700)
 	if f, err := os.OpenFile(pidFilePath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600); err != nil {
 		fatalHint("already_exists",
 			"stop it first with: pilotctl daemon stop",
@@ -2922,7 +3133,7 @@ func cmdDaemonStart(args []string) {
 		f.Close()
 	}
 
-	daemonArgs, socketPath, adminToken := buildDaemonArgs(args)
+	socketPath := plan.SocketPath
 
 	// Clean up stale socket
 	if _, err := os.Stat(socketPath); err == nil {
@@ -2939,6 +3150,30 @@ func cmdDaemonStart(args []string) {
 	}
 
 	daemonBin := daemonBinaryPath()
+	// Fit the launch to the daemon binary (probed once): never hand an
+	// older daemon a flag or value it does not define — Go's flag package
+	// would abort it on startup — and ask a current one for
+	// -transport=auto when no transport is configured.
+	daemonArgs, proxyEnv, requestedTransport := adaptDaemonArgs(daemonBin, plan)
+	daemonEnv := daemonChildEnv(os.Environ(), plan.AdminToken, proxyEnv, requestedTransport)
+	// --proxy-cmd travels as $PILOT_PROXY_CMD (a command can embed
+	// secrets; argv is world-readable), where it beats config.json.
+	if plan.ProxyCmd != "" {
+		if f := daemonFlags(daemonBin); f != nil && !f["proxy-cmd"] {
+			if !jsonOutput {
+				fmt.Fprintf(os.Stderr, "warning: %s does not support -proxy-cmd (older pilot-daemon); --proxy-cmd will not be used — upgrade pilot-daemon to use it\n", daemonBin)
+			}
+		} else {
+			daemonEnv = setEnv(daemonEnv, proxyconf.EnvRefreshCommand, plan.ProxyCmd)
+		}
+	}
+	// In a sandbox whose proxy credentials rotate, have the daemon re-read
+	// them (see sandboxProxyCmdFor) even when no installer saved proxy_cmd.
+	sandboxRefresh := false
+	if c := sandboxProxyCmdFor(daemonBin, plan, flags); c != "" {
+		daemonEnv = setEnv(daemonEnv, proxyconf.EnvRefreshCommand, c)
+		sandboxRefresh = true
+	}
 
 	// --foreground: replace the current process so signal/lifetime
 	// handling matches what the user expects from systemd unit files
@@ -2953,14 +3188,10 @@ func cmdDaemonStart(args []string) {
 		// locked"), an unrecoverable restart loop under systemd.
 		_ = os.WriteFile(pidFilePath(), []byte(strconv.Itoa(os.Getpid())+"\n"), 0600)
 		// syscall.Exec needs argv[0] to be the binary name. Pass the
-		// full env. Inject PILOT_ADMIN_TOKEN so the daemon doesn't
-		// need the token on its argv (PILOT-290).
+		// full env (daemonChildEnv) — it carries PILOT_ADMIN_TOKEN so the
+		// daemon doesn't need the token on its argv (PILOT-290).
 		execArgs := append([]string{daemonBin}, daemonArgs...)
-		env := os.Environ()
-		if adminToken != "" {
-			env = append(env, "PILOT_ADMIN_TOKEN="+adminToken)
-		}
-		if err := syscall.Exec(daemonBin, execArgs, env); err != nil {
+		if err := syscall.Exec(daemonBin, execArgs, daemonEnv); err != nil { // #nosec G204 G702 -- daemonBin is pilotctl's sibling pilot-daemon or the operator's PILOT_DAEMON_BIN
 			fatalCode("internal", "exec %s: %v", daemonBin, err)
 		}
 		return
@@ -2985,15 +3216,19 @@ func cmdDaemonStart(args []string) {
 	proc.Stdout = logFile
 	proc.Stderr = logFile
 	proc.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	// Pass admin token via env, not argv, to avoid leaking in
+	// Full environment plus overrides (daemonChildEnv): the proxy
+	// variables in daemonForwardEnv must reach the daemon, and the admin
+	// token travels via env, not argv, to avoid leaking in
 	// /proc/<pid>/cmdline (PILOT-290).
-	if adminToken != "" {
-		proc.Env = append(os.Environ(), "PILOT_ADMIN_TOKEN="+adminToken)
-	}
+	proc.Env = daemonEnv
 
 	if err := proc.Start(); err != nil {
 		fatalCode("internal", "start daemon: %v", err)
 	}
+	// Notice a daemon that exits during startup (a fatal -proxy, registry
+	// or compat error) instead of polling its socket until the deadline.
+	exited := make(chan error, 1)
+	go func() { exited <- proc.Wait() }()
 
 	pid := proc.Process.Pid
 	os.WriteFile(pidFilePath(), []byte(strconv.Itoa(pid)), 0600)
@@ -3020,12 +3255,26 @@ func cmdDaemonStart(args []string) {
 		fmt.Fprintf(os.Stderr, "starting daemon (pid %d, socket %s)...", pid, socketPath)
 	}
 
-	// Wait for daemon to become ready (socket appears and responds)
-	waitDur := flagDuration(flags, "wait", 15*time.Second)
+	// Wait for daemon to become ready (socket appears and responds).
+	// compat (and auto, which may pick it) registers over TLS and brings
+	// up the WSS tunnel, possibly through a proxy: allow it more time.
+	defaultWait := 15 * time.Second
+	if requestedTransport == "compat" || requestedTransport == "auto" {
+		defaultWait = 30 * time.Second
+	}
+	waitDur := flagDuration(flags, "wait", defaultWait)
 	deadline := time.Now().Add(waitDur)
 	dots := 0
 	for time.Now().Before(deadline) {
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case werr := <-exited:
+			if !jsonOutput {
+				fmt.Fprintln(os.Stderr) // end the dots line
+			}
+			_ = os.Remove(pidFilePath())
+			reportDaemonStartFailure(pid, pidLogPath, daemonExitStatus(werr), 0, proxyCmdSource(plan, flags, pidLogPath, sandboxRefresh))
+		case <-time.After(200 * time.Millisecond):
+		}
 		dots++
 		if !jsonOutput && dots%5 == 0 { // every second
 			fmt.Fprint(os.Stderr, ".")
@@ -3047,19 +3296,49 @@ func cmdDaemonStart(args []string) {
 		address := info["address"]
 		hn, _ := info["hostname"].(string)
 		if jsonOutput {
-			outputOK(map[string]interface{}{
+			fields := map[string]interface{}{
 				"pid":      pid,
 				"node_id":  nodeID,
 				"address":  address,
 				"hostname": hn,
 				"socket":   socketPath,
 				"log_file": pidLogPath,
-			})
+			}
+			if t, auto := effectiveTransport(requestedTransport, pidLogPath); t != "" || auto {
+				if t != "" {
+					fields["transport"] = t
+				}
+				if auto {
+					fields["transport_auto"] = true
+				}
+			}
+			if plan.Proxy != "" {
+				fields["proxy"] = redactProxyURL(plan.Proxy)
+			}
+			if sandboxRefresh {
+				fields["proxy_cmd"] = sandboxProxyCmd
+			}
+			if src := proxyCmdSource(plan, flags, pidLogPath, sandboxRefresh); src != "" {
+				fields["proxy_refresh"] = src
+			}
+			outputOK(fields)
 		} else {
 			fmt.Printf("Daemon running (pid %d)\n", pid)
 			fmt.Printf("  Address:  %s\n", address)
 			if hn != "" {
 				fmt.Printf("  Hostname: %s\n", hn)
+			}
+			if t, auto := effectiveTransport(requestedTransport, pidLogPath); t != "" {
+				if auto {
+					t += " (auto)"
+				}
+				fmt.Printf("  Transport: %s\n", t)
+			}
+			if plan.Proxy != "" {
+				fmt.Printf("  Proxy:    %s\n", redactProxyURL(plan.Proxy))
+			}
+			if src := proxyCmdSource(plan, flags, pidLogPath, sandboxRefresh); src != "" {
+				fmt.Printf("  Proxy credentials: re-read every 60s and when the proxy rejects them, for the daemon and its apps (%s)\n", src)
 			}
 			fmt.Printf("  Socket:   %s\n", socketPath)
 			fmt.Printf("  Logs:     %s\n", pidLogPath)
@@ -3071,9 +3350,7 @@ func cmdDaemonStart(args []string) {
 		fmt.Fprintln(os.Stderr) // end the dots line
 	}
 
-	fatalHint("timeout",
-		fmt.Sprintf("check logs: tail -f %s", pidLogPath),
-		"daemon started (pid %d) but did not become ready within %s", pid, waitDur)
+	reportDaemonStartFailure(pid, pidLogPath, "", waitDur, proxyCmdSource(plan, flags, pidLogPath, sandboxRefresh))
 }
 
 func cmdDaemonStop() {
@@ -4228,6 +4505,13 @@ func cmdSendFile(args []string) {
 	if len(pos) < 2 {
 		fatalCode("invalid_argument", "usage: pilotctl send-file <address|hostname> <filepath> [--timeout <dur>]")
 	}
+	// send-file ignores flags it does not know, so a caller still asking
+	// for a governed send must be refused rather than sent ungoverned.
+	for _, name := range []string{"enterprise-control", "governed-resource"} {
+		if _, ok := flags[name]; ok {
+			fatalCode("invalid_argument", "send-file: unknown flag --%s", name)
+		}
+	}
 
 	// Default 90s is comfortable for transfers up to a hundred MiB over
 	// a relay path; users with bigger files or slower peers should bump
@@ -4287,10 +4571,6 @@ func cmdSendFile(args []string) {
 		fatalCode("invalid_argument", "%s is a directory, not a file", filePath)
 	}
 	size := fi.Size()
-	governedOutbound, governedErr := governedOutboundFromFlags(flags)
-	if governedErr != nil {
-		fatalCode("invalid_argument", "governed send-file: %v", governedErr)
-	}
 
 	// Streamed transfer (default): chunked, ACK'd, resumable, end-to-end
 	// SHA-256 verified — no per-frame size cap, and big files no longer
@@ -4299,11 +4579,9 @@ func cmdSendFile(args []string) {
 	// the single-frame TypeFile path when the receiver is too old to
 	// understand TypeFileStream (it never sends an INIT-ACK).
 	if !flagBool(flags, "no-stream") {
-		if res, serr := streamSendFile(d, target, filePath, filename, size, timeout, governedOutbound); serr == nil {
+		if res, serr := streamSendFile(d, target, filePath, filename, size, timeout); serr == nil {
 			outputOK(res)
 			return
-		} else if governedOutbound != nil && errors.Is(serr, dataexchange.ErrStreamUnsupported) {
-			fatalCode("connection_failed", "governed send-file requires a receiver that supports governed streaming; refusing legacy fallback")
 		} else if !errors.Is(serr, dataexchange.ErrStreamUnsupported) {
 			fatalHint("connection_failed",
 				"check reachability: pilotctl ping "+target.String()+" · for very large/slow links raise --timeout",
@@ -4346,27 +4624,7 @@ func cmdSendFile(args []string) {
 	stop := startWaitProgress(fmt.Sprintf("sending %s to %s", filename, target))
 	start := time.Now()
 
-	var governedDecision decision.Decision
-	var governedIntent decision.Intent
-	if governedOutbound != nil {
-		frame := &dataexchange.Frame{Type: dataexchange.TypeFile, Filename: filename, Payload: data}
-		intent, result, authorizeErr := governedOutbound.authorizeFrame(context.Background(), frame)
-		if authorizeErr != nil {
-			stop()
-			fatalCode("permission_denied", "governed send-file: %v", authorizeErr)
-		}
-		governedIntent = intent
-		governedDecision = result
-		if disclosure, found := governedOutbound.disclosure(intent.ID); found {
-			err = client.SendGovernedWithDisclosure(frame, intent, result, disclosure)
-		} else {
-			err = client.SendGoverned(frame, intent, result)
-		}
-	} else {
-		err = client.SendFile(filename, data)
-	}
-	if err != nil {
-		governedOutbound.complete(context.Background(), governedIntent.ID, false, "transport_send_failed")
+	if err := client.SendFile(filename, data); err != nil {
 		stop()
 		fatalCode("connection_failed", "send failed: %v", err)
 	}
@@ -4392,7 +4650,6 @@ func cmdSendFile(args []string) {
 	case res := <-ackCh:
 		ack = res.frame
 		if res.err != nil {
-			governedOutbound.complete(context.Background(), governedIntent.ID, false, "ack_unavailable")
 			stop()
 			// Sender wrote all bytes but never got the receiver's ACK
 			// back (likely receiver crashed or restarted mid-transfer).
@@ -4401,7 +4658,6 @@ func cmdSendFile(args []string) {
 				"send wrote all bytes but no ACK from receiver: %v", res.err)
 		}
 	case <-time.After(timeout):
-		governedOutbound.complete(context.Background(), governedIntent.ID, false, "ack_timeout")
 		stop()
 		// Closing the conn lets the goroutine unwind. We deliberately
 		// don't wait for it here — we've already given the receiver its
@@ -4426,11 +4682,6 @@ func cmdSendFile(args []string) {
 		"elapsed_ms":      elapsed.Milliseconds(),
 		"throughput_mbps": mbps,
 	}
-	if governedOutbound != nil {
-		result["governed"] = true
-		result["decision_id"] = governedDecision.ID
-		result["policy_revision"] = governedDecision.PolicyRevision
-	}
 	if ack != nil {
 		ackText := string(ack.Payload)
 		result["ack"] = ackText
@@ -4438,14 +4689,8 @@ func cmdSendFile(args []string) {
 		// with "ERR " — surface them as a real failure instead of
 		// claiming success (e.g. disk-full, save permission denied).
 		if strings.HasPrefix(ackText, "ERR ") {
-			governedOutbound.completeWithResponse(context.Background(), governedIntent.ID, false, "receiver_rejected", "text/plain", ack.Payload)
 			fatalCode("internal", "receiver rejected file: %s", ackText)
 		}
-	}
-	if ack != nil {
-		governedOutbound.completeWithResponse(context.Background(), governedIntent.ID, true, "", frameContentType(ack.Type), ack.Payload)
-	} else {
-		governedOutbound.complete(context.Background(), governedIntent.ID, true, "")
 	}
 	outputOK(result)
 }
@@ -4455,7 +4700,7 @@ func cmdSendFile(args []string) {
 // dataexchange.ErrStreamUnsupported tells the caller to fall back to the
 // single-frame TypeFile path (the receiver is too old). timeout bounds the
 // wait for any single ACK and for the receiver's final verification.
-func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename string, size int64, timeout time.Duration, governedOutbound *governedOutboundSender) (map[string]interface{}, error) {
+func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename string, size int64, timeout time.Duration) (map[string]interface{}, error) {
 	client, err := dataexchange.Dial(d, target)
 	if err != nil {
 		return nil, err
@@ -4470,53 +4715,14 @@ func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename s
 
 	stop := startWaitProgress(fmt.Sprintf("streaming %s to %s", filename, target))
 	start := time.Now()
-	var governedDecision decision.Decision
-	var governedIntent decision.Intent
-	var res *dataexchange.StreamResult
-	var serr error
-	if governedOutbound != nil {
-		if governedOutbound.hook != nil && governedOutbound.contentBuilder != nil {
-			if size > maxInlineHostedFederationBytes {
-				return nil, fmt.Errorf("hosted federation currently accepts files up to %d bytes; use an unmanaged transfer or split the file", maxInlineHostedFederationBytes)
-			}
-			body, readErr := io.ReadAll(io.LimitReader(f, maxInlineHostedFederationBytes+1))
-			if readErr != nil {
-				return nil, readErr
-			}
-			if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
-				return nil, seekErr
-			}
-			res, serr = client.SendGovernedFileStreamWithDisclosureAuthorizer(filename, f, size, func(initPayload []byte) (decision.Intent, decision.Decision, decision.DisclosureBinding, error) {
-				intent, result, disclosure, authorizeErr := governedOutbound.authorizeFederatedStream(context.Background(), initPayload, body)
-				if authorizeErr == nil {
-					governedIntent = intent
-					governedDecision = result
-				}
-				return intent, result, disclosure, authorizeErr
-			}, timeout)
-		} else {
-			res, serr = client.SendGovernedFileStreamWithAuthorizer(filename, f, size, func(initPayload []byte) (decision.Intent, decision.Decision, error) {
-				intent, result, authorizeErr := governedOutbound.authorizeStream(context.Background(), initPayload)
-				if authorizeErr == nil {
-					governedIntent = intent
-					governedDecision = result
-				}
-				return intent, result, authorizeErr
-			}, timeout)
-		}
-	} else {
-		res, serr = client.SendFileStream(filename, f, size, timeout)
-	}
+	res, serr := client.SendFileStream(filename, f, size, timeout)
 	stop()
 	if serr != nil {
-		governedOutbound.complete(context.Background(), governedIntent.ID, false, "stream_failed")
 		return nil, serr
 	}
 	if !res.OK {
-		governedOutbound.complete(context.Background(), governedIntent.ID, false, "receiver_rejected")
 		return nil, fmt.Errorf("receiver rejected file: %s", res.Message)
 	}
-	governedOutbound.completeWithResponse(context.Background(), governedIntent.ID, true, "", "text/plain", []byte(res.Message))
 
 	elapsed := time.Since(start)
 	mbps := 0.0
@@ -4535,18 +4741,34 @@ func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename s
 		"transport":       "filestream",
 		"verified":        res.OK,
 	}
-	if governedOutbound != nil {
-		result["governed"] = true
-		result["decision_id"] = governedDecision.ID
-		result["policy_revision"] = governedDecision.PolicyRevision
-	}
 	return result, nil
 }
 
 func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
-	if len(pos) < 1 {
-		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--enterprise-control <path> --governed-resource <receiver-resource>]")
+	for name := range flags {
+		switch name {
+		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
+		default:
+			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
+		}
+	}
+	// The CLI owns a hard wall-clock budget: driver and registry requests,
+	// handshakes, policy decisions, ACKs and inbox polling can all block.
+	// Exiting closes the IPC session, cancelling its outstanding daemon work.
+	// --wait retains its reply-only meaning; --timeout caps the entire command.
+	if raw, ok := flags["timeout"]; ok {
+		timeout, err := time.ParseDuration(raw)
+		if err != nil || timeout <= 0 {
+			fatalCode("invalid_argument", "--timeout must be a positive duration")
+		}
+		timer := time.AfterFunc(timeout, func() {
+			fatalHint("timeout", "delivery may already have occurred; check the inbox before retrying", "send-message exceeded total timeout %s", timeout)
+		})
+		defer timer.Stop()
+	}
+	if len(pos) != 1 {
+		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend]")
 	}
 
 	sendCount := flagInt(flags, "count", 1)
@@ -4559,7 +4781,11 @@ func cmdSendMessage(args []string) {
 		if raw == "true" {
 			waitDur = 30 * time.Second
 		} else {
-			waitDur = flagDuration(flags, "wait", 30*time.Second)
+			var err error
+			waitDur, err = time.ParseDuration(raw)
+			if err != nil || waitDur <= 0 {
+				fatalCode("invalid_argument", "--wait must be a positive duration")
+			}
 		}
 	}
 
@@ -4588,7 +4814,8 @@ func cmdSendMessage(args []string) {
 
 	d := connectDriver()
 	tracef("connectDriver")
-	defer d.Close()
+	// d may be replaced by a fresh connection when a dial is retried.
+	defer func() { d.Close() }()
 
 	target, err := parseAddrOrHostname(d, pos[0])
 	tracef("parseAddrOrHostname")
@@ -4602,6 +4829,14 @@ func cmdSendMessage(args []string) {
 	}
 	msgType := flagString(flags, "type", "text")
 
+	// First contact: the daemon holds no session with the peer yet, so this
+	// command builds the whole path (see firstcontact.go). Checked before
+	// anything is sent.
+	firstContact := false
+	if info, err := d.Info(); err == nil {
+		firstContact = !peerSessionUp(info, target.Node)
+	}
+
 	// Auto-handshake to peers in the embedded trusted-agents list.
 	// Best-effort: warns on stderr and continues if handshake fails.
 	maybeAutoHandshake(d, target, flagBool(flags, "no-auto-handshake"))
@@ -4614,13 +4849,6 @@ func cmdSendMessage(args []string) {
 	}[msgType]
 	if innerType == 0 && msgType != "text" {
 		fatalCode("invalid_argument", "unknown type %q (use text, json, or binary)", msgType)
-	}
-	governedOutbound, governedErr := governedOutboundFromFlags(flags)
-	if governedErr != nil {
-		fatalCode("invalid_argument", "governed send-message: %v", governedErr)
-	}
-	if governedOutbound != nil && traceTime {
-		fatalCode("invalid_argument", "--trace is unavailable with --enterprise-control because trace frames are not governed")
 	}
 
 	// dialOnce opens a fresh data-exchange connection and returns it. Used
@@ -4643,20 +4871,7 @@ func cmdSendMessage(args []string) {
 	sendOne := func(cl *dataexchange.Client, seq int, reused bool) map[string]interface{} {
 		var sentAtNs int64
 		var sendErr error
-		var governedIntent decision.Intent
-		var governedDecision decision.Decision
-		if governedOutbound != nil {
-			frame := &dataexchange.Frame{Type: innerType, Payload: []byte(data)}
-			governedIntent, governedDecision, sendErr = governedOutbound.authorizeFrame(context.Background(), frame)
-			if sendErr == nil {
-				if disclosure, found := governedOutbound.disclosure(governedIntent.ID); found {
-					sendErr = cl.SendGovernedWithDisclosure(frame, governedIntent, governedDecision, disclosure)
-				} else {
-					sendErr = cl.SendGoverned(frame, governedIntent, governedDecision)
-				}
-			}
-			sentAtNs = time.Now().UnixNano()
-		} else if traceTime {
+		if traceTime {
 			sentAtNs, sendErr = cl.SendTrace(innerType, []byte(data))
 		} else {
 			sendStart := time.Now()
@@ -4671,7 +4886,6 @@ func cmdSendMessage(args []string) {
 			sentAtNs = sendStart.UnixNano()
 		}
 		if sendErr != nil {
-			governedOutbound.complete(context.Background(), governedIntent.ID, false, "transport_send_failed")
 			return map[string]interface{}{"seq": seq, "error": sendErr.Error()}
 		}
 
@@ -4679,26 +4893,12 @@ func cmdSendMessage(args []string) {
 		ackRecvAtNs := time.Now().UnixNano()
 		if ackErr != nil {
 			slog.Debug("send-message ACK read failed", "err", ackErr)
-			governedOutbound.complete(context.Background(), governedIntent.ID, false, "ack_unavailable")
-		} else if ack != nil && strings.HasPrefix(string(ack.Payload), "ERR ") {
-			governedOutbound.completeWithResponse(context.Background(), governedIntent.ID, false, "receiver_rejected", frameContentType(ack.Type), ack.Payload)
-		} else {
-			if ack != nil {
-				governedOutbound.completeWithResponse(context.Background(), governedIntent.ID, true, "", frameContentType(ack.Type), ack.Payload)
-			} else {
-				governedOutbound.complete(context.Background(), governedIntent.ID, true, "")
-			}
 		}
 
 		r := map[string]interface{}{
 			"seq":    seq,
 			"bytes":  len(data),
 			"reused": reused,
-		}
-		if governedOutbound != nil && sendErr == nil {
-			r["governed"] = true
-			r["decision_id"] = governedDecision.ID
-			r["policy_revision"] = governedDecision.PolicyRevision
 		}
 		if ack != nil {
 			r["ack"] = string(ack.Payload)
@@ -4730,23 +4930,50 @@ func cmdSendMessage(args []string) {
 	}
 	tracef("dial+send")
 
-	// Snapshot time before the send so --wait can find replies that arrive
-	// after this point even if the filesystem has 1-second mtime granularity.
-	inboxCutoff := time.Now().Add(-time.Second)
 	// agentHint is the resolved pilot address used to filter inbox replies
 	// against the "from" field written by the daemon when it saves the message.
 	agentHint := target.String()
+	// Snapshot the inbox before the send so --wait only takes a reply that
+	// arrives after it (never one already sitting there).
+	var watch *inboxWatch
+	if waitDur > 0 {
+		watch = newInboxWatch(agentHint)
+	}
 
 	if sendCount == 1 {
-		cl := dialOnce()
+		// On first contact a dial can fail while the path is still
+		// converging (a busy peer finishing the key exchange); dial once
+		// more before giving up, and say which step failed if it does.
+		dialStart := time.Now()
+		dialAttempts := 0
+		var cl *dataexchange.Client
+		for cl == nil {
+			dialAttempts++
+			c, err := dataexchange.Dial(d, target)
+			if err == nil {
+				cl = c
+				break
+			}
+			if firstContact && dialAttempts < 2 && isConvergingDialError(err) {
+				if isDriverSideTimeout(err) {
+					// The SDK gave up waiting, the daemon may still be
+					// dialing: use a fresh connection so a late reply to
+					// the first dial cannot be taken for the second.
+					d.Close()
+					d = connectDriver()
+				}
+				if !jsonOutput {
+					fmt.Fprintf(os.Stderr, "path to %s still converging (%v); dialing again...\n", pos[0], err)
+				}
+				continue
+			}
+			fatalHint("connection_failed", dialFailureHint(pos[0], err, dialAttempts, time.Since(dialStart)),
+				"cannot connect to %s (data exchange port %d)", target, protocol.PortDataExchange)
+		}
 		tracef("dataexchange.Dial")
 		defer cl.Close()
 		r := sendOne(cl, 0, false)
-		if governedOutbound != nil {
-			if message, failed := r["error"].(string); failed {
-				fatalCode("permission_denied", "governed send-message: %s", message)
-			}
-		}
+		ackAt := time.Now()
 		result := map[string]interface{}{
 			"target": target.String(),
 			"to":     target.String(),
@@ -4758,31 +4985,81 @@ func cmdSendMessage(args []string) {
 		if len(traceEvents) > 0 {
 			result["trace"] = traceEvents
 		}
+		if firstContact {
+			result["first_contact"] = true
+		}
+		if dialAttempts > 1 {
+			result["dial_attempts"] = dialAttempts
+		}
 		if waitDur > 0 {
+			cfg := replyWait{wait: waitDur}
+			cfg.observe = func() int {
+				if info, err := d.Info(); err == nil {
+					return replyConnsFrom(info, agentHint)
+				}
+				return 0
+			}
+			// First contact: the service answers once, on a new connection
+			// it dials back, and that one reply is easily lost while its
+			// side of the new path is still settling (measured: the query
+			// then succeeded on the next attempt). Send the request once
+			// more on a new stream if nothing arrived by mid-window.
+			// --no-resend opts out for requests that are not safe to
+			// repeat.
+			_, sendFailed := r["error"]
+			if firstContact && !sendFailed && !flagBool(flags, "no-resend") {
+				if after := resendDelay(waitDur); after > 0 {
+					cfg.resendAfter = after
+					cfg.resend = func() (time.Time, error) {
+						rd, err := driver.Connect(getSocket())
+						if err != nil {
+							return time.Time{}, err
+						}
+						defer rd.Close()
+						c, err := dataexchange.Dial(rd, target)
+						if err != nil {
+							return time.Time{}, err
+						}
+						defer c.Close()
+						rr := sendOne(c, 1, false)
+						if e, failed := rr["error"].(string); failed {
+							return time.Time{}, errors.New(e)
+						}
+						if !jsonOutput {
+							fmt.Fprintf(os.Stderr, "no reply yet from %s; request sent again on a new stream\n", pos[0])
+						}
+						return time.Now(), nil
+					}
+				}
+			}
+			waitReply := func() map[string]interface{} {
+				stop := startWaitProgress("waiting for reply")
+				out, err := awaitReply(watch, ackAt, cfg)
+				stop()
+				if err != nil {
+					fatalCode("internal", "%v", err)
+				}
+				if out.resent {
+					result["resent"] = true
+				}
+				if out.reply == nil {
+					fatalHint("timeout", replyTimeoutHint(pos[0], out, firstContact), "%v", errNoReply(agentHint, waitDur))
+				}
+				result["reply_after_ms"] = out.waited.Milliseconds()
+				return out.reply
+			}
 			// Defer all output until the reply is in (or times out) so that
 			// --json emits a SINGLE document: a machine parser reading stdout
 			// must not see the send-result object followed by a second reply
 			// object. In JSON mode we fold the reply into one envelope; in
 			// human mode we still print the send result first, then the reply.
 			if jsonOutput {
-				stop := startWaitProgress("waiting for reply")
-				reply, err := waitForInboxReply(agentHint, inboxCutoff, waitDur)
-				stop()
-				if err != nil {
-					fatalCode("timeout", "%v", err)
-				}
-				result["reply"] = reply
+				result["reply"] = waitReply()
 				outputOK(result)
 			} else {
 				outputOK(result)
 				fmt.Fprintf(os.Stderr, "waiting for reply from %s (up to %s)...\n", pos[0], waitDur)
-				stop := startWaitProgress("waiting for reply")
-				reply, err := waitForInboxReply(agentHint, inboxCutoff, waitDur)
-				stop()
-				if err != nil {
-					fatalCode("timeout", "%v", err)
-				}
-				output(reply)
+				output(waitReply())
 			}
 		} else {
 			outputOK(result)
@@ -4796,11 +5073,6 @@ func cmdSendMessage(args []string) {
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
 			result := sendOne(cl, i, i > 0)
-			if governedOutbound != nil {
-				if message, failed := result["error"].(string); failed {
-					fatalCode("permission_denied", "governed send-message: %s", message)
-				}
-			}
 			results = append(results, result)
 			if i < sendCount-1 {
 				time.Sleep(50 * time.Millisecond)
@@ -4820,12 +5092,6 @@ func cmdSendMessage(args []string) {
 		for i := 0; i < sendCount; i++ {
 			cl := dialOnce()
 			result := sendOne(cl, i, false)
-			if governedOutbound != nil {
-				if message, failed := result["error"].(string); failed {
-					_ = cl.Close()
-					fatalCode("permission_denied", "governed send-message: %s", message)
-				}
-			}
 			results = append(results, result)
 			cl.Close()
 			if i < sendCount-1 {
@@ -6619,52 +6885,25 @@ func cmdReceived(args []string) {
 	fmt.Println(sDim("filters: --since <dur> --limit <n> (0 = all) · clear: --clear [--before 24h] · json: --json"))
 }
 
-// cmdInbox lists or clears messages received via data exchange (port 1001).
 // waitForInboxReply polls ~/.pilot/inbox/ until a JSON file arrives that is
-// newer than cutoff and (if agentHint is non-empty) has a matching "agent"
-// field. Returns the parsed message or an error on timeout.
+// newer than cutoff and (if agentHint is non-empty) has a matching "from"
+// field, taking the oldest such file. Returns the parsed message or an
+// error on timeout. send-message --wait uses inboxWatch directly, which
+// also ignores files that were already in the inbox before the send.
 func waitForInboxReply(agentHint string, cutoff time.Time, timeout time.Duration) (map[string]interface{}, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Join(home, ".pilot", "inbox")
+	w := &inboxWatch{from: agentHint, cutoff: cutoff, seen: map[string]bool{}}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		entries, err := os.ReadDir(dir)
-		if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("read inbox: %w", err)
+		msg, err := w.poll()
+		if err != nil {
+			return nil, err
 		}
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			info, err := e.Info()
-			if err != nil {
-				continue
-			}
-			if !info.ModTime().After(cutoff) {
-				continue
-			}
-			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
-			if err != nil {
-				continue
-			}
-			var msg map[string]interface{}
-			if json.Unmarshal(data, &msg) != nil {
-				continue
-			}
-			if agentHint != "" {
-				from, _ := msg["from"].(string)
-				if from != agentHint {
-					continue
-				}
-			}
+		if msg != nil {
 			return msg, nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("no reply from %q within %s", agentHint, timeout)
+	return nil, errNoReply(agentHint, timeout)
 }
 
 // inboxMessage is one parsed inbox entry plus its stable ID — the filename

@@ -124,7 +124,6 @@ func TestCommandHelpRegistryHasCriticalKeys(t *testing.T) {
 		"listen", "find", "handshake", "peers", "inbox", "info", "health",
 		"daemon start", "daemon stop", "daemon status",
 		"init", "config", "version", "context",
-		"enterprise",
 		"network", "trust", "trusted", "pending", "approve", "reject", "untrust",
 		"appstore",
 	}

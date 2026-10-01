@@ -27,9 +27,6 @@ type daemonSecurityOptions struct {
 	SkillinjectVerificationKeyFound bool
 	MOTDFeedURL                     string
 	WebhookURL                      string
-	EnterpriseControlPath           string
-	DisableDataExchange             bool
-	DisableEventStream              bool
 }
 
 func applyDaemonSecurityProfile(name string, o *daemonSecurityOptions) error {
@@ -68,11 +65,6 @@ func applyDaemonSecurityProfile(name string, o *daemonSecurityOptions) error {
 		if o.WebhookURL != "" {
 			if err := requireSecureOrLoopbackURL(o.WebhookURL); err != nil {
 				return fmt.Errorf("enterprise webhook: %w", err)
-			}
-		}
-		if !o.DisableDataExchange || !o.DisableEventStream {
-			if strings.TrimSpace(o.EnterpriseControlPath) == "" {
-				return fmt.Errorf("enterprise profile requires -enterprise-control while data exchange or event stream is enabled")
 			}
 		}
 		return nil
