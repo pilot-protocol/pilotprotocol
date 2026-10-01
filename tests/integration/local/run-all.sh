@@ -25,6 +25,14 @@
 
 cd "$(dirname "$0")" || exit 1
 
+# Many tests bound a host-side command with timeout(1), which macOS does
+# not ship. Without it each of those calls fails with "command not found"
+# and the test reports a product failure. Fall back to the bundled shim.
+if ! command -v timeout >/dev/null 2>&1; then
+    PATH="$PWD/shims:$PATH"
+    export PATH
+fi
+
 JOBS=8
 LIST_ONLY=0
 PATTERNS=""
@@ -68,9 +76,12 @@ $f"
     TESTS=$(printf '%s\n' "$TESTS" | sed '/^$/d' | sort -u)
 fi
 
-# Always exclude: the runner itself, the in-container p2p driver, and the
-# python SDK test.
-TESTS=$(printf '%s\n' "$TESTS" | grep -v '^run-all\.sh$' | grep -v '^test_p2p\.sh$' | grep -v '^test_sdk\.py$')
+# Always exclude: the runner itself, the in-container p2p driver, the
+# python SDK test, and test_cli.sh. test_cli.sh is the in-container driver
+# for the Dockerfile image: run on the host it starts with
+# `pkill -9 -f pilot-daemon` and then launches a daemon against the public
+# network, which kills the developer's own daemon.
+TESTS=$(printf '%s\n' "$TESTS" | grep -v '^run-all\.sh$' | grep -v '^test_p2p\.sh$' | grep -v '^test_sdk\.py$' | grep -v '^test_cli\.sh$')
 
 if [ -z "$TESTS" ]; then
     echo "no tests matched" >&2
@@ -86,13 +97,11 @@ test_dur_steady_10min.sh
 test_dur_idle_10min.sh
 test_dur_steady_compressed_24h.sh
 test_sec_rekey_flood.sh
-test_cli.sh
 test_size_task_result_10mb.sh
 test_chaos_loss30_all_ops.sh
 test_size_file_100mb.sh
 test_force_relay_task.sh
 test_rendezvous_restart_midflight.sh
-test_gateway_http_message.sh
 test_nat_conntrack_timeout.sh
 test_splitbrain_heal.sh
 test_task_accept_expiry.sh

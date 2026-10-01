@@ -1,0 +1,28 @@
+#!/bin/bash
+# Stand-in for GNU timeout(1) on hosts that do not ship it (macOS).
+# run-all.sh puts this directory on PATH only when `timeout` is missing.
+#
+#   timeout <seconds>[s|m|h] <command> [args...]
+#
+# Exits 124 when the command was stopped for running too long, like GNU
+# timeout; otherwise with the command's own status. Options (-k, -s) are
+# not supported: no test here uses them.
+d="$1"; shift
+case "$d" in
+    *s) secs="${d%s}" ;;
+    *m) secs=$(( ${d%m} * 60 )) ;;
+    *h) secs=$(( ${d%h} * 3600 )) ;;
+    *)  secs="$d" ;;
+esac
+"$@" <&0 &
+pid=$!
+( sleep "$secs"; kill -TERM "$pid" 2>/dev/null ) &
+watcher=$!
+wait "$pid" 2>/dev/null; rc=$?
+if kill -0 "$watcher" 2>/dev/null; then
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null
+else
+    rc=124
+fi
+exit "$rc"

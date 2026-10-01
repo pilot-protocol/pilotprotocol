@@ -22,7 +22,7 @@ echo "=========================================="
 
 $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 for i in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     [ "$COUNT" -ge 2 ] && break
     sleep 1
 done
@@ -40,7 +40,7 @@ $DC exec -T agent-a bash -c 'pilotctl send-message agent-b --data pre-restart' >
 $DC restart rendezvous >/dev/null 2>&1
 # Wait for the dashboard to come back before poking agents
 for i in $(seq 1 30); do
-    $DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats >/dev/null 2>&1 && break
+    $DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats >/dev/null 2>&1 && break
     sleep 1
 done
 # Poll up to 60s for hostname resolution to recover (rereg + SetHostname sync)
@@ -61,7 +61,7 @@ fi
 
 # ---- 2. Dashboard surfaces probe states ----
 log_test "dashboard exposes restart_events / probe states"
-ST=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null)
+ST=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null)
 # probes field may be empty on fresh process but should be valid JSON
 if echo "$ST" | jq -e '.probes // . ' >/dev/null 2>&1; then
     log_pass "stats endpoint returns well-formed JSON"

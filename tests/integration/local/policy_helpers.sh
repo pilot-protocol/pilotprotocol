@@ -240,7 +240,7 @@ wait_both_agents_registered() {
     local count=0
     for _ in $(seq 1 "$timeout"); do
         count=$($DC exec -T rendezvous \
-            curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+            curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
             | jq -r '.total_nodes // 0')
         if [ "${count:-0}" -ge 2 ]; then
             return 0

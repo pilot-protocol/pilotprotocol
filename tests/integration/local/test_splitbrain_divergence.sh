@@ -37,7 +37,7 @@ $DC up -d rendezvous-1 rendezvous-2 agent-a agent-b agent-c agent-d >/dev/null 2
 log_test "rendezvous-1 sees 2 agents"
 C1=""
 for _ in $(seq 1 60); do
-    C1=$($DC exec -T rendezvous-1 curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+    C1=$($DC exec -T rendezvous-1 curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
         | jq -r '.total_nodes // 0')
     if [ "$C1" -ge 2 ]; then break; fi
     sleep 1
@@ -53,7 +53,7 @@ fi
 log_test "rendezvous-2 sees 2 agents"
 C2=""
 for _ in $(seq 1 60); do
-    C2=$($DC exec -T rendezvous-2 curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+    C2=$($DC exec -T rendezvous-2 curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
         | jq -r '.total_nodes // 0')
     if [ "$C2" -ge 2 ]; then break; fi
     sleep 1

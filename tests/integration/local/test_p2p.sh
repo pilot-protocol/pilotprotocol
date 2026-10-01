@@ -33,7 +33,7 @@ echo "=========================================="
 # Wait for both agents to register with the local rendezvous
 log_test "Waiting for agent-a and agent-b to register"
 for i in $(seq 1 60); do
-    COUNT=$(curl -fsS "$DASHBOARD/api/stats" 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$(curl -fsS "$DASHBOARD/api/public-stats" 2>/dev/null | jq -r '.total_nodes // 0')
     if [ "$COUNT" -ge 2 ]; then
         log_pass "Both agents registered (total_nodes=$COUNT)"
         break
@@ -42,7 +42,7 @@ for i in $(seq 1 60); do
 done
 if [ "$COUNT" -lt 2 ]; then
     log_fail "Only $COUNT agents registered after 60s"
-    curl -s "$DASHBOARD/api/stats" | head -c 500
+    curl -s "$DASHBOARD/api/public-stats" | head -c 500
     exit 1
 fi
 

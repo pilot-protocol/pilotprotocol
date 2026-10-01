@@ -28,7 +28,7 @@ trap cleanup EXIT
 $DC down -v >/dev/null 2>&1
 $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 for _ in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     [ "$COUNT" -ge 2 ] && break
     sleep 1
 done
@@ -46,7 +46,7 @@ log_test "before: agent-a has $BEFORE 'peer rekeyed' log lines"
 log_test "restart agent-b to force rekey on next frame"
 $DC restart agent-b >/dev/null 2>&1
 for _ in $(seq 1 60); do
-    C=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    C=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     [ "$C" -ge 2 ] && break
     sleep 1
 done

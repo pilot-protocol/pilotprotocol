@@ -26,7 +26,7 @@ wait_all_registered() {
     : "${DC:?DC must be set (e.g. DC=\"docker compose -f docker-compose.multiN.yml\")}"
     local count=0
     for _ in $(seq 1 90); do
-        count=$($DC exec -T "$rv" curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+        count=$($DC exec -T "$rv" curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
             | jq -r '.total_nodes // 0')
         if [ -n "$count" ] && [ "$count" -ge "$want" ]; then
             echo "$count"
