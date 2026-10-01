@@ -247,8 +247,6 @@ github.com/pilot-protocol/eventstream v0.2.4 h1:SyB64wqo+Qpz0hIAuzHGkI9Npwk5SFSg
 github.com/pilot-protocol/eventstream v0.2.4/go.mod h1:ccBhrLd2vUj70bStS/FJHg7DhjeZ0jinOls6Et4U5cg=
 github.com/pilot-protocol/handshake v0.2.8 h1:UwgExk4Shy01s1S0O5uh96zp2mZ25WamuSGQ+CJECQg=
 github.com/pilot-protocol/handshake v0.2.8/go.mod h1:zJBCcuDnYhVFGTDAm4LtWpei6PBmuaVkTZEh1SfY1Wo=
-github.com/pilot-protocol/nameserver v0.2.1 h1:ACCa6WVkEoDZVctEe09WB24Lfobt/JoLDGIqX2MEnss=
-github.com/pilot-protocol/nameserver v0.2.1/go.mod h1:ze4VFe74xdbyqu5oFPt0YGRrRMMnHWb/AczJhirG+h4=
 github.com/pilot-protocol/policy v0.2.3 h1:sonEBL82oGjj1zyMQjJJ5cw+0KQdjS1sgHiLmIVWb8g=
 github.com/pilot-protocol/policy v0.2.3/go.mod h1:ALQdPalluwdzd3AbqbR+iNU5jJc/aG79n9ym0vhhF7w=
 github.com/pilot-protocol/rendezvous v0.2.8 h1:GRJyNplqNrfhPuCUgOAaY5Dg5En4G2aO+W2oCNKuIlo=
