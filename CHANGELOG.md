@@ -410,6 +410,12 @@ Detailed per-release notes are on the
   responder, so those nodes also stop resetting their paths to this one. Any
   other frame whose source does not match the authenticated peer is still
   dropped. No wire change.
+- **`pilotctl appstore uninstall` removes the app's lock file.** Each app
+  ever installed left an empty `~/.pilot/apps/.<id>.lock` behind. Uninstall
+  now deletes it as it releases the lock, and every install, upgrade and
+  uninstall checks that the lock it got is on the file still at that path, so
+  an install that was waiting during the uninstall cannot run alongside the
+  next one.
 
 ## [1.12.8] - 2026-07-16
 
