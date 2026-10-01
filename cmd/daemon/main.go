@@ -324,6 +324,7 @@ func main() {
 	installDefaultTransportProxy(proxyResolver, proxyRelay)
 	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyResolver),
 		"transport_from", transportSrc, "registry", *registryAddr, "registry_tls", *registryTLS)
+	warnIfPID1(slog.Default())
 
 	// Sandbox: validate all configured file paths are under the confinement
 	// root before the daemon touches the filesystem. Network paths are unaffected.

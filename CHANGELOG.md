@@ -215,6 +215,13 @@ Detailed per-release notes are on the
   (redacted) and the hosts it must allow. In a Linux container/VM without
   systemd the installer runs as root without `PILOT_ALLOW_ROOT` (hosted
   sandboxes run the agent as root); regular hosts still refuse root.
+- **The daemon warns when it is PID 1.** As the entrypoint of a container
+  started without an init, the daemon is handed every orphaned process, and
+  the servers its apps start (redis, postgres) stayed as zombies after they
+  were stopped. The daemon does not reap them — that would also take the exit
+  status of the apps it supervises — and now logs one warning at startup, on
+  Linux, saying to run it under an init (`docker run --init`, or tini as the
+  entrypoint). README: Install.
 
 ### Removed
 - **Hosted control plane client.** The hosted control plane has been retired,
