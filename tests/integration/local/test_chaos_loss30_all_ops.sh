@@ -38,7 +38,7 @@ log_test "fresh chaos-capable stack"
 $DC down -v >/dev/null 2>&1
 $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 for _ in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     if [ "$COUNT" -ge 2 ]; then break; fi
     sleep 1
 done

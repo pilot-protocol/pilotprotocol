@@ -29,9 +29,9 @@ log_test "Starting p2p stack"
 $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 # Wait for both agents to register
 for i in $(seq 1 60); do
-    COUNT=$(curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$(curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     # dashboard isn't published on host; use the rendezvous container instead
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     if [ "$COUNT" -ge 2 ]; then break; fi
     sleep 1
 done
@@ -133,10 +133,10 @@ fi
 
 # ---- 6. Deregister + re-register ----
 log_test "deregister agent-b and confirm total_nodes drops"
-BEFORE=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes')
+BEFORE=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes')
 $DC exec -T agent-b bash -c 'pilotctl deregister >/tmp/dereg.txt 2>&1' || true
 sleep 2
-AFTER=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes')
+AFTER=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes')
 if [ "${AFTER:-0}" -lt "${BEFORE:-0}" ]; then
     log_pass "deregister dropped total_nodes: $BEFORE → $AFTER"
 else
@@ -148,9 +148,9 @@ else
     fi
 fi
 
-# ---- 7. Dashboard /api/stats shape sanity ----
-log_test "dashboard /api/stats has expected keys"
-STATS=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null)
+# ---- 7. Dashboard /api/public-stats shape sanity ----
+log_test "dashboard /api/public-stats has expected keys"
+STATS=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null)
 for key in total_nodes total_requests; do
     if echo "$STATS" | jq -e ".$key" >/dev/null 2>&1; then
         log_pass "stats.$key present"

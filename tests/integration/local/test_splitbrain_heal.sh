@@ -43,8 +43,8 @@ sweep_pilot_p2p_network
 $DC up -d rendezvous-1 rendezvous-2 agent-a agent-b agent-c agent-d >/dev/null 2>&1
 
 for _ in $(seq 1 60); do
-    C1=$($DC exec -T rendezvous-1 curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
-    C2=$($DC exec -T rendezvous-2 curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    C1=$($DC exec -T rendezvous-1 curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
+    C2=$($DC exec -T rendezvous-2 curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     if [ "$C1" -ge 2 ] && [ "$C2" -ge 2 ]; then break; fi
     sleep 1
 done
@@ -147,7 +147,7 @@ docker run -d --rm --name "${COMPOSE_PROJECT_NAME:-pilot}-healed-agent-d" --host
 # Wait for rendezvous-1 to see 4 nodes.
 MERGED=0
 for _ in $(seq 1 60); do
-    C1=$($DC exec -T rendezvous-1 curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    C1=$($DC exec -T rendezvous-1 curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     if [ "$C1" -ge 4 ]; then MERGED=1; break; fi
     sleep 1
 done

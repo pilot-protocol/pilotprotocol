@@ -21,7 +21,7 @@ echo "=========================================="
 
 $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 for i in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     [ "$COUNT" -ge 2 ] && break
     sleep 1
 done
@@ -57,9 +57,9 @@ else
     log_fail "healthz JSON malformed: $(echo "$JSON" | head -c 200)"
 fi
 
-# ---- 4. /api/stats JSON shape ----
-log_test "/api/stats has expected keys"
-JSON=$($DC exec -T rendezvous curl -fsS "$EP/api/stats")
+# ---- 4. /api/public-stats JSON shape ----
+log_test "/api/public-stats has expected keys"
+JSON=$($DC exec -T rendezvous curl -fsS "$EP/api/public-stats")
 if echo "$JSON" | jq -e 'has("total_nodes") and has("active_nodes") and has("total_requests") and has("uptime_secs")' >/dev/null 2>&1; then
     log_pass "stats shape ok (total_nodes=$(echo "$JSON" | jq -r .total_nodes))"
 else
@@ -139,11 +139,11 @@ fi
 
 # ---- 12. CORS header on public API endpoints ----
 log_test "public API responses include Access-Control-Allow-Origin"
-ACAO=$($DC exec -T rendezvous curl -sSI "$EP/api/stats" | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}' | tr -d '\r')
+ACAO=$($DC exec -T rendezvous curl -sSI "$EP/api/public-stats" | awk -F': ' 'tolower($1)=="access-control-allow-origin"{print $2}' | tr -d '\r')
 if [ "$ACAO" = "*" ]; then
-    log_pass "ACAO ok on /api/stats"
+    log_pass "ACAO ok on /api/public-stats"
 else
-    log_fail "ACAO missing or wrong on /api/stats: '$ACAO'"
+    log_fail "ACAO missing or wrong on /api/public-stats: '$ACAO'"
 fi
 
 echo ""

@@ -31,7 +31,7 @@ $DC down -v >/dev/null 2>&1
 sweep_pilot_p2p_network
 $DC up -d rendezvous >/dev/null 2>&1
 for _ in $(seq 1 30); do
-    if $DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats >/dev/null 2>&1; then
+    if $DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats >/dev/null 2>&1; then
         break
     fi
     sleep 1
@@ -46,7 +46,7 @@ $DC up -d a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 >/dev/null 2>&1
 COUNT=0
 FIRST10=0
 for i in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
         | jq -r '.total_nodes // 0')
     if [ "$COUNT" -ge 10 ]; then
         FIRST10=$(( $(date +%s) - START ))
@@ -74,7 +74,7 @@ log_test "all 10 node ids are unique"
 NODES=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/nodes 2>/dev/null)
 IDS=$(echo "$NODES" | jq -r '.nodes[]?.node_id // .nodes[]?.id // empty' 2>/dev/null | sort -u)
 UNIQUE_COUNT=$(echo "$IDS" | grep -c .)
-# Fallback: /api/stats total_nodes matches unique count
+# Fallback: /api/public-stats total_nodes matches unique count
 if [ -z "$IDS" ]; then
     # Endpoint shape varies; fall back to stats assertion.
     if [ "$COUNT" -ge 10 ]; then

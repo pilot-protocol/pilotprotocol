@@ -7,8 +7,8 @@
 #   - wait_for — replaces the `for _ in $(seq 1 60); do ...; sleep 1; done`
 #     pattern scattered across ~120 tests with a single helper that reads
 #     WAIT_BUDGET from env (laptop=60, k8s Job sets 180 via values.yaml)
-#   - teardown — docker compose down -v --remove-orphans, plus pkill of
-#     any leaked pilot-daemon/gateway/rendezvous; auto-trapped at EXIT
+#   - teardown — docker compose down -v --remove-orphans; auto-trapped
+#     at EXIT
 #
 # Teardown is auto-installed via `trap teardown EXIT` on source.
 # If a test wants to manage its own teardown (multi-phase chaos runs),
@@ -47,7 +47,7 @@ _wait_budget() {
 # discarded so loops stay quiet.
 #
 # Usage:
-#   wait_for '[ "$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats | jq -r ".total_nodes // 0")" -ge 2 ]' \
+#   wait_for '[ "$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats | jq -r ".total_nodes // 0")" -ge 2 ]' \
 #     && log_pass "both agents registered"
 wait_for() {
   local pred="$1"
@@ -77,12 +77,10 @@ teardown() {
       # No $DC set — try the two most common compose files as a best
       # effort. Costs nothing if they're not up.
       docker compose -f docker-compose.multi.yml down -v --remove-orphans >/dev/null 2>&1 || true
-      docker compose -f docker-compose.gateway.yml down -v --remove-orphans >/dev/null 2>&1 || true
     fi
-    # Belt-and-braces: anything still holding the daemon sockets.
-    pkill -9 -f pilot-daemon 2>/dev/null || true
-    pkill -9 -f pilot-gateway 2>/dev/null || true
-    pkill -9 -f pilot-rendezvous 2>/dev/null || true
+    # No host-side pkill: every daemon under test runs inside a container
+    # that `down -v` just removed. A `pkill -f pilot-daemon` here matches
+    # the developer's own daemon on the host and kills it.
   ) || true
   return "$rc"
 }

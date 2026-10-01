@@ -34,7 +34,7 @@ trap cleanup EXIT
 $DC down -v >/dev/null 2>&1
 $DC up -d rendezvous agent-a >/dev/null 2>&1
 for _ in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     [ "${COUNT:-0}" -ge 1 ] && break
     sleep 1
 done

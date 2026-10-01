@@ -54,7 +54,7 @@ $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 # Wait for both agents to register via the beacon (this REQUIRES a successful
 # discover reply from the beacon — registration includes public endpoint).
 for _ in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
         | jq -r '.total_nodes // 0')
     if [ "${COUNT:-0}" -ge 2 ]; then break; fi
     sleep 1
@@ -77,7 +77,7 @@ else
 fi
 
 # 2) Endpoint visible to the daemon = beacon discover reply was accepted.
-#    There is no public /api/nodes on the dashboard — only /api/stats,
+#    There is no public /api/nodes on the dashboard — only /api/public-stats,
 #    /api/pulse, /api/badge/*, /api/snapshot. Ask the daemon itself via
 #    pilotctl --json info, which reports the endpoint it registered.
 log_test "agent-a has a non-empty observed endpoint (discover reply accepted)"

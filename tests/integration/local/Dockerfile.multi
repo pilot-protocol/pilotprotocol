@@ -1,10 +1,11 @@
 FROM golang:1.25-bookworm AS builder
 WORKDIR /workspace
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/pilot-rendezvous ./cmd/rendezvous && \
+# The rendezvous server lives in its own module now; build the version
+# go.mod pins so the registry under test matches the daemon's dependency.
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/pilot-rendezvous github.com/pilot-protocol/rendezvous/cmd/rendezvous && \
     CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/pilot-daemon ./cmd/daemon && \
-    CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/pilotctl ./cmd/pilotctl && \
-    CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/pilot-gateway ./cmd/gateway
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/pilotctl ./cmd/pilotctl
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /bin/pilot-rendezvous /usr/local/bin/
 COPY --from=builder /bin/pilot-daemon /usr/local/bin/
 COPY --from=builder /bin/pilotctl /usr/local/bin/
-COPY --from=builder /bin/pilot-gateway /usr/local/bin/
 RUN mkdir -p /root/.pilot/inbox /root/.pilot/received
 COPY tests/integration/local/test_p2p.sh /tests/
 # Security-test injector + helpers (Chunk D). Kept alongside /tests so

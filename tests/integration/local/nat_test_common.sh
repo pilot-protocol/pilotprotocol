@@ -62,7 +62,7 @@ wait_registered() {
     local mult="${PILOT_TEST_WAIT_MULT:-1}"
     timeout=$((timeout * mult))
     for _ in $(seq 1 "$timeout"); do
-        reg=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+        reg=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
             | jq -r '.total_nodes // 0')
         [ "${reg:-0}" -ge "$want" ] && { echo "$reg"; return 0; }
         sleep 1
