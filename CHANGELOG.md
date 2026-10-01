@@ -10,6 +10,11 @@ Detailed per-release notes are on the
 ## [Unreleased]
 
 ### Added
+- **`pilotctl send-message` can take its payload from stdin or a file**:
+  `--data -` and `--data-file <path>`. A payload passed as an argument is
+  capped by the OS — a 1 MB `--data` failed with "Argument list too long",
+  and on Linux a single argument stops at 128 KiB — which is why senders of
+  large bodies needed a separate stdin helper.
 - **A client can ask the daemon whether a datagram was actually sent.** The
   IPC `SendTo` command is fire-and-forget: when the daemon could not send a
   datagram (no route to the node, port policy, ephemeral ports exhausted) it

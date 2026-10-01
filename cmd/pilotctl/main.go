@@ -895,7 +895,9 @@ var commandHelp = map[string]string{
 Send a message to a remote agent and optionally wait for the reply.
 
 Flags:
-  --data <text>         message payload (required)
+  --data <text>         message payload; "-" reads it from stdin
+  --data-file <path>    read the payload from a file (for payloads too large
+                        for a command-line argument)
   --type text|json|binary  payload encoding (default: text)
   --count <n>           send N times (default: 1)
   --reuse-conn          reuse the connection across --count sends (saves ~1 RTT)
@@ -912,6 +914,8 @@ Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
   pilotctl send-message my-peer --data "hello" --wait
   pilotctl send-message 0:0000.0000.400E --data "ping" --trace
+  pilotctl send-message my-peer --data-file report.json --type json
+  generate-report | pilotctl send-message my-peer --data -
 `,
 	"ping": `Usage: pilotctl ping <address|hostname> [flags]
 
@@ -4744,6 +4748,38 @@ func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename s
 	return result, nil
 }
 
+// messagePayload returns the body for send-message: --data, or the whole of
+// stdin for "--data -", or the contents of --data-file. A payload passed as an
+// argument is capped by the OS (ARG_MAX; 128 KiB per argument on Linux), which
+// is why callers with large bodies needed a separate stdin helper.
+func messagePayload(flags map[string]string, stdin io.Reader) (string, error) {
+	data, hasData := flags["data"]
+	file, hasFile := flags["data-file"]
+	switch {
+	case hasData && hasFile:
+		return "", fmt.Errorf("give --data or --data-file, not both")
+	case hasFile:
+		if file == "" || file == "true" {
+			return "", fmt.Errorf("--data-file needs a path")
+		}
+		b, err := os.ReadFile(file) // #nosec G304 -- the operator names the file to send
+		if err != nil {
+			return "", fmt.Errorf("read --data-file: %v", err)
+		}
+		data = string(b)
+	case data == "-":
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("read payload from stdin: %v", err)
+		}
+		data = string(b)
+	}
+	if data == "" {
+		return "", fmt.Errorf("--data is required")
+	}
+	return data, nil
+}
+
 func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
 	for name := range flags {
@@ -4823,9 +4859,9 @@ func cmdSendMessage(args []string) {
 		fatalCode("not_found", "%v", err)
 	}
 
-	data := flagString(flags, "data", "")
-	if data == "" {
-		fatalCode("invalid_argument", "--data is required")
+	data, err := messagePayload(flags, os.Stdin)
+	if err != nil {
+		fatalCode("invalid_argument", "%v", err)
 	}
 	msgType := flagString(flags, "type", "text")
 
