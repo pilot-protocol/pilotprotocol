@@ -471,6 +471,25 @@ Detailed per-release notes are on the
 - **`pilotctl send-message` fails when the receiver does not acknowledge the
   message.** Every receiver answers a stored message with an ACK; with none,
   the command used to exit 0.
+- **A peer whose direct path is dead stays on the relay.** After the
+  blackhole heuristic moved a peer to the relay, the relay probe loop put
+  it back on the direct path within 15 s: to let direct win again it has to
+  unpin the peer, and it did that with a call that clears the relay flag
+  too. Traffic then went to the dead address until three more silent sends
+  tripped the heuristic again, so the daemon spent roughly 75 s of every
+  90 s sending into the void and logged `direct path silent, flipping to
+  relay` on a loop. Seen for over half an hour against a peer whose
+  registry endpoint was stale. The probe loop now removes only the pin; the
+  peer leaves the relay when direct packets from it actually arrive.
+- **The cached key of a peer is no longer overwritten by the next packet.**
+  The key-exchange handler cached a peer's Ed25519 key as a slice of the
+  socket's reused receive buffer, so the following packet replaced the
+  cached key with its own bytes. The next key exchange from that peer then
+  mismatched the cache and made the daemon look the key up in the registry
+  from the packet read loop, holding up every other packet for the length
+  of that round trip; the log line `auth key exchange: peer pubkey updated
+  from registry` (97 in one six-hour session) was this, not peers changing
+  keys. The key is now copied.
 - **`-advertise-endpoint` survives a re-registration.** When the daemon
   re-registered (registry reconnect, transport watchdog recovery) it sent
   the tunnel socket's local address instead of the advertised endpoint, so
