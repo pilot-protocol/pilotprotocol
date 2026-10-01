@@ -451,6 +451,8 @@ type Daemon struct {
 	// it. consecutiveDialTimeouts counts back-to-back dial timeouts
 	// (reset to 0 on any successful dial); a run of them to distinct
 	// peers means our outbound path is wedged, not that one peer is dead.
+	// A timeout is not counted when the tunnel decrypted anything from
+	// that peer during the dial (see dialConnectionLocked).
 	lastDialOKNano          atomic.Int64
 	consecutiveDialTimeouts atomic.Uint64
 
@@ -3897,6 +3899,7 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	dialStart := time.Now()
 
 	// Enforce outbound port policy: prevent dialing ports blocked by the network
 	if !d.evaluatePortPolicy(PolicyEventDial, dstAddr.Network, dstPort, dstAddr.Node, 0, "") {
@@ -4196,7 +4199,16 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 				// Full direct+relay retry budget exhausted with no SYN-ACK.
 				// Feeds the rx-watchdog's partial-wedge detector: a run of
 				// these to distinct peers means our outbound is wedged.
-				d.consecutiveDialTimeouts.Add(1)
+				// Not when the peer was heard from while we dialed: it is
+				// reachable and declined this SYN (its SYN limiter under a
+				// burst of our own dials, a full accept path), which says
+				// nothing about our transport.
+				if last, ok := d.tunnels.LastInboundDecrypt(dstAddr.Node); ok && last.After(dialStart) {
+					slog.Debug("dial timed out but the peer was heard from during the dial; not counted as a transport wedge",
+						"peer_node_id", dstAddr.Node, "dst_port", dstPort)
+				} else {
+					d.consecutiveDialTimeouts.Add(1)
+				}
 				if keyMissing {
 					// Not one SYN left this node: the peer never completed
 					// the key exchange. Say so, so callers can tell "busy

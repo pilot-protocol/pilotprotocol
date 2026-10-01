@@ -77,7 +77,10 @@ const (
 	// dead, not the peers. This is the PARTIAL wedge the rx-silence check
 	// misses: rx keeps trickling (keepalives) so silence never trips, but
 	// no new connection can be opened. 4 = at least four back-to-back
-	// user-visible dial failures with zero successes in between.
+	// user-visible dial failures with zero successes in between. A timeout
+	// against a peer we heard from during that dial is not counted: 32
+	// parallel sends to one peer whose SYN limiter dropped them once read
+	// as a wedge and re-registered a healthy node.
 	dialWedgeThreshold = 4
 
 	// rxWatchdogSoftMax is how many consecutive soft recoveries run
