@@ -23,8 +23,8 @@ jobs:
         # fails immediately, blocking release tags. Darwin still gets
         # full coverage in the build matrix (darwin/amd64, darwin/arm64)
         # so we still ship signed mac binaries; macOS test coverage
-        # continues in PR ci.yml and the nightly suite where the
-        # runner behavior is the same but the gate is non-blocking.
+        # continues in PR ci.yml, where the runner behavior is the same
+        # but the gate is non-blocking.
         os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v7
@@ -46,8 +46,8 @@ jobs:
         # against loopback HTTP servers; that suite has been broken on
         # the GH Actions runner network stack for ~2 weeks (every
         # v1.10.1+ release run failed here), blocking every release tag
-        # since 2026-05-16. Integration tests still run nightly via
-        # nightly.yml and locally via `go test ./tests/`.
+        # since 2026-05-16. Integration tests run locally via
+        # `go test ./tests/`.
         run: go test -short -count=1 -timeout 600s ./pkg/... ./cmd/... ./internal/...
 
   build:
