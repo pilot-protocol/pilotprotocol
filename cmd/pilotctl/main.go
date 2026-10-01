@@ -4974,6 +4974,12 @@ func cmdSendMessage(args []string) {
 		defer cl.Close()
 		r := sendOne(cl, 0, false)
 		ackAt := time.Now()
+		// The receiver answers "ERR ..." when it could not store the
+		// message (disk full, inbox unwritable). That is a failed send, not
+		// a delivered one — same rule send-file applies.
+		if ackText, _ := r["ack"].(string); strings.HasPrefix(ackText, "ERR ") {
+			fatalCode("internal", "receiver rejected message: %s", ackText)
+		}
 		result := map[string]interface{}{
 			"target": target.String(),
 			"to":     target.String(),
@@ -6821,10 +6827,35 @@ func cmdReceived(args []string) {
 				count++
 			}
 		}
+		// Interrupted transfers leave their bytes in .partial for a resume.
+		// They count against the disk like any received file but were never
+		// listed or cleared, so a failed large transfer stayed forever.
+		partials := 0
+		partialDir := filepath.Join(dir, ".partial")
+		if entries, perr := os.ReadDir(partialDir); perr == nil {
+			for _, e := range entries {
+				info, ierr := e.Info()
+				if ierr != nil || e.IsDir() {
+					continue
+				}
+				if !sinceCutoff.IsZero() && info.ModTime().Before(sinceCutoff) {
+					continue
+				}
+				if !beforeCutoff.IsZero() && !info.ModTime().Before(beforeCutoff) {
+					continue
+				}
+				if os.Remove(filepath.Join(partialDir, e.Name())) == nil {
+					partials++
+				}
+			}
+		}
 		if jsonOutput {
-			outputOK(map[string]interface{}{"cleared": count, "remaining": len(all) - count})
+			outputOK(map[string]interface{}{"cleared": count, "remaining": len(all) - count, "cleared_partial": partials})
 		} else {
 			fmt.Printf("cleared %d received file(s), %d remaining\n", count, len(all)-count)
+			if partials > 0 {
+				fmt.Printf("cleared %d interrupted transfer(s)\n", partials)
+			}
 		}
 		return
 	}

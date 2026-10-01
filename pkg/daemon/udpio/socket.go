@@ -100,8 +100,19 @@ func Listen(addr string) (*Socket, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen udp: %w", err)
 	}
+	// Every tunnel shares this one socket. At the kernel default (~200KB on
+	// Linux) a few streams sending at once overflow it, and each dropped
+	// datagram is a whole segment for the stream layer to recover. Ask for
+	// more; the kernel silently caps the request at net.core.rmem_max /
+	// wmem_max, so this is best-effort and never an error.
+	_ = conn.SetReadBuffer(socketBufferBytes)
+	_ = conn.SetWriteBuffer(socketBufferBytes)
 	return &Socket{conn: conn}, nil
 }
+
+// socketBufferBytes is the kernel buffer size requested for the tunnel socket
+// in each direction.
+const socketBufferBytes = 4 << 20
 
 // WrapConn adopts an already-bound *net.UDPConn into a Socket. Used by
 // tests that build a UDP listener manually (so the test owns

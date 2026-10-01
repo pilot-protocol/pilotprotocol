@@ -239,6 +239,15 @@ Detailed per-release notes are on the
 - SIGHUP no longer reloads control state. It is still caught and ignored.
 
 ### Changed
+- **The tunnel socket asks the kernel for 4 MB buffers** in each direction
+  instead of the default (about 200 KB on Linux). Every tunnel shares the one
+  socket, and several streams sending at once overflowed it. The kernel caps
+  the request at `net.core.rmem_max` / `wmem_max`; raise those to get the full
+  size.
+- **The daemon's `info` reply is cheaper to build.** `pilotctl send-message`
+  asks for it on every send, and with a few hundred connections in the table
+  it was three quarters of the daemon's CPU under send load. The JSON is
+  unchanged.
 - **Dependencies: skillinject v0.2.4, dataexchange v0.2.3, updater v0.2.5**
   (plus common v0.5.14, and the sigstore-go v1.3.0 / go-openapi versions
   updater v0.2.5 requires).
@@ -262,6 +271,39 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **Datagrams no longer use up the daemon's ports.** Every datagram sent
+  (`pilotctl dgram`, `SendTo`, broadcasts) took an ephemeral source port and
+  never gave it back, because only closing a connection released one. After
+  about 16,000 datagrams no stream could be opened — sends failed with what
+  looked like an unreachable peer — until the daemon restarted. The port is now
+  released as soon as the datagram is sent. A dial that does fail for lack of
+  ports says so instead of telling the operator to check the peer.
+- **Large writes and first exchanges no longer stall for 40ms with both ends
+  idle.** A write held by Nagle waits for the data before it to be
+  acknowledged, and the receiver delayed a lone or odd segment's ACK by 40ms.
+  That cost 40ms on the first exchange of every connection, and one stall per
+  48KB chunk of a file transfer — about 1.5 MB/s on any link. The delayed-ACK
+  timer is now 5ms: a 60 MB transfer between two containers went from 31s to
+  3.5s.
+- **A dial returns when its handshake completes**, not on the next 10ms poll.
+  A local dial took 11ms and now takes under 1ms; with the change above,
+  connecting and exchanging one message dropped from 55ms to 6ms.
+- **`pilotctl send-message` fails when the receiver could not store the
+  message.** The receiver answers `ERR ...` when its disk is full or its inbox
+  is unwritable; the command printed that as the ack and exited 0. It now exits
+  non-zero, as `send-file` already did.
+- **`pilotctl appstore install` cleans up after itself.** Each install unpacked
+  the bundle into a temporary directory and left it there — a copy of every app
+  ever installed, and on a small `/tmp` the reason later installs failed with
+  "no space left on device". The directory is removed when the install ends,
+  whether it succeeded or not.
+- **`pilotctl appstore call` waits for an app that was just installed.** The
+  daemon starts an app a few seconds after `install` returns, so a call made
+  straight away failed with "socket not present". It now waits up to 15s for
+  the socket, and says so plainly when the app is suspended after crashing.
+- **`pilotctl received --clear` removes interrupted transfers too.** Their
+  bytes stay in `received/.partial` for a resume and count against the disk,
+  but were never listed or cleared. The reply gains a `cleared_partial` count.
 - **Parallel sends to one peer no longer stall or time out on the peer's
   SYN limiter.** The per-source limit admitted 10 connections at once and
   silently dropped the rest; the dialers retransmitted together, so a burst

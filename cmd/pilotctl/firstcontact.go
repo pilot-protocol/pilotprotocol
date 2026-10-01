@@ -132,6 +132,10 @@ func dialFailureHint(target string, err error, attempts int, elapsed time.Durati
 		s = err.Error()
 	}
 	switch {
+	case strings.Contains(s, "ephemeral ports exhausted"):
+		// A local condition: the peer was never contacted, so pointing at
+		// its reachability sends the operator the wrong way.
+		return "this node has no free local ports for a new connection; close idle connections (`pilotctl connections`) or restart the daemon"
 	case strings.Contains(s, "key exchange"):
 		return fmt.Sprintf("%s never completed the tunnel key exchange (%d dial attempt(s), %s): the service is overloaded or offline. "+
 			"Retry in a minute; `pilotctl peers` shows the tunnel state.", target, attempts, elapsed.Round(time.Second))
