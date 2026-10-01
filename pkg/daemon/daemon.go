@@ -5530,6 +5530,11 @@ func (d *Daemon) reRegister() {
 			registrationAddr = resolveLocalAddr(d.tunnels.LocalAddr().String())
 		}
 	}
+	// Same override as Start (step 1b): an operator-set advertised
+	// endpoint must survive a re-registration.
+	if d.config.AdvertiseEndpoint != "" {
+		registrationAddr = d.config.AdvertiseEndpoint
+	}
 
 	// Always re-register with client-generated key.
 	// Hold identityMu.RLock for the snapshot so RotateKey (which
