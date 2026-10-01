@@ -1122,49 +1122,89 @@ func (s *IPCServer) handleBroadcast(conn *ipcConn, reqID uint64, payload []byte)
 //     key request that every released daemon answers.
 var daemonFeatures = []string{"reply_window", "dial_awaits_key", "key_request"}
 
+// ipcInfoPeer is one row of the info reply's peer_list.
+type ipcInfoPeer struct {
+	Authenticated bool   `json:"authenticated"`
+	Encrypted     bool   `json:"encrypted"`
+	Endpoint      string `json:"endpoint"`
+	NodeID        uint32 `json:"node_id"`
+	Relay         bool   `json:"relay"`
+}
+
+// ipcInfoConn is one row of the info reply's conn_list.
+type ipcInfoConn struct {
+	BytesRecv   uint64  `json:"bytes_recv"`
+	BytesSent   uint64  `json:"bytes_sent"`
+	CongWin     int     `json:"cong_win"`
+	DupACKs     uint64  `json:"dup_acks"`
+	FastRetx    uint64  `json:"fast_retx"`
+	ID          uint32  `json:"id"`
+	InFlight    int     `json:"in_flight"`
+	InRecovery  bool    `json:"in_recovery"`
+	LocalPort   uint16  `json:"local_port"`
+	OOOBuf      int     `json:"ooo_buf"`
+	PeerRecvWin int     `json:"peer_recv_win"`
+	RecvWin     int     `json:"recv_win"`
+	RemoteAddr  string  `json:"remote_addr"`
+	RemotePort  uint16  `json:"remote_port"`
+	Retransmits uint64  `json:"retransmits"`
+	RTTVARMs    float64 `json:"rttvar_ms"`
+	SACKRecv    uint64  `json:"sack_recv"`
+	SACKSent    uint64  `json:"sack_sent"`
+	SegsRecv    uint64  `json:"segs_recv"`
+	SegsSent    uint64  `json:"segs_sent"`
+	SRTTMs      float64 `json:"srtt_ms"`
+	SSThresh    int     `json:"ssthresh"`
+	State       string  `json:"state"`
+	Unacked     int     `json:"unacked"`
+}
+
 func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 	info := s.daemon.Info()
 
-	// Build peer list for JSON
-	peers := make([]map[string]interface{}, len(info.PeerList))
+	// Peer and connection rows are typed structs, not maps: `info` is called
+	// by every pilotctl send, and under load the connection table holds
+	// hundreds of rows, where building and key-sorting a map per row was
+	// most of the daemon's CPU. Fields are declared in key order so the
+	// JSON is byte-for-byte what the maps produced.
+	peers := make([]ipcInfoPeer, len(info.PeerList))
 	for i, p := range info.PeerList {
-		peers[i] = map[string]interface{}{
-			"node_id":       p.NodeID,
-			"endpoint":      p.Endpoint,
-			"encrypted":     p.Encrypted,
-			"authenticated": p.Authenticated,
-			"relay":         p.Relay,
+		peers[i] = ipcInfoPeer{
+			Authenticated: p.Authenticated,
+			Encrypted:     p.Encrypted,
+			Endpoint:      p.Endpoint,
+			NodeID:        p.NodeID,
+			Relay:         p.Relay,
 		}
 	}
 
-	// Build connection list for JSON
-	conns := make([]map[string]interface{}, len(info.ConnList))
+	conns := make([]ipcInfoConn, len(info.ConnList))
 	for i, c := range info.ConnList {
-		conns[i] = map[string]interface{}{
-			"id":            c.ID,
-			"local_port":    c.LocalPort,
-			"remote_addr":   c.RemoteAddr,
-			"remote_port":   c.RemotePort,
-			"state":         c.State,
-			"cong_win":      c.CongWin,
-			"ssthresh":      c.SSThresh,
-			"in_flight":     c.InFlight,
-			"srtt_ms":       float64(c.SRTT.Milliseconds()),
-			"rttvar_ms":     float64(c.RTTVAR.Milliseconds()),
-			"unacked":       c.Unacked,
-			"ooo_buf":       c.OOOBuf,
-			"peer_recv_win": c.PeerRecvWin,
-			"recv_win":      c.RecvWin,
-			"in_recovery":   c.InRecovery,
-			"bytes_sent":    c.Stats.BytesSent,
-			"bytes_recv":    c.Stats.BytesRecv,
-			"segs_sent":     c.Stats.SegsSent,
-			"segs_recv":     c.Stats.SegsRecv,
-			"retransmits":   c.Stats.Retransmits,
-			"fast_retx":     c.Stats.FastRetx,
-			"sack_recv":     c.Stats.SACKRecv,
-			"sack_sent":     c.Stats.SACKSent,
-			"dup_acks":      c.Stats.DupACKs,
+		conns[i] = ipcInfoConn{
+			BytesRecv:   c.Stats.BytesRecv,
+			BytesSent:   c.Stats.BytesSent,
+			CongWin:     c.CongWin,
+			DupACKs:     c.Stats.DupACKs,
+			FastRetx:    c.Stats.FastRetx,
+			ID:          c.ID,
+			InFlight:    c.InFlight,
+			InRecovery:  c.InRecovery,
+			LocalPort:   c.LocalPort,
+			OOOBuf:      c.OOOBuf,
+			PeerRecvWin: c.PeerRecvWin,
+			RecvWin:     c.RecvWin,
+			RemoteAddr:  c.RemoteAddr,
+			RemotePort:  c.RemotePort,
+			Retransmits: c.Stats.Retransmits,
+			RTTVARMs:    float64(c.RTTVAR.Milliseconds()),
+			SACKRecv:    c.Stats.SACKRecv,
+			SACKSent:    c.Stats.SACKSent,
+			SegsRecv:    c.Stats.SegsRecv,
+			SegsSent:    c.Stats.SegsSent,
+			SRTTMs:      float64(c.SRTT.Milliseconds()),
+			SSThresh:    c.SSThresh,
+			State:       c.State,
+			Unacked:     c.Unacked,
 		}
 	}
 

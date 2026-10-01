@@ -218,3 +218,38 @@ func TestMultipleDatagrams(t *testing.T) {
 	}
 	t.Logf("received all %d datagrams", len(msgs))
 }
+
+// TestDatagramsDoNotExhaustEphemeralPorts sends more datagrams than there are
+// ephemeral ports. Each one used to keep its source port forever, so after
+// ~16k the daemon could not open any stream until it restarted.
+func TestDatagramsDoNotExhaustEphemeralPorts(t *testing.T) {
+	requireRealNetwork(t)
+	t.Parallel()
+	env := NewTestEnv(t)
+
+	a := env.AddDaemon()
+	b := env.AddDaemon()
+
+	// Drain B so its receive queue does not back up.
+	go func() {
+		for {
+			if _, err := b.Driver.RecvFrom(); err != nil {
+				return
+			}
+		}
+	}()
+
+	const sends = 17000 // the ephemeral range holds 16384
+	for i := 0; i < sends; i++ {
+		if err := a.Driver.SendTo(b.Daemon.Addr(), 5000, []byte("d")); err != nil {
+			t.Fatalf("sendto %d: %v", i, err)
+		}
+	}
+	// SendTo is fire-and-forget over IPC; a stream dial is served after the
+	// queued sends and fails outright if the ports are gone.
+	conn, err := a.Driver.DialAddr(b.Daemon.Addr(), 7)
+	if err != nil {
+		t.Fatalf("dial after %d datagrams: %v", sends, err)
+	}
+	conn.Close()
+}

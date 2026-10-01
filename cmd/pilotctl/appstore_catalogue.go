@@ -464,7 +464,8 @@ func resolveInstallTarget(target string) (string, installSource, error) {
 // fetchAndUnpackBundle downloads the catalogue entry's tarball,
 // verifies its sha256 against the catalogue value (defence against a
 // CDN substitute), and unpacks it into a tempdir whose path is
-// returned for the install path to consume.
+// returned for the install path to consume. The caller removes that
+// directory when it is done; on error nothing is left behind.
 func fetchAndUnpackBundle(e catalogueEntry) (string, error) {
 	bundleURL, bundleSHA, err := e.resolveBundle()
 	if err != nil {
@@ -518,15 +519,20 @@ func fetchAndUnpackBundle(e catalogueEntry) (string, error) {
 	}
 	f, err := os.Open(tmpTar.Name())
 	if err != nil {
+		_ = os.RemoveAll(unpackDir)
 		return "", err
 	}
 	defer f.Close()
 	gz, err := gzip.NewReader(f)
 	if err != nil {
+		_ = os.RemoveAll(unpackDir)
 		return "", fmt.Errorf("gzip: %w", err)
 	}
 	defer gz.Close()
 	if err := untarUnder(gz, unpackDir); err != nil {
+		// A partial unpack is what fills a small $TMPDIR: remove it, or
+		// the next install starts with less room than this one had.
+		_ = os.RemoveAll(unpackDir)
 		return "", fmt.Errorf("untar: %w", err)
 	}
 	return unpackDir, nil
