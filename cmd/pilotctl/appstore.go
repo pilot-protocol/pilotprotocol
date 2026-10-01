@@ -779,7 +779,7 @@ func cmdAppStoreUninstall(args []string) {
 	// crafted id (e.g. "../../something") can't RemoveAll outside the
 	// install tree. Same guard the install/verify paths use.
 	root := appStoreRoot()
-	dir, err := resolveUnder(root, appID)
+	dir, err := resolveAppDir(root, appID)
 	if err != nil {
 		fatalHint("invalid_argument",
 			"app ids are single directory names; try `pilotctl appstore list`",
@@ -1130,6 +1130,17 @@ func resolveUnder(base, rel string) (string, error) {
 		return "", fmt.Errorf("path %q escapes %s", rel, absBase)
 	}
 	return joined, nil
+}
+
+// resolveAppDir confines a user-supplied app id to one directory directly
+// under root. resolveUnder alone accepts "." (root itself) and nested paths,
+// so `appstore uninstall .` would resolve to the install root and remove
+// every installed app.
+func resolveAppDir(root, appID string) (string, error) {
+	if appID == "." || appID == ".." || strings.ContainsAny(appID, `/\`) {
+		return "", fmt.Errorf("app id must be a single directory name")
+	}
+	return resolveUnder(root, appID)
 }
 
 func cmdAppStoreInstall(args []string) {
@@ -1914,7 +1925,7 @@ func cmdAppStoreCaps(args []string) {
 	// appID is user input; confine it to a single entry under the app
 	// store root so a crafted id (e.g. "../../etc") can't read or open
 	// files outside the install tree.
-	appDir, err := resolveUnder(appStoreRoot(), appID)
+	appDir, err := resolveAppDir(appStoreRoot(), appID)
 	if err != nil {
 		fatalHint("invalid_argument",
 			"app ids are single directory names; try `pilotctl appstore list`",

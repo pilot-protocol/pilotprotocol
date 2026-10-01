@@ -279,6 +279,38 @@ func TestCLIAppStoreUninstallRequiresYes(t *testing.T) {
 	}
 }
 
+// `uninstall .` used to resolve to the install root itself, so --yes removed
+// every installed app. An app id is a single directory name.
+func TestCLIAppStoreUninstallRejectsRootAndNestedIDs(t *testing.T) {
+	t.Parallel()
+	for _, id := range []string{".", "..", "victim/..", "a/b"} {
+		id := id
+		t.Run(id, func(t *testing.T) {
+			t.Parallel()
+			root := filepath.Join(t.TempDir(), "apps-root")
+			for _, app := range []string{"victim", "bystander"} {
+				if err := os.MkdirAll(filepath.Join(root, app), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, stderr, code := runCLI(t, []string{"appstore", "uninstall", id, "--yes"}, map[string]string{
+				"PILOT_APPSTORE_ROOT": root,
+			})
+			if code == 0 {
+				t.Errorf("uninstall %q --yes succeeded", id)
+			}
+			if !strings.Contains(stderr, "invalid app id") {
+				t.Errorf("expected invalid app id error: %s", stderr)
+			}
+			for _, app := range []string{"victim", "bystander"} {
+				if _, err := os.Stat(filepath.Join(root, app)); err != nil {
+					t.Errorf("%s should still exist: %v", app, err)
+				}
+			}
+		})
+	}
+}
+
 func TestCLIAppStoreVerifyMissingBundle(t *testing.T) {
 	t.Parallel()
 	_, stderr, code := runCLI(t, []string{"appstore", "verify", "/no/such/bundle"}, nil)
