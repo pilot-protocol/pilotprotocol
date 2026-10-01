@@ -480,7 +480,7 @@ type Daemon struct {
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 
-	lanAddrs []string // LAN addresses for same-network peer detection
+	lanAddrs []string // LAN addresses for same-network peer detection; guarded by addrMu once Start has spawned the loops
 
 	// Endpoint cache: nodeID -> last-known endpoint (peer resilience)
 	epCacheMu sync.RWMutex
@@ -1314,6 +1314,12 @@ func (d *Daemon) Start() error {
 	// peer's path in place — see pathwatch.go.
 	d.bgWG.Add(1)
 	go func() { defer d.bgWG.Done(); d.pathWatchLoop() }()
+
+	// 8d. Start the address watcher (L4). Notices this host's own address
+	// changing and re-announces to the beacon, the registry and every
+	// tunnel peer at once — see addrwatch.go.
+	d.bgWG.Add(1)
+	go func() { defer d.bgWG.Done(); d.addrWatchLoop() }()
 
 	// 9. Start idle connection sweeper
 	d.bgWG.Add(1)
@@ -5273,7 +5279,7 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	isLoopback := realIP != nil && realIP.IsLoopback()
 	if !isLoopback {
 		if lanAddrs, ok := resp["lan_addrs"].([]interface{}); ok && len(lanAddrs) > 0 {
-			if lanAddr := matchLANSubnet(d.lanAddrs, lanAddrs); lanAddr != "" {
+			if lanAddr := matchLANSubnet(d.currentLANAddrs(), lanAddrs); lanAddr != "" {
 				if !d.addrFamilyMismatch(lanAddr) {
 					targetAddr = lanAddr
 					slog.Info("same-LAN peer detected, using LAN address", "node_id", nodeID, "lan_addr", lanAddr)
@@ -5532,7 +5538,7 @@ func (d *Daemon) reRegister() {
 		ListenAddr: registrationAddr,
 		PublicKey:  pubKeyB64,
 		Owner:      d.config.Owner,
-		LANAddrs:   d.lanAddrs,
+		LANAddrs:   d.currentLANAddrs(),
 		Version:    d.config.Version,
 		RelayOnly:  d.config.RelayOnly, // task 32
 	})
