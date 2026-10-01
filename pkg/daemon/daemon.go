@@ -417,6 +417,10 @@ type Daemon struct {
 	// IPC calls are NOT throttled.
 	autoHandshakeLastAttempt sync.Map
 
+	// hsPoll schedules relayed-handshake polls: the 60s baseline plus the
+	// bounded fast, on-demand and poke-triggered polls (handshakepoll.go).
+	hsPoll *handshakePollSched
+
 	// outbound records the peers this node recently dialed or sent a
 	// trust handshake to, so the private-node SYN gate can admit their
 	// dial-back replies (see replywindow.go).
@@ -635,6 +639,7 @@ func New(cfg Config) *Daemon {
 		tunnels:         NewTunnelManager(),
 		ports:           NewPortManager(),
 		stopCh:          make(chan struct{}),
+		hsPoll:          newHandshakePollSched(),
 		synTokens:       cfg.synRateLimit(),
 		synLastFill:     time.Now(),
 		perSrcSYN:       make(map[uint32]*srcSYNBucket),
@@ -1040,6 +1045,7 @@ func (d *Daemon) Start() error {
 	// the race under §4.8 stress with -race). d.bus is constructed in
 	// New() so it's safe to publish here.
 	d.tunnels.SetEventBus(d.bus)
+	d.tunnels.SetBeaconNotifyHandler(d.handshakePoke)
 
 	// 3. Start UDP listener for tunnel traffic. Compat-mode daemons
 	// skip this — the WSS transport is dialed after register, once we
@@ -2298,6 +2304,18 @@ func (d *Daemon) HandshakeSendRequest(nodeID uint32, reason string) error {
 	}
 	defer d.handshakeInFlight.Delete(nodeID)
 	return d.handshakes.SendRequest(nodeID, reason)
+}
+
+// handshakeRequestSent starts fast polling for the answer to a handshake
+// request that just left. The answer of a private peer comes back through
+// the registry whichever way the request went, so this does not need to
+// know whether the request was relayed. A peer that is already trusted
+// (auto-approved over a direct connection) starts nothing.
+func (d *Daemon) handshakeRequestSent(nodeID uint32, explicit bool) {
+	if d.handshakes == nil || d.handshakes.IsTrusted(nodeID) {
+		return
+	}
+	d.hsPoll.requestSent(nodeID, explicit)
 }
 
 // RegisterHandshakeService installs the daemon-wide HandshakeService
@@ -3940,7 +3958,11 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 			// effort, just like before. ErrHandshakeInFlight short-circuit
 			// is the dedup hit, which is the success case.
 			if d.shouldAutoHandshake(dstAddr.Node) {
-				go func() { _ = d.HandshakeSendRequest(dstAddr.Node, "") }()
+				go func() {
+					if d.HandshakeSendRequest(dstAddr.Node, "") == nil {
+						d.handshakeRequestSent(dstAddr.Node, false)
+					}
+				}()
 			}
 		}
 	}
@@ -5508,21 +5530,70 @@ func (d *Daemon) tunnelKeepaliveLoop() {
 // Owns no transport state. Independent of trustRepublishLoop's failure
 // tracking — handshake polling is best-effort and survives transient
 // registry hiccups on its own.
+//
+// The keepalive-interval tick is the baseline and the only thing an idle
+// node runs. A second timer is armed only while a request this node sent is
+// unanswered, or a beacon poke is owed a poll (see handshakepoll.go), and is
+// stopped again as soon as neither holds.
 func (d *Daemon) handshakePollLoop() {
-	// Independent jitter so this loop does not align with the others.
-	time.Sleep(time.Duration(rand.Int63n(int64(5 * time.Second))))
-
-	ticker := time.NewTicker(d.config.keepaliveInterval())
-	defer ticker.Stop()
+	// Independent jitter so this loop does not align with the others. The
+	// baseline ticker starts once it has passed; requests, pokes and Stop
+	// are served during it.
+	jitter := time.NewTimer(time.Duration(rand.Int63n(int64(5 * time.Second))))
+	defer jitter.Stop()
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	extra := time.NewTimer(time.Hour)
+	extra.Stop()
+	defer extra.Stop()
+	extraArmed := false
+	trusted := func(nodeID uint32) bool {
+		return d.handshakes != nil && d.handshakes.IsTrusted(nodeID)
+	}
 	for {
 		select {
 		case <-d.stopCh:
 			return
-		case <-ticker.C:
-			if d.reg() == nil {
-				continue
+		case <-jitter.C:
+			ticker = time.NewTicker(d.config.keepaliveInterval())
+			tick = ticker.C
+		case <-tick:
+			d.pollHandshakes(0, 0)
+		case <-extra.C:
+			extraArmed = false
+			d.pollHandshakes(handshakeFastPollInterval/2, 0)
+		case <-d.hsPoll.wake:
+			if due, wait := d.hsPoll.pokeWait(); due && wait == 0 {
+				d.pollHandshakes(handshakeOnDemandGap, 0)
 			}
-			d.pollRelayedHandshakes()
+		}
+
+		// Arm the extra timer for whichever comes first: a poll owed to a
+		// poke, or the next fast poll while a request is outstanding.
+		next := time.Duration(-1)
+		if due, wait := d.hsPoll.pokeWait(); due {
+			next = wait
+		}
+		if d.hsPoll.fastActive(trusted) && (next < 0 || handshakeFastPollInterval < next) {
+			next = handshakeFastPollInterval
+		}
+		switch {
+		case next < 0 && extraArmed:
+			if !extra.Stop() {
+				select {
+				case <-extra.C:
+				default:
+				}
+			}
+			extraArmed = false
+		case next >= 0 && !extraArmed:
+			extra.Reset(next)
+			extraArmed = true
 		}
 	}
 }
@@ -6349,8 +6420,20 @@ func (d *Daemon) lookupPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 
 // pollRelayedHandshakes checks the registry for handshake requests and
 // responses relayed to this node and processes them.
-func (d *Daemon) pollRelayedHandshakes() {
-	resp, err := d.reg().PollHandshakes(d.NodeID())
+//
+// timeout > 0 bounds the registry call (a local client is waiting on it);
+// 0 leaves it unbounded, as the background loop always ran it.
+func (d *Daemon) pollRelayedHandshakes(timeout time.Duration) {
+	rc, nodeID := d.reg(), d.NodeID()
+	var resp map[string]interface{}
+	var err error
+	if timeout > 0 {
+		resp, err = withRegistryDeadline(timeout, func() (map[string]interface{}, error) {
+			return rc.PollHandshakes(nodeID)
+		})
+	} else {
+		resp, err = rc.PollHandshakes(nodeID)
+	}
 	if err != nil {
 		slog.Debug("poll handshakes failed", "error", err)
 		return
@@ -6391,6 +6474,7 @@ func (d *Daemon) pollRelayedHandshakes() {
 		}
 		fromNodeID := uint32(fromIDVal)
 		accept, _ := respMsg["accept"].(bool)
+		d.hsPoll.answered(fromNodeID)
 
 		if accept {
 			slog.Info("relayed handshake approval received", "from_node_id", fromNodeID)

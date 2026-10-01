@@ -84,6 +84,10 @@ type TestEnv struct {
 	RegistryAddr string
 	AdminToken   string
 
+	// HandshakeNotify is true when the registry and beacon in use can
+	// prompt a node to poll for a relayed handshake.
+	HandshakeNotify bool
+
 	daemons  []*daemon.Daemon
 	drivers  []*driver.Driver
 	runtimes []*pluginsruntime.Runtime
@@ -135,6 +139,16 @@ func NewTestEnv(t *testing.T) *TestEnv {
 		t.Fatal("registry failed to start within 5s")
 	}
 	env.RegistryAddr = resolveLocalAddr(env.Registry.Addr())
+
+	// Same wiring as cmd/rendezvous: the beacon prompts the recipient of a
+	// relayed handshake to poll. Asserted so the harness builds against
+	// beacon / rendezvous releases that predate the hook.
+	if b, ok := interface{}(env.Beacon).(interface{ NotifyNode(uint32) error }); ok {
+		if r, ok := interface{}(env.Registry).(interface{ SetHandshakeNotifier(func(uint32)) }); ok {
+			r.SetHandshakeNotifier(func(nodeID uint32) { _ = b.NotifyNode(nodeID) })
+			env.HandshakeNotify = true
+		}
+	}
 
 	t.Cleanup(func() {
 		env.Close()

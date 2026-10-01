@@ -200,6 +200,10 @@ type TunnelManager struct {
 	// or only the session layer (decrypt/key desync). Stamped at Listen /
 	// ConnectCompat so the age is measured from transport start, not epoch.
 	LastRecvNano int64
+
+	// onBeaconNotify is run when the beacon says the registry holds
+	// something for this node (beaconMsgNotify).
+	onBeaconNotify atomic.Pointer[func()]
 	// P1-008: packets dropped from the per-peer pending queue while waiting
 	// for key exchange. Exposed so operators can tell a congested overlay
 	// apart from a silent crypto stall.
@@ -2318,9 +2322,35 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 			return
 		}
 		tm.handleRelayDeliver(data[1:])
+	case beaconMsgNotify:
+		// Carries nothing but "the registry holds something for you".
+		// Only the beacon may say so, and what the daemon does with it is
+		// rate-limited (handshakepoll.go), so a forged or repeated notify
+		// costs at most a few registry polls.
+		if !fromBeacon {
+			slog.Debug("dropping notify from non-beacon source", "from", from)
+			return
+		}
+		if fn := tm.onBeaconNotify.Load(); fn != nil {
+			(*fn)()
+		}
 	default:
 		slog.Debug("unknown beacon message on tunnel socket", "type", data[0], "from", from)
 	}
+}
+
+// beaconMsgNotify is a beacon → node message, [0x0A][kind(1)], telling the
+// node that the registry is holding something for it. kind 0x01 is a relayed
+// trust-handshake request or answer; the node polls for it. It carries no
+// node ID, address or payload. Daemons that predate it log it as an unknown
+// beacon message and drop it. (Must match beacon.MsgNotify; the other beacon
+// message types live in common/protocol and this one should move there.)
+const beaconMsgNotify byte = 0x0A
+
+// SetBeaconNotifyHandler installs the callback run for each beacon notify.
+// It is called on the tunnel read loop and must not block.
+func (tm *TunnelManager) SetBeaconNotifyHandler(fn func()) {
+	tm.onBeaconNotify.Store(&fn)
 }
 
 // handlePunchCommand processes a beacon punch command, sending a punch packet

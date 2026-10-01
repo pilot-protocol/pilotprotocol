@@ -165,7 +165,7 @@ func TestPollRelayedHandshakesEmptyNoOp(t *testing.T) {
 	registerSelfOnRegistry(t, d)
 
 	// No panic, no side effect. The empty-list branches are still walked.
-	d.pollRelayedHandshakes()
+	d.pollRelayedHandshakes(0)
 }
 
 // pollRelayedHandshakesHasService verifies that when a HandshakeService is
@@ -208,7 +208,7 @@ func TestPollRelayedHandshakesWithServiceNoOp(t *testing.T) {
 
 	// Empty mailbox — the code walks the empty requests/responses lists
 	// and the service-non-nil guards but does not invoke any Process* method.
-	d.pollRelayedHandshakes()
+	d.pollRelayedHandshakes(0)
 
 	if svc.requests.Load() != 0 || svc.approvals.Load() != 0 || svc.rejections.Load() != 0 {
 		t.Fatalf("unexpected service calls: req=%d approve=%d reject=%d",

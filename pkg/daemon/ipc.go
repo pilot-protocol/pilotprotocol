@@ -1955,7 +1955,13 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 		if len(rest) > 4 {
 			justification = string(rest[4:])
 		}
-		if err := s.daemon.HandshakeSendRequest(nodeID, justification); err != nil {
+		err := s.daemon.HandshakeSendRequest(nodeID, justification)
+		if err == nil || errors.Is(err, ErrHandshakeInFlight) {
+			// Poll for the answer every couple of seconds for a while
+			// instead of once a minute.
+			s.daemon.handshakeRequestSent(nodeID, true)
+		}
+		if err != nil {
 			if errors.Is(err, ErrHandshakeInFlight) {
 				// Soft success: another caller is already running the
 				// same handshake. Reply with a distinct status so
@@ -1985,6 +1991,10 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 			return
 		}
 		nodeID := binary.BigEndian.Uint32(rest[0:4])
+		// A request relayed through the registry is only known here once
+		// polled; fetch it now so it can be answered without waiting for
+		// the next background poll. Same for reject, pending and trusted.
+		s.daemon.pollHandshakesOnDemand()
 		if err := s.daemon.handshakes.ApproveHandshake(nodeID); err != nil {
 			s.sendError(conn, reqID, fmt.Sprintf("handshake approve: %v", err))
 			return
@@ -2005,6 +2015,7 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 		if len(rest) > 4 {
 			reason = string(rest[4:])
 		}
+		s.daemon.pollHandshakesOnDemand()
 		if err := s.daemon.handshakes.RejectHandshake(nodeID, reason); err != nil {
 			s.sendError(conn, reqID, fmt.Sprintf("handshake reject: %v", err))
 			return
@@ -2016,6 +2027,7 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 		s.ipcWriteHandshakeOK(conn, reqID, data)
 
 	case SubHandshakePending:
+		s.daemon.pollHandshakesOnDemand()
 		pending := s.daemon.handshakes.PendingRequests()
 		list := make([]map[string]interface{}, len(pending))
 		for i, p := range pending {
@@ -2032,6 +2044,7 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 		s.ipcWriteHandshakeOK(conn, reqID, data)
 
 	case SubHandshakeTrusted:
+		s.daemon.pollHandshakesOnDemand()
 		trusted := s.daemon.handshakes.TrustedPeers()
 		list := make([]map[string]interface{}, len(trusted))
 		for i, t := range trusted {
@@ -2076,6 +2089,7 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 		if timeoutMs > 30000 {
 			timeoutMs = 30000
 		}
+		s.daemon.pollHandshakesOnDemand()
 		ok := s.daemon.handshakes.WaitForTrust(nodeID, time.Duration(timeoutMs)*time.Millisecond)
 		data, _ := json.Marshal(map[string]interface{}{
 			"node_id": nodeID,
