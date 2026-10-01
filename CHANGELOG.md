@@ -10,6 +10,17 @@ Detailed per-release notes are on the
 ## [Unreleased]
 
 ### Added
+- **A client can ask the daemon whether a datagram was actually sent.** The
+  IPC `SendTo` command is fire-and-forget: when the daemon could not send a
+  datagram (no route to the node, port policy, ephemeral ports exhausted) it
+  only logged `IPC datagram send failed`, and `pilotctl dgram` and the
+  driver's `SendTo` still reported success. A new command pair,
+  `CmdSendToConfirm` (0x39) / `CmdSendToOK` (0x3A), sends the same datagram
+  and replies OK once it is handed to the tunnel, or with the error. The
+  daemon lists `dgram_confirm` in the `info` reply's `features`. The
+  existing `SendTo` command is unchanged and still never replies, so
+  current clients and SDKs are unaffected; `pilotctl dgram` switches to the
+  confirmed send once the driver release that carries it is picked up.
 - **The daemon caps its own log file.** launchd never rotates the daemon's
   `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
   without bound — 22 MB on one laptop. When stderr is a regular file the
@@ -263,6 +274,16 @@ Detailed per-release notes are on the
   registry had recorded — and peers resolved — the node's private address
   with the real tunnel port. The daemon now reports that address. Nothing
   sent to the registry changes.
+- **Parallel sends to one peer no longer stall or time out on the peer's
+  SYN limiter.** The per-source limit admitted 10 connections at once and
+  silently dropped the rest; the dialers retransmitted together, so a burst
+  of 64 connections from one node took 9 s and larger bursts ended in dial
+  timeouts (and flipped a healthy direct peer to relay). A source may now
+  open 64 connections at once; the sustained rate is still 10 per second.
+  The per-source limit is also checked before the shared one, so a source
+  over its own limit no longer uses up the tokens other peers need
+  (previously every SYN it had rejected still took a shared token).
+  `-syn-whitelist` is unchanged.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's
