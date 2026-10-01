@@ -279,7 +279,7 @@ const (
 	DialMaxRetries       = 7                      // total attempts (direct + relay). 3 direct + 4 relay. With DialInitialRTO=250ms exponential-backoff capped at DialMaxRTO=8s, the relay phase is ~7.75s — covers cold-start handshake (key_exchange + flushPending + SYN/SYN-ACK round trip) for typical peers while keeping bad dials from blocking longer than the user's --timeout. The probe-and-adapt machinery (see srttHistory below) will let us shorten this for peers we've successfully dialed before.
 	DialInitialRTO       = 250 * time.Millisecond // initial SYN retransmission timeout. Lowered from 1s — modern relay RTT is <200ms; waiting a full second before assuming loss makes cold dials feel like a stall. Three direct retries with exponential backoff (250→500→1000) still cover up to 1.75s of jitter before flipping to relay; that's plenty for an unhealthy direct path while letting the common case (peer is reachable, single retry needed) feel snappy.
 	DialMaxRTO           = 8 * time.Second        // max backoff for SYN retransmission
-	DialCheckInterval    = 10 * time.Millisecond  // poll interval for state changes during dial
+	DialCheckInterval    = 10 * time.Millisecond  // backstop poll for state changes during dial (conn.DialCh is the fast path)
 	RetxCheckInterval    = 100 * time.Millisecond // retransmission check ticker
 	MaxRetxAttempts      = 8                      // abandon connection after this many retransmissions
 	HeartbeatReregThresh = 3                      // heartbeat failures before re-registration
@@ -3472,6 +3472,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		sendSeq := conn.SendSeq
 		recvAck := conn.RecvAck
 		conn.Mu.Unlock()
+		conn.signalDial()
 
 		conn.RecvMu.Lock()
 		conn.ExpectedSeq = pkt.Seq + 1 // first data segment after SYN-ACK
@@ -4037,6 +4038,40 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 	check := time.NewTicker(DialCheckInterval)
 	defer check.Stop()
 
+	// dialOutcome reports whether the dial is over, and how. It runs when
+	// the handshake signals conn.DialCh, and on a slow tick as a backstop.
+	dialOutcome := func() (*Connection, error, bool) {
+		conn.Mu.Lock()
+		st := conn.State
+		conn.Mu.Unlock()
+		if st == StateEstablished || st == StateFinWait || st == StateTimeWait {
+			// StateFinWait/StateTimeWait: the three-way handshake completed but
+			// the remote closed before we observed ESTABLISHED. The connection
+			// was successfully established — return it so the caller can handle
+			// the closed state normally.
+			if st == StateEstablished {
+				d.startRetxLoop(conn)
+			}
+			// A completed handshake proves the outbound path is alive —
+			// clears the rx-watchdog's partial-wedge signal.
+			d.lastDialOKNano.Store(time.Now().UnixNano())
+			d.consecutiveDialTimeouts.Store(0)
+			return conn, nil, true
+		}
+		if st == StateClosed {
+			// Symmetric with the ctx.Done and retries>maxRetries arms:
+			// the connection is finished from this dial's perspective,
+			// so release the slot immediately. StaleConnections does
+			// catch StateClosed entries on its next tick, but until
+			// then the conn occupies an ephemeral port AND counts toward
+			// MaxTotalConnections — making the next dial fail under
+			// burst even though nothing real holds the slot.
+			d.ports.RemoveConnection(conn.ID)
+			return nil, protocol.ErrConnRefused, true
+		}
+		return nil, nil, false
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -4054,34 +4089,13 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 				d.tunnels.SetRelayPeer(dstAddr.Node, false)
 			}
 			return nil, ctx.Err()
-		case <-check.C:
-			conn.Mu.Lock()
-			st := conn.State
-			conn.Mu.Unlock()
-			if st == StateEstablished || st == StateFinWait || st == StateTimeWait {
-				// StateFinWait/StateTimeWait: the three-way handshake completed but
-				// the remote closed before we observed ESTABLISHED. The connection
-				// was successfully established — return it so the caller can handle
-				// the closed state normally.
-				if st == StateEstablished {
-					d.startRetxLoop(conn)
-				}
-				// A completed handshake proves the outbound path is alive —
-				// clears the rx-watchdog's partial-wedge signal.
-				d.lastDialOKNano.Store(time.Now().UnixNano())
-				d.consecutiveDialTimeouts.Store(0)
-				return conn, nil
+		case <-conn.DialCh:
+			if c, err, done := dialOutcome(); done {
+				return c, err
 			}
-			if st == StateClosed {
-				// Symmetric with the ctx.Done and retries>maxRetries arms:
-				// the connection is finished from this dial's perspective,
-				// so release the slot immediately. StaleConnections does
-				// catch StateClosed entries on its next tick, but until
-				// then the conn occupies an ephemeral port AND counts toward
-				// MaxTotalConnections — making the next dial fail under
-				// burst even though nothing real holds the slot.
-				d.ports.RemoveConnection(conn.ID)
-				return nil, protocol.ErrConnRefused
+		case <-check.C:
+			if c, err, done := dialOutcome(); done {
+				return c, err
 			}
 		case <-timer.C:
 			if keyPending() {
@@ -4185,8 +4199,20 @@ var ErrDialKeyExchange = fmt.Errorf("%w: key exchange with peer did not complete
 // NagleTimeout is the maximum time to buffer small writes before flushing.
 const NagleTimeout = 40 * time.Millisecond
 
-// DelayedACKTimeout is the max time to delay an ACK (RFC 1122 suggests 500ms max, we use 40ms).
-const DelayedACKTimeout = 40 * time.Millisecond
+// DelayedACKTimeout is the max time to delay an ACK (RFC 1122 suggests 500ms max).
+//
+// It is also how long a write can stall with both ends idle. Nagle holds a
+// short write — a frame's body after its header, the tail of a large write —
+// until the data before it is ACKed, and the ACK of a lone or odd segment
+// waits for this timer. At 40ms that was 40ms on the first exchange of every
+// connection and one stall per 48KB file chunk (about 1.5 MB/s on any link).
+//
+// The timer is shortened rather than removed from the path. ACKing short
+// segments at once, or sending tails without waiting, takes the pause between
+// writes away entirely; several streams then burst into the peer's socket
+// buffer faster than a stock kernel's can hold, and four concurrent 20MB
+// transfers measured 34-40s instead of 1.4s.
+const DelayedACKTimeout = 5 * time.Millisecond
 
 // DelayedACKThreshold is the number of segments to receive before sending an ACK immediately.
 const DelayedACKThreshold = 2
@@ -4791,6 +4817,10 @@ func (d *Daemon) SendDatagram(dstAddr protocol.Addr, dstPort uint16, data []byte
 	if srcPort == 0 {
 		return ErrEphemeralExhausted
 	}
+	// A datagram creates no connection, so nothing else would ever return
+	// this port: left allocated, ~16k datagrams exhaust the ephemeral range
+	// and every later dial fails until the daemon restarts.
+	defer d.ports.ReleaseEphemeralPort(srcPort)
 
 	if err := d.ensureTunnel(dstAddr.Node); err != nil {
 		return err
@@ -4831,6 +4861,10 @@ func (d *Daemon) BroadcastDatagram(netID uint16, dstPort uint16, data []byte, ad
 	if srcPort == 0 {
 		return ErrEphemeralExhausted
 	}
+	// A datagram creates no connection, so nothing else would ever return
+	// this port: left allocated, ~16k datagrams exhaust the ephemeral range
+	// and every later dial fails until the daemon restarts.
+	defer d.ports.ReleaseEphemeralPort(srcPort)
 	return d.broadcastDatagram(netID, srcPort, dstPort, data, adminToken)
 }
 

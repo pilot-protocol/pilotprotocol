@@ -1234,6 +1234,14 @@ func cmdAppStoreInstall(args []string) {
 			"the argument must be either a catalogue ID (`pilotctl appstore catalogue` to list) or a path to a bundle dir containing manifest.json",
 			"%v", err)
 	}
+	if source == installSourceCatalogue {
+		// The bundle was unpacked into a temporary directory for this
+		// install alone. It was never removed, so every install — failed or
+		// not — left a copy of the app behind in $TMPDIR.
+		removeUnpacked := func() { _ = os.RemoveAll(bundleDir) }
+		defer removeUnpacked()
+		fatalCleanups = append(fatalCleanups, removeUnpacked)
+	}
 	if source == installSourceLocal && !allowLocal {
 		fatalHint("invalid_argument",
 			"local sideloads carry no catalogue signature; pass --local to confirm you trust this bundle's source. The supervisor will clamp the manifest to a small allow-list (fs.read/fs.write under $APP, audit.log). No net.dial, key.sign, ipc.call to other apps, or daemon hooks.",
@@ -2663,13 +2671,14 @@ func cmdAppStoreCall(args []string) {
 		}
 	}
 
-	sockPath := filepath.Join(appStoreRoot(), appID, "app.sock")
-	if _, err := os.Stat(sockPath); err != nil {
+	appDir := filepath.Join(appStoreRoot(), appID)
+	sockPath := filepath.Join(appDir, "app.sock")
+	if err := waitForAppSocket(appDir, sockPath, appSocketWait); err != nil {
 		// Not installed here at all: if the id is a rename tombstone, say so
 		// instead of blaming the daemon. No silent retarget: the method
 		// namespace changed too. (An installed app whose daemon is down skips
 		// the catalogue fetch.)
-		if _, derr := os.Stat(filepath.Dir(sockPath)); errors.Is(derr, os.ErrNotExist) { // #nosec G703 -- only a stat of the dir whose app.sock was stat'ed just above; nothing is read or written
+		if _, derr := os.Stat(appDir); errors.Is(derr, os.ErrNotExist) { // #nosec G703 -- only a stat of the dir whose app.sock was stat'ed just above; nothing is read or written
 			if c, lerr := loadCatalogue(); lerr == nil {
 				if e := c.findEntry(appID); e != nil && e.RenamedTo != "" {
 					fatalHint("invalid_argument",
@@ -2677,6 +2686,11 @@ func cmdAppStoreCall(args []string) {
 						"app %q was renamed to %q", appID, e.RenamedTo)
 				}
 			}
+		}
+		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil {
+			fatalHint("io_error",
+				"the app crashed repeatedly and was suspended: `pilotctl appstore audit "+appID+"` shows the exits, the app's own error output is in the daemon's log; `pilotctl appstore restart "+appID+"` retries it",
+				"app %s is suspended", appID)
 		}
 		fatalHint("io_error",
 			"is the daemon running and has it supervised this app yet?",
@@ -2786,4 +2800,33 @@ func cmdAppStoreCall(args []string) {
 	}
 	_, _ = pretty.WriteTo(os.Stdout)
 	fmt.Println()
+}
+
+// appSocketWait is how long `appstore call` waits for an installed app's
+// socket to appear. The daemon starts an app on its next rescan after the
+// install and the adapter then stages its own assets, so a call made right
+// after `install` used to fail with "socket not present" for several seconds.
+const appSocketWait = 15 * time.Second
+
+// waitForAppSocket returns once sockPath exists. It only waits for an app
+// that is installed and not suspended; otherwise the socket is not coming and
+// it reports that at once.
+func waitForAppSocket(appDir, sockPath string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		_, err := os.Stat(sockPath)
+		if err == nil {
+			return nil
+		}
+		if _, merr := os.Stat(filepath.Join(appDir, "manifest.json")); merr != nil {
+			return err // not installed
+		}
+		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }

@@ -27,8 +27,16 @@ func exitAfterFatal(code, msg string) {
 	if fatalTrapDepth > 0 {
 		panic(trappedFatal{Code: code, Message: msg})
 	}
+	for _, fn := range fatalCleanups {
+		fn()
+	}
 	os.Exit(1)
 }
+
+// fatalCleanups run before a fatal error exits the process. os.Exit skips
+// deferred calls, so anything that must not outlive the command (a temporary
+// directory, say) registers here as well as deferring its own removal.
+var fatalCleanups []func()
 
 // runTrappingFatal runs fn and returns the fatal error it ended with, or nil
 // when it returned normally. Any other panic propagates.
