@@ -36,6 +36,13 @@ func TestMain(m *testing.M) {
 			}
 		}
 		os.Args = append([]string{"pilotctl"}, argv...)
+		if os.Getenv("PILOTCTL_TEST_SANDBOX") == "1" {
+			// A Linux container without systemd, with bash (see
+			// sandboxProxyCmdFor), whatever host runs the test.
+			hostGOOS = "linux"
+			systemdRunning = func() bool { return false }
+			bashAvailable = func() bool { return true }
+		}
 		main()
 		return
 	}

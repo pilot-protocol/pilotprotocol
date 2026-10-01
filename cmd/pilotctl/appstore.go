@@ -193,13 +193,13 @@ func cmdAppStoreList(_ []string) {
 				_ = json.NewEncoder(os.Stdout).Encode([]appListEntry{})
 				return
 			}
-			fmt.Fprintf(os.Stderr, "no install root at %s — install an app first\n", root)
+			fmt.Printf("no apps installed under %s\n", root)
 			return
 		}
 		fatalHint("io_error", "check the install root permissions", "read %s: %v", root, err)
 	}
 
-	var apps []appListEntry
+	apps := make([]appListEntry, 0)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue

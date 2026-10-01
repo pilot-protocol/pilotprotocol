@@ -58,14 +58,9 @@ func TestExitRequestRunsGracefulShutdownThenExits(t *testing.T) {
 	// (the handler runs on the watchdog goroutine).
 	forwardExitRequest(daemon.ExitRequest{Code: 1, Reason: "dup"})
 
-	cause := awaitShutdown(make(chan os.Signal), make(chan string), supervisorExitRequests, func() {
-		t.Error("reload called without SIGHUP")
-	})
+	cause := awaitShutdown(make(chan os.Signal), supervisorExitRequests)
 	if cause.exit == nil || cause.exit.Code != 86 {
 		t.Fatalf("cause = %+v, want exit request with code 86", cause)
-	}
-	if cause.restart {
-		t.Fatal("exit request must not re-exec")
 	}
 
 	var rec stepRecorder
@@ -84,17 +79,17 @@ func TestExitRequestRunsGracefulShutdownThenExits(t *testing.T) {
 }
 
 // TestSignalShutdownDoesNotExit: SIGTERM keeps the old behavior — tear
-// down and return from main (status 0), no forced exit code.
+// down and return from main (status 0), no forced exit code. A SIGHUP
+// ahead of it is ignored rather than ending the loop.
 func TestSignalShutdownDoesNotExit(t *testing.T) {
 	sig := make(chan os.Signal, 2)
 	sig <- syscall.SIGHUP
 	sig <- syscall.SIGTERM
-	reloads := 0
-	cause := awaitShutdown(sig, make(chan string), make(chan daemon.ExitRequest), func() { reloads++ })
-	if reloads != 1 {
-		t.Fatalf("SIGHUP reloads = %d, want 1", reloads)
+	cause := awaitShutdown(sig, make(chan daemon.ExitRequest))
+	if len(sig) != 0 {
+		t.Fatalf("awaitShutdown returned on SIGHUP, %d signal(s) left unread", len(sig))
 	}
-	if cause.exit != nil || cause.restart {
+	if cause.exit != nil {
 		t.Fatalf("SIGTERM cause = %+v, want plain shutdown", cause)
 	}
 
@@ -105,17 +100,6 @@ func TestSignalShutdownDoesNotExit(t *testing.T) {
 		func(code int) { t.Fatalf("signal shutdown called exit(%d)", code) })
 	if want := []string{"daemon.Stop", "StopPlugins"}; !equalSteps(rec.snapshot(), want) {
 		t.Fatalf("teardown steps = %v, want %v", rec.snapshot(), want)
-	}
-}
-
-// TestLifecycleRestartCause: the signed fleet restart still maps to a
-// re-exec, not an exit.
-func TestLifecycleRestartCause(t *testing.T) {
-	lifecycle := make(chan string, 1)
-	lifecycle <- "restart"
-	cause := awaitShutdown(make(chan os.Signal), lifecycle, make(chan daemon.ExitRequest), func() {})
-	if !cause.restart || cause.exit != nil {
-		t.Fatalf("cause = %+v, want restart", cause)
 	}
 }
 
