@@ -249,6 +249,21 @@ Detailed per-release notes are on the
     new binary. In every other case the daemon keeps running and
     `restart_error` says how to restart it. Every check is recorded in
     `~/.pilot/update-state.json`.
+- **`pilotctl appstore install` says whether the app started.** Install only
+  writes files and the daemon starts the app a moment later, so it reported
+  success for an app that then exited at every start (seen with
+  `io.pilot.sqlite` on an image without `tar`) and was suspended half a minute
+  later. With a daemon running, install now waits up to 20s for the first
+  start and reports one of three outcomes: started; failed — the supervisor
+  suspended the app, or it exited at least twice without opening its socket —
+  in which case install **exits non-zero** (`app_start_failed`) with the last
+  supervisor log line and where to look next; or still starting, which is not
+  an error, so an app that needs longer than the wait is not a failed
+  install. The `--json` report gains `start_state`, `start_exits`,
+  `start_detail` and `start_waited_ms`; nothing existing changed. No wait
+  with `--no-wait`, when no daemon is running, or for a reinstall the
+  supervisor does not act on (same version and binary, or an older version).
+  `appstore upgrade` does not wait.
 
 ### Fixed
 - **Proxy credential hints no longer send an operator who already set
