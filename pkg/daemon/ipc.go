@@ -113,6 +113,16 @@ const (
 	// accepted connections and the rest of the driver session intact.
 	CmdUnbind   byte = 0x37
 	CmdUnbindOK byte = 0x38
+	// CmdSendToConfirm is CmdSendTo with a reply: CmdSendToOK once the
+	// datagram has been handed to the tunnel, CmdError when the daemon
+	// could not send it. CmdSendTo itself must stay silent — the envelope
+	// has no request ID, and a driver that never asked for a reply would
+	// hand a CmdError to whichever unrelated request it has in flight.
+	// Daemons that support the pair list "dgram_confirm" in the info
+	// reply's features. (Must match driver cmdSendToConfirm/cmdSendToOK in
+	// common/driver.)
+	CmdSendToConfirm byte = 0x39
+	CmdSendToOK      byte = 0x3A
 )
 
 // Network sub-commands (second byte of CmdNetwork payload)
@@ -762,8 +772,9 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 		// data ordering — dataexchange.WriteFrame issues two sequential
 		// Conn.Write() calls (header + payload); if those raced in
 		// worker goroutines, SendData would append in the wrong order
-		// and the receiver would see a corrupted frame. CmdSendTo
-		// follows the same pattern. CmdHealth also dispatches inline
+		// and the receiver would see a corrupted frame. CmdSendTo and
+		// CmdSendToConfirm follow the same pattern, so datagrams leave in
+		// the order the client wrote them. CmdHealth also dispatches inline
 		// so health checks bypass the per-client semaphore — when all
 		// dispatch slots are occupied by goroutines parked in ipcWrite
 		// (PILOT-218 write-deadline deadlock), CmdHealth must still
@@ -778,6 +789,9 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 			continue
 		case CmdSendTo:
 			s.handleSendTo(conn, reqID, payload)
+			continue
+		case CmdSendToConfirm:
+			s.handleSendToConfirm(conn, reqID, payload)
 			continue
 		case CmdHealth:
 			s.handleHealth(conn, reqID)
@@ -828,6 +842,8 @@ func (s *IPCServer) dispatch(conn *ipcConn, cmd byte, reqID uint64, payload []by
 		s.handleClose(conn, reqID, payload)
 	case CmdSendTo:
 		s.handleSendTo(conn, reqID, payload)
+	case CmdSendToConfirm:
+		s.handleSendToConfirm(conn, reqID, payload)
 	case CmdBroadcast:
 		s.handleBroadcast(conn, reqID, payload)
 	case CmdInfo:
@@ -1076,6 +1092,30 @@ func (s *IPCServer) handleSendTo(conn *ipcConn, reqID uint64, payload []byte) {
 	}
 }
 
+// handleSendToConfirm services CmdSendToConfirm: the same payload as
+// CmdSendTo ([dstAddr][dstPort(2)][data...]), but the client waits for the
+// outcome. CmdSendToOK (no body) means the datagram was handed to the
+// tunnel — datagrams are unreliable, so it says nothing about delivery.
+// CmdError carries the reason the daemon could not send it.
+func (s *IPCServer) handleSendToConfirm(conn *ipcConn, reqID uint64, payload []byte) {
+	if len(payload) < protocol.AddrSize+2 {
+		s.sendError(conn, reqID, "sendto: missing header")
+		return
+	}
+	dstAddr := protocol.UnmarshalAddr(payload[0:protocol.AddrSize])
+	dstPort := binary.BigEndian.Uint16(payload[protocol.AddrSize : protocol.AddrSize+2])
+	data := payload[protocol.AddrSize+2:]
+
+	if err := s.daemon.SendDatagram(dstAddr, dstPort, data); err != nil {
+		slog.Warn("IPC datagram send failed", "dst", dstAddr.String(), "dst_port", dstPort, "bytes", len(data), "err", err)
+		s.sendError(conn, reqID, fmt.Sprintf("sendto: %v", err))
+		return
+	}
+	if err := conn.writeReply(CmdSendToOK, reqID, nil); err != nil {
+		slog.Debug("IPC sendto reply failed", "err", err)
+	}
+}
+
 // handleBroadcast services CmdBroadcast — admin-token-gated fan-out to a
 // whole network. Wire payload:
 //
@@ -1120,7 +1160,10 @@ func (s *IPCServer) handleBroadcast(conn *ipcConn, reqID uint64, payload []byte)
 //     "key exchange with peer did not complete" when it never finishes.
 //   - key_request: an unanswered first-contact key exchange also sends a
 //     key request that every released daemon answers.
-var daemonFeatures = []string{"reply_window", "dial_awaits_key", "key_request"}
+//   - dgram_confirm: CmdSendToConfirm sends a datagram and replies with
+//     the outcome, so a client can tell a datagram the daemon failed to
+//     send from one it sent.
+var daemonFeatures = []string{"reply_window", "dial_awaits_key", "key_request", "dgram_confirm"}
 
 func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 	info := s.daemon.Info()

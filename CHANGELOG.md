@@ -10,6 +10,17 @@ Detailed per-release notes are on the
 ## [Unreleased]
 
 ### Added
+- **A client can ask the daemon whether a datagram was actually sent.** The
+  IPC `SendTo` command is fire-and-forget: when the daemon could not send a
+  datagram (no route to the node, port policy, ephemeral ports exhausted) it
+  only logged `IPC datagram send failed`, and `pilotctl dgram` and the
+  driver's `SendTo` still reported success. A new command pair,
+  `CmdSendToConfirm` (0x39) / `CmdSendToOK` (0x3A), sends the same datagram
+  and replies OK once it is handed to the tunnel, or with the error. The
+  daemon lists `dgram_confirm` in the `info` reply's `features`. The
+  existing `SendTo` command is unchanged and still never replies, so
+  current clients and SDKs are unaffected; `pilotctl dgram` switches to the
+  confirmed send once the driver release that carries it is picked up.
 - **The daemon caps its own log file.** launchd never rotates the daemon's
   `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
   without bound — 22 MB on one laptop. When stderr is a regular file the
