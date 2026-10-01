@@ -801,7 +801,7 @@ func cmdAppStoreUninstall(args []string) {
 			"%s is not a directory", dir)
 	}
 	// Not in the middle of an install or upgrade of the same app.
-	unlock, err := lockAppInstall(root, appID)
+	unlock, unlockAndRemove, err := lockAppInstallRemovable(root, appID)
 	if err != nil {
 		fatalHint("timeout", "wait for the other install or upgrade of this app to finish, then re-run", "%v", err)
 	}
@@ -879,6 +879,9 @@ func cmdAppStoreUninstall(args []string) {
 		}
 	}
 	stillRunning := processesRunningFrom(procRoots)
+	// The app is gone and nothing below touches its dirs, so the lock is
+	// released here and its file deleted with it (appstore_lock.go).
+	unlockAndRemove()
 
 	// Forensic trail at the install-root level (survives the deletion
 	// of the app dir). Pairs with the install-time event we wrote
