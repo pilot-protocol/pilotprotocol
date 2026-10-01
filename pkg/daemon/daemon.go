@@ -4299,6 +4299,30 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 		return d.sendDataImmediate(conn, data)
 	}
 
+	// A write larger than the send buffer can never fit in it, so it used
+	// to be refused outright with ErrSendBufFull — and since an IPC send has
+	// no reply, the client never knew: a message over MaxNagleBuf (256 KB)
+	// was dropped while the sender reported success. Feed a large write
+	// through the buffer in whole-segment pieces instead. Each piece is
+	// flushed before the next is taken (sendSegment blocks on the window),
+	// so the buffer never holds more than one piece of this write.
+	for len(data) > nagleWritePiece {
+		if err := d.sendDataPiece(conn, data[:nagleWritePiece]); err != nil {
+			return err
+		}
+		data = data[nagleWritePiece:]
+	}
+	return d.sendDataPiece(conn, data)
+}
+
+// nagleWritePiece is how much of one large write SendData buffers at a time:
+// a whole number of segments, so a piece leaves no tail behind for Nagle to
+// hold, and well under MaxNagleBuf.
+const nagleWritePiece = 16 * MaxSegmentSize
+
+// sendDataPiece buffers one write of at most nagleWritePiece bytes (or any
+// smaller caller write) and flushes it under Nagle's algorithm.
+func (d *Daemon) sendDataPiece(conn *Connection, data []byte) error {
 	conn.NagleMu.Lock()
 	// v1.9.1: cap NagleBuf at MaxNagleBuf. Without this, slow peers /
 	// full cwnd / packet loss caused the buffer to grow without bound,

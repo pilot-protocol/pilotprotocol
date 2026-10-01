@@ -61,26 +61,9 @@ func TestSendDataNagleBufGrowsUnbounded(t *testing.T) {
 	conn.PeerRecvWin = 1 << 20 // advertise 1 MB receive window so cwnd is the binding constraint
 	conn.Mu.Unlock()
 
-	// FIXED (v1.9.1): SendData now rejects an oversized write up-front
-	// instead of appending it to NagleBuf. The 5 MiB write should
-	// return ErrSendBufFull immediately and NagleBuf should remain
-	// at 0 (not grow at all). MaxNagleBuf = 64 * MaxSegmentSize = 256 KB.
-	const payloadSize = 5 * 1024 * 1024
-	payload := make([]byte, payloadSize)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	err := d.SendData(conn, payload)
-	if !errors.Is(err, ErrSendBufFull) {
-		t.Fatalf("expected ErrSendBufFull on 5 MiB oversized write; got %v", err)
-	}
-
-	conn.NagleMu.Lock()
-	bufLen := len(conn.NagleBuf)
-	conn.NagleMu.Unlock()
-	if bufLen != 0 {
-		t.Errorf("NagleBuf should be empty after rejected oversized write; got %d bytes", bufLen)
-	}
+	// The cap on NagleBuf is what fixed the OOM. (A single write larger
+	// than the cap used to be refused here too; it is now fed through the
+	// buffer in pieces — see TestSendDataOversizedWriteStaysWithinNagleCap.)
 
 	// Cap is invariant: a sequence of small writes that, in aggregate,
 	// would exceed the cap also rejects the offending one. Send up
@@ -106,7 +89,7 @@ func TestSendDataNagleBufGrowsUnbounded(t *testing.T) {
 
 	// And confirm NagleBuf still didn't grow past the cap.
 	conn.NagleMu.Lock()
-	bufLen = len(conn.NagleBuf)
+	bufLen := len(conn.NagleBuf)
 	conn.NagleMu.Unlock()
 	if bufLen > MaxNagleBuf {
 		t.Errorf("NagleBuf grew past cap %d; got %d", MaxNagleBuf, bufLen)
@@ -119,4 +102,63 @@ func TestSendDataNagleBufGrowsUnbounded(t *testing.T) {
 	conn.Mu.Unlock()
 	d.ports.RemoveConnection(conn.ID)
 	_ = time.Millisecond // keep `time` import live regardless of what's in cleanup
+}
+
+// A write larger than MaxNagleBuf used to be refused with ErrSendBufFull.
+// Over IPC that refusal has nowhere to go (a send has no reply), so a client
+// writing a 1 MB message lost it while reporting success. SendData now feeds
+// such a write through the buffer in pieces and blocks on the window like any
+// other write. The OOM guard is unchanged: against a peer that never ACKs,
+// NagleBuf must stay within the cap for as long as the write is blocked.
+func TestSendDataOversizedWriteStaysWithinNagleCap(t *testing.T) {
+	t.Parallel()
+	d := New(Config{})
+	t.Cleanup(func() { d.tunnels.Close() })
+
+	const peerNode uint32 = 0xBA5EBA12
+	peerConn := addPeerOnDaemon(t, d, peerNode)
+	t.Cleanup(func() { peerConn.Close() })
+	d.setNodeID_testhelper(0x33330001)
+
+	conn := d.ports.NewConnection(40001, protocol.Addr{Network: 0, Node: peerNode}, 80)
+	conn.Mu.Lock()
+	conn.LocalAddr = protocol.Addr{Network: 0, Node: 0x33330001}
+	conn.RemoteAddr = protocol.Addr{Network: 0, Node: peerNode}
+	conn.RemotePort = 80
+	conn.State = StateEstablished
+	conn.PeerRecvWin = 1 << 20
+	conn.Mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- d.SendData(conn, make([]byte, 5*1024*1024)) }()
+
+	// The peer never ACKs, so the write blocks once the congestion window is
+	// full. Watch the buffer while it does.
+	maxBuf := 0
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		conn.NagleMu.Lock()
+		if n := len(conn.NagleBuf); n > maxBuf {
+			maxBuf = n
+		}
+		conn.NagleMu.Unlock()
+	}
+	if maxBuf > MaxNagleBuf {
+		t.Errorf("NagleBuf reached %d bytes during an oversized write; cap is %d", maxBuf, MaxNagleBuf)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("a 5 MiB write to a peer that never ACKs returned (%v); it should block on the window", err)
+	default:
+	}
+
+	// Closing the connection releases the blocked writer with an error.
+	d.ports.RemoveConnection(conn.ID)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("blocked write returned nil after the connection closed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked write did not return after the connection closed")
+	}
 }
