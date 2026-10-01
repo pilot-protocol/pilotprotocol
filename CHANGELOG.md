@@ -237,6 +237,12 @@ Detailed per-release notes are on the
   while data exchange or event stream is enabled; its other locked settings
   are unchanged.
 - SIGHUP no longer reloads control state. It is still caught and ignored.
+- **Governed envelopes in the plugins.** dataexchange v0.3.0, eventstream
+  v0.3.0 and handshake v0.3.0 no longer contain the governed-send,
+  governed-publication and action-hook code the hosted control plane used.
+  A node that receives a data-exchange frame of type 8 or 9 (the retired
+  governed types) now answers `ERR ... unsupported frame type`, as for any
+  unknown type; before it answered that no verifier was configured.
 
 ### Changed
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction

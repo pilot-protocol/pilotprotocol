@@ -7,9 +7,9 @@ require (
 	github.com/pilot-protocol/app-store v1.0.5
 	github.com/pilot-protocol/beacon v0.2.10
 	github.com/pilot-protocol/common v0.5.15
-	github.com/pilot-protocol/dataexchange v0.2.3
-	github.com/pilot-protocol/eventstream v0.2.4
-	github.com/pilot-protocol/handshake v0.2.8
+	github.com/pilot-protocol/dataexchange v0.3.0
+	github.com/pilot-protocol/eventstream v0.3.0
+	github.com/pilot-protocol/handshake v0.3.0
 	github.com/pilot-protocol/policy v0.2.3
 	github.com/pilot-protocol/rendezvous v0.2.8
 	github.com/pilot-protocol/runtime v0.3.2
