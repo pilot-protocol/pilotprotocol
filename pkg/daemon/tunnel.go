@@ -101,6 +101,10 @@ type TunnelManager struct {
 	readWg    sync.WaitGroup // tracks readLoop goroutine for clean shutdown
 	closeOnce sync.Once
 
+	// observedEndpoint is where the beacon last saw this socket (see
+	// handleBeaconMessage / ObservedEndpoint).
+	observedEndpoint atomic.Pointer[net.UDPAddr]
+
 	// Encryption config
 	encrypt bool             // if true, attempt encrypted tunnels
 	privKey *ecdh.PrivateKey // our X25519 private key
@@ -1108,7 +1112,18 @@ func (tm *TunnelManager) SendPathProbe(peerNodeID uint32) error {
 	if pc == nil || !pc.Ready {
 		return fmt.Errorf("path probe: no ready session for peer %d", peerNodeID)
 	}
-	probe := &protocol.Packet{
+	plaintext, err := tm.newPathProbePacket(peerNodeID).Marshal()
+	if err != nil {
+		return fmt.Errorf("path probe marshal: %w", err)
+	}
+	frame := tm.encryptFrame(pc, plaintext)
+	return tm.writeFrame(peerNodeID, addr, frame)
+}
+
+// newPathProbePacket builds the pong-soliciting probe described on
+// SendPathProbe.
+func (tm *TunnelManager) newPathProbePacket(peerNodeID uint32) *protocol.Packet {
+	return &protocol.Packet{
 		Version:  protocol.Version,
 		Protocol: protocol.ProtoControl,
 		SrcPort:  protocol.PortPing,
@@ -1117,12 +1132,52 @@ func (tm *TunnelManager) SendPathProbe(peerNodeID uint32) error {
 		Dst:      protocol.Addr{Node: peerNodeID},
 		Payload:  pathProbePayload,
 	}
-	plaintext, err := probe.Marshal()
-	if err != nil {
-		return fmt.Errorf("path probe marshal: %w", err)
+}
+
+// SendDirectPathProbe sends the same probe as SendPathProbe, but straight to
+// the peer's stored direct endpoint even when the peer is relay-flagged (see
+// SendDirectProbe). The address watcher uses it after our own address changed:
+// the peer overwrites its entry for us from the source of any authenticated
+// direct frame (handleEncrypted), so one probe moves the peer to our new
+// address, and its pong proves the new path in both directions. A copy sent
+// through the relay would teach the peer nothing, since relayed frames arrive
+// from the beacon.
+func (tm *TunnelManager) SendDirectPathProbe(peerNodeID uint32) error {
+	return tm.SendDirectProbe(peerNodeID, tm.newPathProbePacket(peerNodeID))
+}
+
+// ObservedEndpoint returns the endpoint the beacon last reported seeing us
+// at (the reply to RegisterWithBeacon on the tunnel socket), or nil if no
+// reply has arrived yet.
+func (tm *TunnelManager) ObservedEndpoint() *net.UDPAddr {
+	return tm.observedEndpoint.Load()
+}
+
+// ForgetObservedEndpoint drops the stored beacon reply, so the next
+// ObservedEndpoint is one that arrived afterwards.
+func (tm *TunnelManager) ForgetObservedEndpoint() {
+	tm.observedEndpoint.Store(nil)
+}
+
+// BeaconUDPAddr returns the beacon endpoint the tunnel currently uses, or
+// nil when none is configured. Thin shim over routing.Manager.BeaconAddr.
+func (tm *TunnelManager) BeaconUDPAddr() *net.UDPAddr {
+	return tm.routing.BeaconAddr()
+}
+
+// parseDiscoverReply decodes [iplen(1)][IP(4 or 16)][port(2)], the body of a
+// BeaconMsgDiscoverReply. Returns nil for a malformed body.
+func parseDiscoverReply(body []byte) *net.UDPAddr {
+	if len(body) < 1 {
+		return nil
 	}
-	frame := tm.encryptFrame(pc, plaintext)
-	return tm.writeFrame(peerNodeID, addr, frame)
+	ipLen := int(body[0])
+	if (ipLen != 4 && ipLen != 16) || len(body) < 1+ipLen+2 {
+		return nil
+	}
+	ip := make(net.IP, ipLen)
+	copy(ip, body[1:1+ipLen])
+	return &net.UDPAddr{IP: ip, Port: int(binary.BigEndian.Uint16(body[1+ipLen:]))}
 }
 
 // getPeerPubKey returns the cached Ed25519 public key for a peer,
@@ -2311,6 +2366,15 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 	switch data[0] {
 	case protocol.BeaconMsgDiscoverReply:
 		slog.Debug("beacon discover reply on tunnel socket", "from", from)
+		// Remember where the beacon sees us. A node behind NAT cannot see
+		// its public address change locally; this reply is the only place
+		// it shows up (addrwatch.go compares successive values). Only the
+		// beacon's own reply counts, so a third party cannot feed us one.
+		if fromBeacon {
+			if ep := parseDiscoverReply(data[1:]); ep != nil {
+				tm.observedEndpoint.Store(ep)
+			}
+		}
 	case protocol.BeaconMsgPunchCommand:
 		if !fromBeacon {
 			slog.Warn("dropping punch command from non-beacon source", "from", from)
