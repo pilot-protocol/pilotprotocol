@@ -244,14 +244,26 @@ func TestHandshakePollLoopExtraPollsAreBounded(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		d.handshakePoke()
 	}
-	waitPolls(1, 2*time.Second) // served even during the startup jitter
+	// The first poke is served at once, even during the startup jitter. A
+	// poke that lands after that poll began is owed one more, deferred by
+	// handshakeOnDemandGap; whether any of the burst does is a matter of
+	// scheduling. So the whole burst buys one poll or two, never more.
+	deadline := time.Now().Add(2 * time.Second)
+	for d.RelayedHandshakePolls() < 1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
 	time.Sleep(handshakeOnDemandGap + time.Second)
-	waitPolls(1, 0) // the rest of the burst bought nothing
+	burst := d.RelayedHandshakePolls()
+	if burst < 1 || burst > 2 {
+		t.Fatalf("a burst of 200 pokes caused %d registry polls, want 1 or 2", burst)
+	}
+	time.Sleep(handshakeOnDemandGap + time.Second)
+	waitPolls(burst, 0) // and nothing after that
 
 	d.hsPoll.requestSent(42, true)
 	time.Sleep(2*handshakeFastPollInterval + handshakeFastPollInterval/2)
-	if got := d.RelayedHandshakePolls(); got < 2 || got > 4 {
-		t.Fatalf("registry polls = %d after 2.5 fast periods with a request in flight, want 3 (1 + 2)", got)
+	if got := d.RelayedHandshakePolls() - burst; got < 1 || got > 3 {
+		t.Fatalf("%d registry polls in 2.5 fast periods with a request in flight, want 2", got)
 	}
 	d.hsPoll.answered(42)
 	time.Sleep(handshakeFastPollInterval + 200*time.Millisecond) // at most one already-armed poll

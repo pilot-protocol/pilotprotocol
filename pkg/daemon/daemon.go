@@ -5539,6 +5539,7 @@ func (d *Daemon) handshakePollLoop() {
 	// Independent jitter so this loop does not align with the others. The
 	// baseline ticker starts once it has passed; requests, pokes and Stop
 	// are served during it.
+	// #nosec G404 -- startup-jitter scheduling only, not a security decision
 	jitter := time.NewTimer(time.Duration(rand.Int63n(int64(5 * time.Second))))
 	defer jitter.Stop()
 	var ticker *time.Ticker
