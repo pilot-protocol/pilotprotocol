@@ -170,6 +170,10 @@ type TunnelManager struct {
 	trustGate   func(nodeID uint32) bool
 	peerTrustFn func(nodeID uint32) bool
 
+	// onBeaconNotify is run when the beacon says the registry holds
+	// something for this node (beaconMsgNotify).
+	onBeaconNotify atomic.Pointer[func()]
+
 	// Event bus — replaces inline tm.webhook.Emit calls. Set via
 	// SetEventBus from daemon during construction. May be nil in
 	// tests; tm.publishEvent handles that. Webhook delivery is a
@@ -201,9 +205,6 @@ type TunnelManager struct {
 	// ConnectCompat so the age is measured from transport start, not epoch.
 	LastRecvNano int64
 
-	// onBeaconNotify is run when the beacon says the registry holds
-	// something for this node (beaconMsgNotify).
-	onBeaconNotify atomic.Pointer[func()]
 	// P1-008: packets dropped from the per-peer pending queue while waiting
 	// for key exchange. Exposed so operators can tell a congested overlay
 	// apart from a silent crypto stall.
@@ -2331,6 +2332,11 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 			slog.Debug("dropping notify from non-beacon source", "from", from)
 			return
 		}
+		if len(data) != 2 || data[1] != beaconNotifyHandshake {
+			// A kind this daemon does not know is not a reason to poll.
+			slog.Debug("dropping beacon notify of unknown kind", "len", len(data))
+			return
+		}
 		if fn := tm.onBeaconNotify.Load(); fn != nil {
 			(*fn)()
 		}
@@ -2346,6 +2352,9 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 // beacon message and drop it. (Must match beacon.MsgNotify; the other beacon
 // message types live in common/protocol and this one should move there.)
 const beaconMsgNotify byte = 0x0A
+
+// beaconNotifyHandshake is the notify kind for a relayed trust handshake.
+const beaconNotifyHandshake byte = 0x01
 
 // SetBeaconNotifyHandler installs the callback run for each beacon notify.
 // It is called on the tunnel read loop and must not block.

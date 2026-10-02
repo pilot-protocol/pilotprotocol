@@ -5567,7 +5567,13 @@ func (d *Daemon) handshakePollLoop() {
 			d.pollHandshakes(0, 0)
 		case <-extra.C:
 			extraArmed = false
-			d.pollHandshakes(handshakeFastPollInterval/2, 0)
+			// The timer was armed for a poke or a request in flight; poll
+			// only if one of them is still owed. A request answered while
+			// the timer ran needs nothing more.
+			due, wait := d.hsPoll.pokeWait()
+			if (due && wait == 0) || d.hsPoll.fastActive(trusted) {
+				d.pollHandshakes(handshakeOnDemandGap-handshakePollSlack, 0)
+			}
 		case <-d.hsPoll.wake:
 			if due, wait := d.hsPoll.pokeWait(); due && wait == 0 {
 				d.pollHandshakes(handshakeOnDemandGap, 0)
@@ -6424,17 +6430,16 @@ func (d *Daemon) lookupPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 //
 // timeout > 0 bounds the registry call (a local client is waiting on it);
 // 0 leaves it unbounded, as the background loop always ran it.
-func (d *Daemon) pollRelayedHandshakes(timeout time.Duration) {
+func (d *Daemon) pollRelayedHandshakes() {
 	rc, nodeID := d.reg(), d.NodeID()
-	var resp map[string]interface{}
-	var err error
-	if timeout > 0 {
-		resp, err = withRegistryDeadline(timeout, func() (map[string]interface{}, error) {
-			return rc.PollHandshakes(nodeID)
-		})
-	} else {
-		resp, err = rc.PollHandshakes(nodeID)
+	if rc == nil {
+		return
 	}
+	// No deadline of our own. The registry empties this node's handshake
+	// inbox as it answers; walking away from a slow reply would drop the
+	// requests and approvals in it. The client's own read deadline bounds
+	// the call, and callers that cannot wait stop waiting (pollHandshakes).
+	resp, err := rc.PollHandshakes(nodeID)
 	if err != nil {
 		slog.Debug("poll handshakes failed", "error", err)
 		return

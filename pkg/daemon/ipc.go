@@ -2089,7 +2089,7 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 		if timeoutMs > 30000 {
 			timeoutMs = 30000
 		}
-		s.daemon.pollHandshakesOnDemand()
+		s.daemon.pollHandshakesForTrustWait(nodeID)
 		ok := s.daemon.handshakes.WaitForTrust(nodeID, time.Duration(timeoutMs)*time.Millisecond)
 		data, _ := json.Marshal(map[string]interface{}{
 			"node_id": nodeID,

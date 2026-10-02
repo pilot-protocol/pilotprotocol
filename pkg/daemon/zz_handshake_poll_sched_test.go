@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -263,7 +264,7 @@ func TestHandshakePollLoopExtraPollsAreBounded(t *testing.T) {
 	d.hsPoll.requestSent(42, true)
 	time.Sleep(2*handshakeFastPollInterval + handshakeFastPollInterval/2)
 	if got := d.RelayedHandshakePolls() - burst; got < 1 || got > 3 {
-		t.Fatalf("%d registry polls in 2.5 fast periods with a request in flight, want 2", got)
+		t.Fatalf("%d registry polls in 2.5 fast periods with a request in flight, want 1 to 3", got)
 	}
 	d.hsPoll.answered(42)
 	time.Sleep(handshakeFastPollInterval + 200*time.Millisecond) // at most one already-armed poll
@@ -271,5 +272,165 @@ func TestHandshakePollLoopExtraPollsAreBounded(t *testing.T) {
 	time.Sleep(2 * handshakeFastPollInterval)
 	if got := d.RelayedHandshakePolls(); got != settled {
 		t.Fatalf("loop kept polling after the answer: %d -> %d", settled, got)
+	}
+}
+
+// A poll the caller stops waiting for must still run to completion. The
+// registry empties a node's handshake inbox as it answers, so a reply that
+// arrives after its caller has gone and is then thrown away is a request or
+// an approval lost for good — `pilotctl pending` against a registry that took
+// four seconds lost whatever was in the inbox.
+func TestOnDemandPollOutlivesTheCallerThatGaveUp(t *testing.T) {
+	t.Parallel()
+	reg, rc := startTestRegistry(t)
+	t.Cleanup(func() { reg.Close() })
+	t.Cleanup(func() { rc.Close() })
+	d := New(Config{KeepaliveInterval: time.Hour})
+	d.regConn.Store(rc)
+
+	release := make(chan struct{})
+	var started, finished atomic.Int32
+	d.hsPoll.run = func() {
+		started.Add(1)
+		<-release // a registry that is slow to answer
+		finished.Add(1)
+	}
+
+	const wait = 80 * time.Millisecond
+	begin := time.Now()
+	d.pollHandshakes(handshakeOnDemandGap, wait)
+	if held := time.Since(begin); held > wait+500*time.Millisecond {
+		t.Fatalf("caller was held %v, want about %v", held, wait)
+	}
+	if started.Load() != 1 || finished.Load() != 0 {
+		t.Fatalf("after the caller gave up: started=%d finished=%d, want the poll still in flight", started.Load(), finished.Load())
+	}
+
+	// Callers arriving while it is in flight start no second poll, and one
+	// arriving after the wait has already been used up is not held at all.
+	time.Sleep(wait)
+	begin = time.Now()
+	for i := 0; i < 5; i++ {
+		d.pollHandshakes(handshakeOnDemandGap, wait)
+	}
+	if held := time.Since(begin); held > wait {
+		t.Fatalf("five callers behind a poll already running past its wait were held %v in total", held)
+	}
+	if n := started.Load(); n != 1 {
+		t.Fatalf("%d polls started while one was in flight, want 1", n)
+	}
+
+	// The reply lands: the poll finishes its work.
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for finished.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if finished.Load() != 1 {
+		t.Fatal("the poll its caller stopped waiting for never completed")
+	}
+	if got := d.RelayedHandshakePolls(); got != 1 {
+		t.Fatalf("registry polls = %d, want 1", got)
+	}
+}
+
+// fastActive asks the handshake plugin whether a peer is trusted, and the
+// plugin can hold its lock across a registry lookup. The tunnel read loop
+// takes the scheduler's lock for every beacon notify, so that question must
+// not be asked with the scheduler's lock held.
+func TestFastActiveAsksAboutTrustWithoutHoldingTheLock(t *testing.T) {
+	t.Parallel()
+	s := newHandshakePollSched()
+	s.requestSent(7, true)
+	s.requestSent(8, true)
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- s.fastActive(func(peer uint32) bool {
+			s.poke() // what the read loop does; deadlocks if s.mu is held
+			return peer == 7
+		})
+	}()
+	select {
+	case active := <-result:
+		if !active {
+			t.Fatal("peer 8 is still waiting: fastActive should report true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fastActive called the trust check with the scheduler's lock held")
+	}
+	if s.waitingOn(7) {
+		t.Fatal("peer 7 was reported trusted and should be settled")
+	}
+	if !s.waitingOn(8) {
+		t.Fatal("peer 8 should still be waited on")
+	}
+}
+
+// Peers stay tracked for handshakeAutoRearm after their window closes, so
+// that an automatic handshake cannot reopen it. Sixty-four of those must not
+// stop a new request from getting its fast polling.
+func TestSettledPeersDoNotCrowdOutANewRequest(t *testing.T) {
+	t.Parallel()
+	s := newHandshakePollSched()
+	for peer := uint32(1); peer <= handshakeMaxWaiting; peer++ {
+		s.requestSent(peer, true)
+		s.answered(peer)
+	}
+	s.requestSent(1000, true)
+	if !s.waitingOn(1000) {
+		t.Fatalf("with %d answered peers tracked, a new request got no fast polling", handshakeMaxWaiting)
+	}
+
+	// Still a cap on requests that are genuinely outstanding.
+	s = newHandshakePollSched()
+	for peer := uint32(1); peer <= handshakeMaxWaiting; peer++ {
+		s.requestSent(peer, true)
+	}
+	s.requestSent(1000, true)
+	if s.waitingOn(1000) {
+		t.Fatalf("a request beyond %d outstanding ones was tracked", handshakeMaxWaiting)
+	}
+}
+
+// Wait-for-trust polls only when there is an answer to wait for. pilotctl
+// calls it with a zero timeout before every send, connect and ping.
+func TestWaitingOnTracksOnlyOutstandingRequests(t *testing.T) {
+	t.Parallel()
+	s := newHandshakePollSched()
+	if s.waitingOn(5) {
+		t.Fatal("no request was sent to peer 5")
+	}
+	s.requestSent(5, true)
+	if !s.waitingOn(5) {
+		t.Fatal("a request to peer 5 is outstanding")
+	}
+	s.answered(5)
+	if s.waitingOn(5) {
+		t.Fatal("peer 5 answered")
+	}
+}
+
+// Only the handshake kind triggers a poll. A bare type byte, or a kind this
+// daemon does not know, is dropped.
+func TestBeaconNotifyOfUnknownKindIsDropped(t *testing.T) {
+	t.Parallel()
+	tm := NewTunnelManager()
+	if err := tm.SetBeaconAddr("192.0.2.10:9001"); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	tm.SetBeaconNotifyHandler(func() { calls++ })
+	beacon := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 9001}
+
+	tm.handleBeaconMessage([]byte{beaconMsgNotify}, beacon)
+	tm.handleBeaconMessage([]byte{beaconMsgNotify, 0x02}, beacon)
+	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake, 0x00}, beacon)
+	if calls != 0 {
+		t.Fatalf("a malformed or unknown notify ran the handler %d times", calls)
+	}
+	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake}, beacon)
+	if calls != 1 {
+		t.Fatalf("a handshake notify ran the handler %d times, want 1", calls)
 	}
 }

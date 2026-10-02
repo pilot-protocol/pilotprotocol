@@ -339,9 +339,13 @@ Detailed per-release notes are on the
   target after ~59s, approval back at the requester ~57s later. Now:
   - a node that has sent a handshake request polls every 2s until it is
     answered, for at most 2 minutes;
-  - `pilotctl pending`, `trust`, `approve`, `reject` and waiting for trust
-    poll first (at most one such poll every 2s), so a relayed request is
-    there as soon as someone looks;
+  - `pilotctl pending`, `trust`, `approve` and `reject` poll first (at most
+    one such poll every 2s), so a relayed request is there as soon as
+    someone looks. Waiting for trust polls only while a request this node
+    sent that peer is unanswered, so checking a peer that is already trusted
+    — which pilotctl does before every send — costs nothing. The caller is
+    held at most 3s by a slow registry; the poll itself still completes and
+    delivers what it fetched;
   - the beacon can tell a node that something is waiting for it (a two-byte
     notify that carries nothing else; needs the matching registry/beacon
     release), and the node polls at once — at most 3 polls in a burst and

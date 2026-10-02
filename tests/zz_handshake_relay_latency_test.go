@@ -61,8 +61,12 @@ func TestRelayedHandshakeCompletesInSeconds(t *testing.T) {
 		t.Fatalf("approve: %v", err)
 	}
 
-	// Requester side: nobody asks it anything; its own polling must pick
-	// the approval up.
+	// Requester side: nobody asks it anything. In this harness both nodes
+	// sit on loopback, so once the target has approved it can usually reach
+	// the requester directly and the approval arrives that way, with the
+	// requester's fast poll as the fallback. The fast poll on its own is
+	// exercised by the scheduler tests in pkg/daemon and was measured
+	// between containers that cannot reach each other directly.
 	for !a.Daemon.HandshakeService().IsTrusted(b.Daemon.NodeID()) {
 		if time.Since(approved) > limit {
 			t.Fatalf("relayed approval did not reach the requester within %s", limit)
@@ -126,5 +130,56 @@ func TestRelayedHandshakeReachesUnattendedTarget(t *testing.T) {
 		time.Since(start).Truncate(time.Millisecond), b.Daemon.RelayedHandshakePolls())
 	if polls := b.Daemon.RelayedHandshakePolls(); polls > 2 {
 		t.Errorf("target polled the registry %d times for one request", polls)
+	}
+}
+
+// TestWaitForTrustOnTrustedPeerDoesNotPollRegistry pins that asking whether
+// a peer is trusted costs no registry round trip once it is. pilotctl asks
+// with a zero timeout before every send-message, send-file, connect, ping
+// and publish; polling there put up to thirty registry requests a minute on
+// a busy node with no handshake in flight, and a three-second stall in front
+// of each command whenever the registry was slow.
+func TestWaitForTrustOnTrustedPeerDoesNotPollRegistry(t *testing.T) {
+	requireRealNetwork(t)
+	t.Parallel()
+	env := NewTestEnv(t)
+	a := env.AddDaemon()
+	b := env.AddDaemon()
+
+	if _, err := a.Driver.Handshake(b.Daemon.NodeID(), "trusted-wait test"); err != nil {
+		t.Fatalf("A handshake: %v", err)
+	}
+	if _, err := b.Driver.Handshake(a.Daemon.NodeID(), "trusted-wait test"); err != nil {
+		t.Fatalf("B handshake: %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		resp, err := a.Driver.WaitForTrust(b.Daemon.NodeID(), 1000)
+		if trusted, _ := resp["trusted"].(bool); err == nil && trusted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("A and B did not become trusted")
+		}
+	}
+
+	before := a.Daemon.RelayedHandshakePolls()
+	for i := 0; i < 5; i++ {
+		start := time.Now()
+		resp, err := a.Driver.WaitForTrust(b.Daemon.NodeID(), 0)
+		if err != nil {
+			t.Fatalf("WaitForTrust: %v", err)
+		}
+		if trusted, _ := resp["trusted"].(bool); !trusted {
+			t.Fatal("B should be trusted")
+		}
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("WaitForTrust on a trusted peer took %v", took)
+		}
+		// Past the on-demand gap, so a poll would be allowed if one were asked for.
+		time.Sleep(2100 * time.Millisecond)
+	}
+	if got := a.Daemon.RelayedHandshakePolls(); got != before {
+		t.Fatalf("five trust checks on a trusted peer caused %d registry polls, want 0", got-before)
 	}
 }
