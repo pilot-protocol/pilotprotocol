@@ -332,6 +332,26 @@ Detailed per-release notes are on the
   over its own limit no longer uses up the tokens other peers need
   (previously every SYN it had rejected still took a shared token).
   `-syn-whitelist` is unchanged.
+- **A trust handshake between two private nodes takes seconds, not two
+  minutes.** Neither side can reach the other before trust exists, so the
+  request and the answer are parked at the registry until each node polls —
+  once per keepalive interval (60s). Measured before: request visible on the
+  target after ~59s, approval back at the requester ~57s later. Now:
+  - a node that has sent a handshake request polls every 2s until it is
+    answered, for at most 2 minutes;
+  - `pilotctl pending`, `trust`, `approve` and `reject` poll first (at most
+    one such poll every 2s), so a relayed request is there as soon as
+    someone looks. Waiting for trust polls only while a request this node
+    sent that peer is unanswered, so checking a peer that is already trusted
+    — which pilotctl does before every send — costs nothing. The caller is
+    held at most 3s by a slow registry; the poll itself still completes and
+    delivers what it fetched;
+  - the beacon can tell a node that something is waiting for it (a two-byte
+    notify that carries nothing else; needs the matching registry/beacon
+    release), and the node polls at once — at most 3 polls in a burst and
+    one per 5s after that, whatever arrives.
+  An idle node still makes one poll per minute, as before. Nodes and
+  servers that are not updated keep working at the old pace for their part.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's
