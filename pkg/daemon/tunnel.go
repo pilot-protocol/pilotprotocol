@@ -85,6 +85,10 @@ type TunnelManager struct {
 	sock transport.Transport
 	// peers maps node_id → real UDP endpoint. Owned by L4 (routing).
 	peers map[uint32]*net.UDPAddr
+	// activity and openConnPeers decide which peers are idle; see
+	// peeractivity.go.
+	activity      *peerActivity
+	openConnPeers func() map[uint32]bool
 	// envelope is the L5-owned per-peer crypto Store (named "envelope"
 	// for historical reasons — pre-T5.x-followup the Store lived in
 	// pkg/daemon/envelope). Accessed by:
@@ -413,6 +417,7 @@ func NewTunnelManager() *TunnelManager {
 		routing:         routing.New(),
 		kxRateLim:       make(map[string]*srcKxBucket),
 		relayKxLim:      make(map[uint32]*srcKxBucket),
+		activity:        newPeerActivity(),
 	}
 	tm.routing.SetLocalNodeIDFn(tm.loadNodeID)
 	tm.kx = keyexchange.New(store)
@@ -988,11 +993,15 @@ func (tm *TunnelManager) keepaliveSweep(now time.Time) int {
 		addr *net.UDPAddr
 		pc   *peerCrypto
 	}
+	idle := tm.idleFilter(now)
 	tm.mu.RLock()
 	stale := make([]peerInfo, 0, len(tm.peers))
 	for nodeID, addr := range tm.peers {
 		last, ok := tm.routing.LastOutboundSend(nodeID)
 		if ok && now.Sub(last) < TunnelKeepaliveInterval {
+			continue
+		}
+		if idle(nodeID) {
 			continue
 		}
 		pc := tm.envelope.Get(nodeID)
@@ -1585,6 +1594,12 @@ func (tm *TunnelManager) onKeyInstalled(ev keyexchange.PostInstallEvent) {
 	// and the per-peer 1s reply cooldown holds the ping-pong back but
 	// never lets the staleness flag clear.
 	tm.recordInboundDecrypt(peerNodeID)
+	if !ev.HadCrypto {
+		// A new session counts as activity, so it starts out maintained
+		// and ages into idleness like any other. A rekey of an existing
+		// session does not: it is upkeep, not use.
+		tm.noteAppActivity(peerNodeID)
+	}
 	if !ev.HadCrypto || ev.KeyChanged {
 		tm.keyViaRelay.Store(peerNodeID, fromRelay)
 	}
@@ -1865,6 +1880,9 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 	// them. All liveness/address-learning side-effects above already ran.
 	if isTunnelKeepalive(pkt) {
 		return
+	}
+	if !(pkt.Protocol == protocol.ProtoControl && pkt.DstPort == protocol.PortPing) {
+		tm.noteAppActivity(peerNodeID)
 	}
 
 	select {
@@ -2192,6 +2210,9 @@ func (tm *TunnelManager) SetRelayPeerPinned(nodeID uint32, relay bool) {
 
 // SendTo sends a packet to a specific UDP address (relay-aware).
 func (tm *TunnelManager) SendTo(addr *net.UDPAddr, nodeID uint32, pkt *protocol.Packet) error {
+	// Path upkeep (keepalives, probes, key exchange) bypasses SendTo, so
+	// everything that arrives here is traffic someone asked for.
+	tm.noteAppActivity(nodeID)
 	data, err := pkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -2329,6 +2350,9 @@ func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 	// L5-owned per-peer state (peerPubKeys, pendingRekey, lastInboundDecrypt).
 	tm.kx.RemovePeer(nodeID)
 	tm.keyViaRelay.Delete(nodeID)
+	if tm.activity != nil {
+		tm.activity.forget(nodeID)
+	}
 }
 
 // KeyArrivedViaRelayOnly reports whether the peer's session key was
