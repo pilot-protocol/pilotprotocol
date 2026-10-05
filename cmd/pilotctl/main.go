@@ -5871,6 +5871,9 @@ func cmdTrust(args []string) {
 	})
 
 	total := len(trusted)
+	// A daemon with more trust records than one reply can carry sends
+	// the newest that fit.
+	cut, _ := result["trusted_truncated"].(bool)
 
 	if jsonOutput {
 		// Shape unchanged; "total" is the pre-limit count. The list is
@@ -5880,7 +5883,11 @@ func cmdTrust(args []string) {
 		if limitExplicit && limit > 0 && len(list) > limit {
 			list = list[:limit]
 		}
-		output(map[string]interface{}{"trusted": list, "total": total})
+		out := map[string]interface{}{"trusted": list, "total": total}
+		if cut {
+			out["truncated"] = true
+		}
+		output(out)
 		return
 	}
 
@@ -5905,6 +5912,9 @@ func cmdTrust(args []string) {
 	}
 	if len(shown) < total {
 		qualifier += fmt.Sprintf(" · showing %d newest", len(shown))
+	}
+	if cut {
+		qualifier += " · the daemon listed only its newest (one reply holds about 8,000)"
 	}
 	fmt.Printf("%s%s\n\n", header, sDim(qualifier))
 
@@ -6303,13 +6313,23 @@ func cmdPeers(args []string) {
 	}
 	direct := total - relayCount
 
+	// A daemon with more peers than one reply can carry lists only part.
+	cut, _ := info["peer_list_truncated"].(bool)
 	if jsonOutput {
-		output(map[string]interface{}{
+		out := map[string]interface{}{
 			"peers":     filtered,
 			"total":     total,
 			"encrypted": encCount,
-		})
+		}
+		if cut {
+			out["truncated"] = true
+			out["daemon_peers"] = info["peers"]
+		}
+		output(out)
 		return
+	}
+	if cut {
+		fmt.Println(sDim(fmt.Sprintf("the daemon has %v peers and listed %d (one reply holds about 10,000; peers in use first)", info["peers"], len(peerList))))
 	}
 
 	if total == 0 {

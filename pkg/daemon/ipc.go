@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -1172,6 +1173,42 @@ func (s *IPCServer) handleBroadcast(conn *ipcConn, reqID uint64, payload []byte)
 var daemonFeatures = []string{"reply_window", "dial_awaits_key", "key_request", "dgram_confirm"}
 
 // ipcInfoPeer is one row of the info reply's peer_list.
+// ipcReplyBudget is the most JSON one IPC reply may carry. The framing
+// refuses a message over ipcutil.MaxMessageSize, and a refused write closes
+// the client's connection: the request failed with "daemon disconnected",
+// and so did every later one on that connection. The margin covers the
+// command byte.
+const ipcReplyBudget = ipcutil.MaxMessageSize - 64
+
+// marshalRowsWithinBudget marshals body with as many leading rows of the
+// list under key as fit in budget bytes, and marks the list as cut with
+// "<key>_truncated": true. The counts elsewhere in body keep the totals.
+func marshalRowsWithinBudget[T any](body map[string]interface{}, key string, rows []T, budget int) ([]byte, error) {
+	body[key] = []T{}
+	body[key+"_truncated"] = true
+	base, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	size, keep := len(base), 0
+	for ; keep < len(rows); keep++ {
+		row, err := json.Marshal(rows[keep])
+		if err != nil {
+			return nil, err
+		}
+		add := len(row)
+		if keep > 0 {
+			add++ // separating comma
+		}
+		if size+add > budget {
+			break
+		}
+		size += add
+	}
+	body[key] = rows[:keep]
+	return json.Marshal(body)
+}
+
 type ipcInfoPeer struct {
 	Authenticated bool   `json:"authenticated"`
 	Encrypted     bool   `json:"encrypted"`
@@ -1257,7 +1294,7 @@ func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 		}
 	}
 
-	data, err := json.Marshal(map[string]interface{}{
+	body := map[string]interface{}{
 		"node_id":                   info.NodeID,
 		"address":                   info.Address,
 		"endpoint":                  info.Endpoint,
@@ -1291,7 +1328,26 @@ func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 		"motd":                      info.MOTD,
 		"features":                  daemonFeatures,
 		"transport":                 info.Transport,
-	})
+	}
+	data, err := json.Marshal(body)
+	if err == nil && len(data) > ipcReplyBudget {
+		// Past about 10,000 peers the reply no longer fits one IPC message.
+		// Peers in use come first so the rows a client looks for survive
+		// the cut; the rest in node order. If the connections alone are
+		// still too many, they are cut as well.
+		open := s.daemon.ports.ActiveNodeIDs()
+		sort.SliceStable(peers, func(i, j int) bool {
+			oi, oj := open[peers[i].NodeID], open[peers[j].NodeID]
+			if oi != oj {
+				return oi
+			}
+			return peers[i].NodeID < peers[j].NodeID
+		})
+		data, err = marshalRowsWithinBudget(body, "peer_list", peers, ipcReplyBudget)
+		if err == nil && len(data) > ipcReplyBudget {
+			data, err = marshalRowsWithinBudget(body, "conn_list", conns, ipcReplyBudget)
+		}
+	}
 	if err != nil {
 		s.sendError(conn, reqID, fmt.Sprintf("info marshal: %v", err))
 		return
@@ -2062,9 +2118,17 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, reqID uint64, payload []byte)
 				"network":     t.Network,
 			}
 		}
-		data, _ := json.Marshal(map[string]interface{}{
-			"trusted": list,
-		})
+		body := map[string]interface{}{"trusted": list}
+		data, _ := json.Marshal(body)
+		if len(data) > ipcReplyBudget {
+			// About 8,000 trust records fill one IPC message; service
+			// agents hold over 20,000. Keep the newest, as pilotctl
+			// lists them.
+			sort.SliceStable(list, func(i, j int) bool {
+				return list[i]["approved_at"].(int64) > list[j]["approved_at"].(int64)
+			})
+			data, _ = marshalRowsWithinBudget(body, "trusted", list, ipcReplyBudget)
+		}
 		s.ipcWriteHandshakeOK(conn, reqID, data)
 
 	case SubHandshakeRevoke:
