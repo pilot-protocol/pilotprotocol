@@ -277,6 +277,85 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **Stream segments fit one packet.** A full stream segment was 4096 bytes,
+  about 4.2 KB on the wire and three IP fragments on a 1500-byte path. NATs,
+  firewalls and some virtual networks drop fragments, so on those paths
+  handshakes, pings and messages under ~1.4 KB worked while every full
+  segment was lost: larger replies never arrived, `send-file` failed, and
+  `bench` reported a few kbit/s until its retransmissions gave up. Segments
+  are now at most 1152 bytes (`SendSegmentSize`), a 1231-byte datagram on the
+  relay path — within what fits IPv6's minimum MTU, so within any path that
+  carries IP. This is a sender-side change: receivers accept segments up to
+  the old size, so old and new nodes interoperate in both directions. With
+  non-first fragments dropped at the receiver, a 3 KB message, a 60 KB
+  message and 64 KB and 1 MB file transfers all failed before and all
+  succeed now.
+  - The peer's receive window is advertised in segments, not bytes, and is
+    now enforced as such. A sender of short segments used to put more of
+    them in flight than the peer had slots for.
+  - A short write no longer stalls its sender. Nagle's algorithm held a
+    short segment until everything before it was acknowledged, and the
+    writer was blocked until it had gone out. The ACK it waited for is
+    delayed by the peer when the full segments before it are an odd number
+    (5ms; 40ms up to v1.14.1), nothing could join a held write because its
+    writer could not write again, so a stream of short writes moved at one
+    write per round trip, and since a client's sends are handled in order on
+    its IPC connection, everything else that client asked for waited too.
+    With 1152-byte segments every 4 KB write ends in a short tail, so this
+    had to go. Now:
+    - the tail of a write of a segment or more leaves with it;
+    - a write shorter than a segment waits only for an earlier short
+      segment, which is what lets small writes coalesce;
+    - a held write does not block: it stays buffered, later writes join it,
+      and it is sent when that earlier segment is acknowledged, after 40ms
+      at the latest, or ahead of the FIN when the connection is closed.
+
+    This also removes the stall per file chunk that held transfers back. A
+    60 MB file between two nodes on one host took 4.8s and takes 1.2s; from
+    an upgraded node into v1.13.5 it takes 1.8s, where v1.13.5 to itself
+    takes 22.7s.
+  - A receiver acknowledges a lone segment at once for the first 32
+    segments of a connection, and again after each time its delayed-ACK
+    timer has had to fire. A peer that waits for an ACK before sending its
+    next small write no longer stalls for the timer each time; the first
+    exchange on a connection goes from 5.4ms to 0.3ms.
+  - The congestion window grows and backs off over the same number of bytes
+    as before.
+
+  Mixed versions were checked in both directions against v1.13.5, v1.14.1
+  and the previous main: messages up to 100 KB, files up to 60 MB, four
+  concurrent transfers, echo and pub/sub, on a clean network, under a stock
+  kernel's socket buffer limit, at 1% loss over a 30ms path, and through the
+  relay. Two things to know while a network is part upgraded:
+  - Only an upgraded sender stops fragmenting. A reply of more than a
+    packet from a node that is not upgraded is still lost on a path that
+    drops fragments.
+  - A node that is not upgraded and writes back what it reads piece by
+    piece (the echo service, so `pilotctl bench` against it) now reads
+    1152-byte pieces, each below its own 4096-byte segment size, and its
+    own Nagle rule sends one per round trip: 1 MB echoed over a 30ms path
+    takes about 35s. Its replies to requests, files and pub/sub are not
+    affected, and upgrading that node removes it (1.5–2s).
+- **A transfer no longer collapses after a burst of losses.** Three faults
+  in loss recovery, found at 2% packet loss on a 30ms path, where 2 of 5
+  5 MB transfers failed after several minutes:
+  - In fast recovery, segments the peer had already reported (SACK) were
+    left out of the amount in flight while the window was also grown by one
+    segment per duplicate ACK, counting each twice: the amount outstanding
+    doubled every round trip for as long as the first loss stayed
+    unrepaired.
+  - The peer holds at most 128 out-of-order segments and silently drops the
+    rest; the sender did not know and ran past it. It now keeps at most 128
+    segments unacknowledged.
+  - After a retransmission timeout, every further segment missing from that
+    window waited for a timeout of its own, and the timeout doubles each
+    time (1s, 2s, 4s … 10s). The next missing segment is now retransmitted
+    as soon as an ACK shows the previous one arrived.
+
+  Measured, 5 MB over a 30ms path, five runs each: at 2% loss, 9.7–12.4s
+  with 2 of 5 failing before, 10.3–11.8s with none failing after; at 0.5%
+  loss 9.4–10.5s before, 7.3–7.6s after; without loss 8.2–8.4s before,
+  7.6–7.7s after.
 - **`-advertise-endpoint` survives a re-registration.** When the daemon
   re-registered (registry reconnect, transport watchdog recovery) it sent
   the tunnel socket's local address instead of the advertised endpoint, so

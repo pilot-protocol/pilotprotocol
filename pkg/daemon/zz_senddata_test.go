@@ -120,7 +120,7 @@ func TestNagleFlushFullMSSSendsSegment(t *testing.T) {
 	const peerNode uint32 = 0xD2D2D2D2
 	d, pc, conn := newSendDataFixture(t, peerNode)
 	conn.NoDelay = false
-	conn.NagleBuf = make([]byte, MaxSegmentSize)
+	conn.NagleBuf = make([]byte, SendSegmentSize)
 	for i := range conn.NagleBuf {
 		conn.NagleBuf[i] = byte('A' + (i % 26))
 	}
@@ -129,8 +129,8 @@ func TestNagleFlushFullMSSSendsSegment(t *testing.T) {
 		t.Fatalf("nagleFlush: %v", err)
 	}
 	pkt := readOneSegment(t, pc, 500*time.Millisecond)
-	if len(pkt.Payload) != MaxSegmentSize {
-		t.Fatalf("payload len = %d, want %d", len(pkt.Payload), MaxSegmentSize)
+	if len(pkt.Payload) != SendSegmentSize {
+		t.Fatalf("payload len = %d, want %d", len(pkt.Payload), SendSegmentSize)
 	}
 	conn.NagleMu.Lock()
 	remaining := len(conn.NagleBuf)
@@ -185,14 +185,14 @@ func TestNagleFlushSubMSSWithUnackedBlocksThenNagleChFlushes(t *testing.T) {
 	}
 }
 
-func TestNagleFlushRetxStopReturnsErrConnClosed(t *testing.T) {
+func TestNagleFlushDoesNotWaitForAHeldWrite(t *testing.T) {
 	t.Parallel()
 	const peerNode uint32 = 0xD4D4D4D4
 	d, _, conn := newSendDataFixture(t, peerNode)
 	conn.NoDelay = false
-	conn.NagleBuf = []byte("blocked")
+	conn.NagleBuf = []byte("held")
 	conn.RetxStop = make(chan struct{})
-	// Create in-flight so nagleFlush waits.
+	// A short segment in flight, so the write is held.
 	conn.RetxMu.Lock()
 	conn.Unacked = append(conn.Unacked, &retxEntry{
 		data: []byte("x"), seq: 1, sentAt: time.Now(), attempts: 1,
@@ -201,18 +201,21 @@ func TestNagleFlushRetxStopReturnsErrConnClosed(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- d.nagleFlush(conn) }()
-
-	time.Sleep(10 * time.Millisecond)
-	close(conn.RetxStop)
-
 	select {
 	case err := <-errCh:
-		if err != protocol.ErrConnClosed {
-			t.Fatalf("err = %v, want protocol.ErrConnClosed", err)
+		if err != nil {
+			t.Fatalf("nagleFlush: %v", err)
 		}
 	case <-time.After(1 * time.Second):
-		t.Fatal("nagleFlush did not return after RetxStop close")
+		t.Fatal("nagleFlush waited for the held write instead of returning")
 	}
+	conn.NagleMu.Lock()
+	buffered := string(conn.NagleBuf)
+	conn.NagleMu.Unlock()
+	if buffered != "held" {
+		t.Fatalf("buffer = %q, want the held write still in it", buffered)
+	}
+	close(conn.RetxStop) // lets the flusher go
 }
 
 // --- Stop / doStop ---

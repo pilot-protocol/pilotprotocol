@@ -94,7 +94,9 @@ func TestFreshFastRecoveryPerDupAckInflation(t *testing.T) {
 	congWin := c.CongWin
 	c.RetxMu.Unlock()
 
-	expected := congWinBefore + MaxSegmentSize // 5*MSS + MSS = 6*MSS = 24576
+	// The inflation is one segment as sent: SendSegmentSize, which is what a
+	// duplicate ACK says has left the network.
+	expected := congWinBefore + SendSegmentSize
 	if congWin < expected {
 		t.Errorf("4th dup ACK in fresh fast recovery: CongWin=%d, want >=%d (%d+MSS=%d); "+
 			"RFC 5681 §3.2 step 5 requires cwnd += SMSS per additional dup ACK while in "+

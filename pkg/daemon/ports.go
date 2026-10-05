@@ -206,16 +206,56 @@ type recvSegment struct {
 	data []byte
 }
 
+// SendSegmentSize is the most stream payload this node puts in one segment.
+//
+// A segment travels as one UDP datagram: 34 bytes of stream header, 36 bytes of
+// tunnel framing (magic, sender, nonce, AEAD tag) and, when relayed, 9 more
+// for the beacon header. At the old size, 4096, every full segment was a
+// datagram of about 4.2 KB — three IP fragments on a 1500-byte path. NATs,
+// firewalls and some virtual networks drop fragments, so on those paths the
+// handshake, pings and small messages worked while every full segment was
+// lost: a reply of more than ~1.4 KB never arrived, send-file failed, and
+// bench "ran" at 0.017 Mbps until its retransmits gave up.
+//
+// 1152 keeps the datagram at 1231 bytes on the relay path, within the 1232
+// bytes that fit IPv6's minimum MTU (1280) and so within any path that can
+// carry IP at all. It is a sender-side choice: a receiver takes segments of
+// any size up to MaxSegmentSize, so peers running the old size interoperate
+// in both directions.
+//
+// Which constant goes where:
+//
+//   - SendSegmentSize wherever a segment is counted: cutting data into
+//     segments, converting the peer's window (advertised in segments) to
+//     bytes, and the congestion-window adjustments that stand for one segment
+//     leaving the network (one per duplicate ACK, three on entering fast
+//     recovery, the add-back on a partial ACK).
+//   - MaxSegmentSize for how fast the congestion window moves and how low it
+//     may go: the initial window, the growth per ACK in slow start and
+//     congestion avoidance, the ssthresh floor, the window after a timeout.
+//     These are unchanged, so a connection ramps up and backs off over the
+//     same number of bytes as before. Scaling them down with the segment made
+//     a lossy path markedly slower (5 MB at 30 ms RTT and 0.5% loss: 17s
+//     against 10s) for no gain: the old values were already what this
+//     transport ran with, in 4 KB datagrams.
+const SendSegmentSize = 1152
+
 // Default window parameters
 const (
 	InitialCongWin = 10 * MaxSegmentSize          // 40 KB initial congestion window (IW10, RFC 6928)
 	MaxCongWin     = 1024 * 1024                  // 1 MB max congestion window
-	MaxSegmentSize = 4096                         // MTU for virtual segments
+	MaxSegmentSize = 4096                         // largest stream segment accepted from a peer; unit of the byte limits here
 	RecvBufSize    = 512                          // receive buffer channel capacity (segments)
 	MaxRecvWin     = RecvBufSize * MaxSegmentSize // 2 MB max receive window
 	MaxOOOBuf      = 128                          // max out-of-order segments buffered per connection
-	AcceptQueueLen = 64                           // listener accept channel capacity
-	SendBufLen     = 256                          // send buffer channel capacity (segments)
+	// MaxSegmentsOutstanding is the most segments a sender keeps unacknowledged.
+	// When the oldest of them is lost, every later one waits in the peer's
+	// reorder buffer, which holds MaxOOOBuf segments and silently drops the
+	// rest. A sender past that limit loses the excess even on a clean path,
+	// and finds out one retransmission timeout at a time.
+	MaxSegmentsOutstanding = MaxOOOBuf
+	AcceptQueueLen         = 64  // listener accept channel capacity
+	SendBufLen             = 256 // send buffer channel capacity (segments)
 
 	// MaxNagleBuf caps the per-connection NagleBuf at 64 segments
 	// (256 KB). v1.9.1 fix: SendData previously appended without bound,
@@ -275,19 +315,27 @@ type Connection struct {
 	WindowCh      chan struct{}          // signaled when window opens up
 	PeerRecvWin   int                    // peer's advertised receive window (-1 = not yet received, 0 = explicit zero-window)
 	// Nagle algorithm (write coalescing)
-	NagleBuf []byte        // pending small write data
-	NagleMu  sync.Mutex    // protects NagleBuf
-	NagleCh  chan struct{} // signaled when Nagle should flush
-	DialCh   chan struct{} // signaled when an outbound dial leaves SYN_SENT
-	NoDelay  bool          // if true, disable Nagle (send immediately)
+	NagleBuf []byte     // pending small write data
+	NagleMu  sync.Mutex // protects NagleBuf and tailFlusher
+	// SendMu is held from taking bytes out of NagleBuf until they are handed
+	// to sendSegment, so segments leave in the order the bytes were written
+	// whichever goroutine sends them. Taken before NagleMu.
+	SendMu sync.Mutex
+	// tailFlusher is true while a flushHeldTail goroutine is waiting to send
+	// a remainder that Nagle is holding.
+	tailFlusher bool
+	NagleCh     chan struct{} // signaled when Nagle should flush
+	DialCh      chan struct{} // signaled when an outbound dial leaves SYN_SENT
+	NoDelay     bool          // if true, disable Nagle (send immediately)
 	// Receive window (reassembly)
 	RecvMu      sync.Mutex
 	ExpectedSeq uint32         // next in-order seq expected
 	OOOBuf      []*recvSegment // out-of-order buffer
 	// Delayed ACK
-	AckMu       sync.Mutex  // protects PendingACKs and ACKTimer
+	AckMu       sync.Mutex  // protects PendingACKs, ACKTimer and QuickACKs
 	PendingACKs int         // count of unacked received segments
 	ACKTimer    *time.Timer // delayed ACK timer
+	QuickACKs   int         // lone segments still to be ACKed at once (see QuickACKBudget)
 	// Keepalive dead-peer detection
 	KeepaliveUnacked int // consecutive unanswered keepalive probes
 	// Close
@@ -500,6 +548,7 @@ func (pm *PortManager) NewConnection(localPort uint16, remoteAddr protocol.Addr,
 		SSThresh:     MaxCongWin / 2,
 		WindowCh:     make(chan struct{}, 1),
 		NagleCh:      make(chan struct{}, 1),
+		QuickACKs:    QuickACKBudget,
 		DialCh:       make(chan struct{}, 1),
 		PeerRecvWin:  -1, // sentinel: no window advertisement received yet
 		// Initialize RetxStop here (instead of in startRetxLoop) so it is
@@ -748,6 +797,40 @@ func (c *Connection) BytesInFlight() int {
 	return total
 }
 
+// nagleHoldsTail reports whether a write shorter than a segment must wait
+// before it is sent. Must be called with RetxMu held. (The tail of a write
+// of a segment or more is never held; see SendData.)
+//
+// The rule is Nagle's with Minshall's refinement: a short segment waits only
+// while an earlier short segment is unacknowledged. Full segments in flight
+// do not hold it.
+//
+// Nagle's original rule — wait while anything is unacknowledged — meets the
+// peer's delayed ACK badly. A peer acknowledges every second segment at once
+// and a lone or odd one on a timer (5ms; 40ms up to v1.14.1), so the tail
+// behind an odd number of full segments waited for that timer. With 4096-byte
+// segments only writes that were not a multiple of 4096 paid it. With
+// SendSegmentSize every 4096-byte write is three full segments and a tail:
+// a program streaming 4 KB writes stalled 5ms per write against a current
+// peer and 40ms against an older one (1 MB took 3.6s and 10s).
+//
+// A stream of tiny writes still coalesces: the second waits for the first to
+// be acknowledged.
+//
+// SACKed entries stay in Unacked until a cumulative ACK removes them, but
+// they are already at the peer and do not count.
+func (c *Connection) nagleHoldsTail() bool {
+	for _, e := range c.Unacked {
+		if e.sacked || e.isFIN || len(e.data) == 0 {
+			continue
+		}
+		if len(e.data) < SendSegmentSize {
+			return true
+		}
+	}
+	return false
+}
+
 // EffectiveWindow returns the effective send window (minimum of congestion
 // window and peer's advertised receive window).
 // Must be called with RetxMu held.
@@ -764,8 +847,41 @@ func (c *Connection) EffectiveWindow() int {
 
 // WindowAvailable returns true if the effective window allows more data.
 // Must be called with RetxMu held.
+//
+// Three limits apply.
+//
+// Bytes: what is in flight against the smaller of the congestion window and
+// the peer's window. A SACKed segment has left the network and normally does
+// not count. In fast recovery it does: there the congestion window is
+// inflated by one segment per duplicate ACK, which already accounts for the
+// segments that have left. Leaving them out as well counted each one twice,
+// so every duplicate ACK released two new segments and the amount in flight
+// doubled each round trip for as long as the hole stayed open.
+//
+// Segments against the peer's window: the peer advertises free slots in its
+// receive buffer, one per segment whatever the segment's size. Short segments
+// — the tail of a write, a small message — fill slots without filling bytes,
+// so a sender that only counted bytes sent more segments than the peer had
+// room for; the peer's packet loop then blocks for up to a second per segment
+// on its full buffer, stalling every connection on that node. SACKed segments
+// count here: they wait in the peer's reorder buffer and take a slot each the
+// moment the hole before them is filled.
+//
+// Segments against the peer's reorder buffer: see MaxSegmentsOutstanding.
 func (c *Connection) WindowAvailable() bool {
-	return c.BytesInFlight() < c.EffectiveWindow()
+	bytes := 0
+	for _, e := range c.Unacked {
+		if !e.sacked || c.FastRecovery {
+			bytes += len(e.data)
+		}
+	}
+	if bytes >= c.EffectiveWindow() {
+		return false
+	}
+	if c.PeerRecvWin >= 0 && len(c.Unacked) >= c.PeerRecvWin/SendSegmentSize {
+		return false
+	}
+	return len(c.Unacked) < MaxSegmentsOutstanding
 }
 
 // TrackSend adds a sent data segment to the retransmission buffer.
@@ -846,7 +962,7 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 		// (InRecovery=true, FastRecovery=true) must inflate cwnd by SMSS regardless
 		// of the current count.
 		if c.DupAckCount < 3 && c.InRecovery && c.FastRecovery && len(c.Unacked) > 0 {
-			c.CongWin += MaxSegmentSize
+			c.CongWin += SendSegmentSize
 			if c.CongWin > MaxCongWin {
 				c.CongWin = MaxCongWin
 			}
@@ -897,7 +1013,7 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 					// §3 step 6 retransmit + deflation even when DupAckCount was reset
 					// to 0 by a prior partial ACK.
 					c.FastRecovery = true
-					c.CongWin = c.SSThresh + 3*MaxSegmentSize
+					c.CongWin = c.SSThresh + 3*SendSegmentSize
 					// For small CongWin (< 6*SMSS), SSThresh+3*MSS > old CongWin, so
 					// the window may have opened.  Signal the sender so it doesn't stall.
 					if c.WindowCh != nil && c.WindowAvailable() {
@@ -911,7 +1027,7 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 					// ACK reset DupAckCount to 0.  fastRetransmit (above) is the RFC
 					// 6582 §3 step 6a retransmit; the step-5 per-dup cwnd inflation
 					// must also fire — it is not gated on newEpisode.
-					c.CongWin += MaxSegmentSize
+					c.CongWin += SendSegmentSize
 					if c.CongWin > MaxCongWin {
 						c.CongWin = MaxCongWin
 					}
@@ -934,7 +1050,7 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 				return
 			}
 			// Inflate window for each additional dup ACK (only in recovery)
-			c.CongWin += MaxSegmentSize
+			c.CongWin += SendSegmentSize
 			if c.CongWin > MaxCongWin {
 				c.CongWin = MaxCongWin
 			}
@@ -1062,8 +1178,8 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 			// so that a 1-SMSS partial ACK is neutral, and cwnd never falls
 			// below ssthresh.
 			c.CongWin -= bytesAcked
-			if bytesAcked >= MaxSegmentSize {
-				c.CongWin += MaxSegmentSize
+			if bytesAcked >= SendSegmentSize {
+				c.CongWin += SendSegmentSize
 			}
 			if c.CongWin < c.SSThresh {
 				c.CongWin = c.SSThresh
@@ -1073,6 +1189,16 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 			// the 100ms RTO tick — up to one full RTO of unnecessary delay.
 			c.fastRetransmit(recvAck)
 		}
+	} else if wasInRecovery && c.InRecovery {
+		// Partial ACK in timeout recovery. The cumulative ACK stopped at the
+		// segment now at the head, and that segment was sent before the
+		// timeout, so the peer does not have it: resend it now. Waiting for
+		// its own timer instead costs a full RTO per missing segment, and
+		// the RTO doubles each time (Karn: no RTT sample comes from a
+		// retransmitted segment) — a window with thirty segments missing
+		// took minutes and the connection was given up on. One segment per
+		// ACK keeps the retransmissions clocked by what the peer receives.
+		c.fastRetransmit(recvAck)
 	}
 
 	// Congestion window growth (Appropriate Byte Counting, RFC 3465).
@@ -1125,11 +1251,10 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 		}
 	}
 
-	// Signal Nagle flush when no data is genuinely in flight.
-	// Use BytesInFlight()==0 rather than len(c.Unacked)==0: after iter-49,
-	// sacked entries remain in Unacked across partial ACKs, so len>0 even
-	// when the peer already has every outstanding byte.
-	if c.BytesInFlight() == 0 && c.NagleCh != nil {
+	// Signal Nagle flush when no short segment is left in flight (see
+	// nagleHoldsTail). SACKed entries remain in Unacked across partial ACKs
+	// but are at the peer already, and do not count.
+	if c.NagleCh != nil && !c.nagleHoldsTail() {
 		select {
 		case c.NagleCh <- struct{}{}:
 		default:
@@ -1479,11 +1604,10 @@ func (c *Connection) ProcessSACK(blocks []SACKBlock) {
 		}
 	}
 
-	// When all outstanding bytes are now sacked, BytesInFlight()==0 means the
-	// peer has received everything in flight.  Signal NagleCh so a nagleFlush
-	// goroutine waiting for "all data ACKed" wakes immediately instead of
+	// A SACK can be what tells us the short segment in flight has arrived.
+	// Signal NagleCh so a nagleFlush waiting on it wakes now instead of
 	// stalling for NagleTimeout (40 ms) until the cumulative ACK arrives.
-	if c.NagleCh != nil && c.BytesInFlight() == 0 {
+	if c.NagleCh != nil && !c.nagleHoldsTail() {
 		select {
 		case c.NagleCh <- struct{}{}:
 		default:

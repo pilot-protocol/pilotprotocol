@@ -3410,7 +3410,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Process peer's receive window from SYN (H9 fix: always update, including Window==0)
 		conn.RetxMu.Lock()
 		prevWin := conn.PeerRecvWin
-		conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
+		conn.PeerRecvWin = int(pkt.Window) * SendSegmentSize
 		// prevWin==-1 is the sentinel (no advertisement yet); don't signal
 		// window-opened on the first transition (unknown→zero would fire).
 		winOpened := prevWin != -1 && conn.PeerRecvWin > prevWin && conn.WindowAvailable()
@@ -3499,7 +3499,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Process peer's receive window from SYN-ACK (H9 fix: always update)
 		conn.RetxMu.Lock()
 		prevWin := conn.PeerRecvWin
-		conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
+		conn.PeerRecvWin = int(pkt.Window) * SendSegmentSize
 		winOpened := prevWin != -1 && conn.PeerRecvWin > prevWin && conn.WindowAvailable()
 		conn.RetxMu.Unlock()
 		if winOpened && conn.WindowCh != nil {
@@ -3613,7 +3613,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Update peer's receive window (H9 fix: always update, honor Window==0)
 		conn.RetxMu.Lock()
 		prevPeerWin := conn.PeerRecvWin
-		conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
+		conn.PeerRecvWin = int(pkt.Window) * SendSegmentSize
 		peerWinOpened := prevPeerWin != -1 && conn.PeerRecvWin > prevPeerWin && conn.WindowAvailable()
 		conn.RetxMu.Unlock()
 		if peerWinOpened && conn.WindowCh != nil {
@@ -3679,13 +3679,24 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 				conn.AckMu.Unlock()
 				d.sendDelayedACK(conn)
 			} else {
-				// Delayed ACK: batch up to 2 segments or 40ms
+				// Delayed ACK: every second segment at once, a lone one at
+				// once while the quick-ACK budget lasts, otherwise after
+				// DelayedACKTimeout.
 				conn.PendingACKs++
 				if conn.PendingACKs >= DelayedACKThreshold {
 					conn.AckMu.Unlock()
 					d.sendDelayedACK(conn)
+				} else if conn.QuickACKs > 0 {
+					conn.QuickACKs--
+					conn.AckMu.Unlock()
+					d.sendDelayedACK(conn)
 				} else if conn.ACKTimer == nil {
 					conn.ACKTimer = time.AfterFunc(DelayedACKTimeout, func() {
+						// Nothing followed the lone segment: its sender is
+						// probably waiting for this ACK before sending more.
+						conn.AckMu.Lock()
+						conn.QuickACKs = QuickACKBudget
+						conn.AckMu.Unlock()
 						d.sendDelayedACK(conn)
 					})
 					conn.AckMu.Unlock()
@@ -4223,21 +4234,44 @@ const NagleTimeout = 40 * time.Millisecond
 
 // DelayedACKTimeout is the max time to delay an ACK (RFC 1122 suggests 500ms max).
 //
-// It is also how long a write can stall with both ends idle. Nagle holds a
-// short write — a frame's body after its header, the tail of a large write —
-// until the data before it is ACKed, and the ACK of a lone or odd segment
-// waits for this timer. At 40ms that was 40ms on the first exchange of every
+// It is also how long a sender that waits for an ACK before it sends more
+// can stall with both ends idle: a short write behind another short write
+// (see nagleHoldsTail), once the receiver's quick-ACK budget is spent (see
+// QuickACKBudget). At 40ms, and with every short tail held until all the
+// data before it was ACKed, that was 40ms on the first exchange of every
 // connection and one stall per 48KB file chunk (about 1.5 MB/s on any link).
 //
-// The timer is shortened rather than removed from the path. ACKing short
-// segments at once, or sending tails without waiting, takes the pause between
-// writes away entirely; several streams then burst into the peer's socket
-// buffer faster than a stock kernel's can hold, and four concurrent 20MB
-// transfers measured 34-40s instead of 1.4s.
+// An earlier attempt to take the pause between writes away entirely had
+// several streams burst into the peer's socket buffer faster than a stock
+// kernel's can hold: four concurrent 20MB transfers measured 34-40s instead
+// of 1.4s. Two things changed since. A sender keeps at most
+// MaxSegmentsOutstanding segments unacknowledged, which bounds the burst,
+// and a burst of losses is repaired on the ACK clock instead of one
+// retransmission timeout per segment. With no pause between writes the same
+// four transfers take 1.4s under a stock kernel's limit (rmem_max 212992).
 const DelayedACKTimeout = 5 * time.Millisecond
 
 // DelayedACKThreshold is the number of segments to receive before sending an ACK immediately.
 const DelayedACKThreshold = 2
+
+// QuickACKBudget is how many lone segments are acknowledged at once, without
+// the delayed-ACK timer, at the start of a connection and again after each
+// time the timer has had to fire.
+//
+// A sender that holds its next small write until the previous one is
+// acknowledged (Nagle) sends one segment and waits. Each of those is a lone
+// segment here, and delaying its ACK stalls that sender for the whole timer.
+// The usual case is the first exchange on a connection — a frame header, then
+// its body. The costly one is a peer up to v1.14.1 relaying what it reads:
+// it reads this node's 1152-byte segments, writes each back as a write below
+// its own 4096-byte segment size, and waits for the ACK of every one. bench
+// against such a peer took 3.2s for 1 MB at 5ms a segment.
+//
+// While the budget lasts every arriving segment is acknowledged on its own.
+// A bulk transfer uses it up within its first 32 segments and from then on
+// is acknowledged every second segment as before: the timer, which restores
+// the budget, only fires when a segment arrives and nothing follows it.
+const QuickACKBudget = 32
 
 // SendData sends data over an established connection.
 // Implements Nagle's algorithm: small writes are coalesced into MSS-sized
@@ -4278,91 +4312,189 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 	conn.NagleBuf = append(conn.NagleBuf, data...)
 	conn.NagleMu.Unlock()
 
-	return d.nagleFlush(conn)
+	// A write of a segment or more takes its tail with it: it is the end of
+	// a message, not one of a run of small writes that would coalesce.
+	_, err := d.flushNagle(conn, len(data) >= SendSegmentSize, false)
+	return err
 }
 
-// nagleFlush sends buffered data according to Nagle's algorithm:
-// - Full MSS segments are always sent
-// - Sub-MSS data is sent only if no unacknowledged data exists or timeout
+// nagleFlush sends what Nagle's algorithm allows from the connection's
+// buffer: every full segment, and the short remainder unless it is held.
+//
+// A remainder is held when the write that left it was shorter than a
+// segment and an earlier short segment is still unacknowledged (see
+// nagleHoldsTail). It stays in the buffer, where the next write joins it, and
+// flushHeldTail sends it once that segment is acknowledged or NagleTimeout
+// has passed. The caller does not wait for that.
+//
+// It used to: this function returned only once the buffer was empty. A
+// writer whose short write was held could not write again until it went out,
+// so nothing ever joined it, and a stream of short writes moved at one write
+// per round trip — a node echoing back 4 KB writes it had received as three
+// full segments and a tail managed 136 KB/s at 30ms. IPC sends are handled
+// inline in the client's read loop, so everything else that client asked
+// for waited as well.
+//
+// SendData does not hold the remainder of a write of a segment or more.
 func (d *Daemon) nagleFlush(conn *Connection) error {
+	_, err := d.flushNagle(conn, false, false)
+	return err
+}
+
+// flushNagle is nagleFlush with two switches: force sends the remainder even
+// if Nagle would hold it, and asFlusher marks the call as coming from
+// flushHeldTail.
+//
+// flushHeldTail sends only a held remainder, and sends it without waiting for
+// the window: it is less than one segment, and a goroutine that waited here
+// would hold SendMu for as long as the window stayed shut, with the
+// connection unable to close in order behind it. It does not start another
+// copy of itself, and its bookkeeping (Connection.tailFlusher) is cleared
+// here, under NagleMu, at the moment nothing is left for it to send — so a
+// writer that holds a new remainder right afterwards finds no flusher and
+// starts one.
+//
+// SendMu is held from taking bytes out of the buffer until they are handed
+// on to be sent, so segments leave in the order the bytes were written
+// whichever goroutine sends them.
+func (d *Daemon) flushNagle(conn *Connection, force, asFlusher bool) (held bool, err error) {
+	conn.SendMu.Lock()
+	defer conn.SendMu.Unlock()
+
 	for {
 		conn.NagleMu.Lock()
 		if len(conn.NagleBuf) == 0 {
+			if asFlusher {
+				conn.tailFlusher = false
+			}
 			conn.NagleMu.Unlock()
-			return nil
+			return false, nil
 		}
 
 		// If we have at least MSS bytes, send a full segment
-		if len(conn.NagleBuf) >= MaxSegmentSize {
-			segment := make([]byte, MaxSegmentSize)
-			copy(segment, conn.NagleBuf[:MaxSegmentSize])
-			conn.NagleBuf = conn.NagleBuf[MaxSegmentSize:]
+		if len(conn.NagleBuf) >= SendSegmentSize {
+			if asFlusher {
+				// A writer has added to the buffer and is on its way here
+				// to send it; full segments wait for the window, which is
+				// the writer's place to wait, not this goroutine's.
+				conn.NagleMu.Unlock()
+				return true, nil
+			}
+			segment := make([]byte, SendSegmentSize)
+			copy(segment, conn.NagleBuf[:SendSegmentSize])
+			conn.NagleBuf = conn.NagleBuf[SendSegmentSize:]
 			conn.NagleMu.Unlock()
 
 			if err := d.sendSegment(conn, segment); err != nil {
-				return err
+				return false, err
 			}
 			continue
 		}
 
 		// Sub-MSS data: check if we can send now (check under NagleMu).
-		// Use BytesInFlight() rather than len(Unacked): SACKed entries
-		// stay in Unacked until cumulative ACK removes them, but they
-		// are already at the peer and should not delay a flush.
 		conn.RetxMu.Lock()
-		hasUnacked := conn.BytesInFlight() > 0
+		hold := !force && conn.nagleHoldsTail()
 		conn.RetxMu.Unlock()
 
-		if !hasUnacked {
-			// No data in flight — send immediately (Nagle allows this)
-			segment := make([]byte, len(conn.NagleBuf))
-			copy(segment, conn.NagleBuf)
-			conn.NagleBuf = conn.NagleBuf[:0]
+		if hold {
+			if !asFlusher && !conn.tailFlusher {
+				conn.tailFlusher = true
+				go d.flushHeldTail(conn)
+			}
 			conn.NagleMu.Unlock()
-
-			return d.sendSegment(conn, segment)
-		}
-		conn.NagleMu.Unlock()
-
-		// Data in flight — wait for ACK or timeout
-		nagleTimer := time.NewTimer(NagleTimeout)
-		select {
-		case <-conn.NagleCh:
-			nagleTimer.Stop()
-			// All data ACKed — flush now
-		case <-nagleTimer.C:
-			// Timeout — flush regardless
-		case <-conn.RetxStop:
-			nagleTimer.Stop()
-			return protocol.ErrConnClosed
-		}
-
-		// Re-check under lock after waking
-		conn.NagleMu.Lock()
-		if len(conn.NagleBuf) == 0 {
-			conn.NagleMu.Unlock()
-			return nil
-		}
-
-		// Send whatever we have (might have reached MSS now)
-		if len(conn.NagleBuf) >= MaxSegmentSize {
-			conn.NagleMu.Unlock()
-			continue // loop back to send full segments
+			return true, nil
 		}
 
 		segment := make([]byte, len(conn.NagleBuf))
 		copy(segment, conn.NagleBuf)
 		conn.NagleBuf = conn.NagleBuf[:0]
+		if asFlusher {
+			conn.tailFlusher = false
+		}
 		conn.NagleMu.Unlock()
 
-		return d.sendSegment(conn, segment)
+		if asFlusher {
+			return false, d.transmitSegment(conn, segment)
+		}
+		return false, d.sendSegment(conn, segment)
+	}
+}
+
+// flushHeldTail sends a remainder that nagleFlush left held: as soon as the
+// short segment ahead of it is acknowledged (NagleCh), and regardless once
+// NagleTimeout has passed since it was first held. One runs per connection
+// at most, and only while something is held.
+func (d *Daemon) flushHeldTail(conn *Connection) {
+	timer := time.NewTimer(NagleTimeout)
+	defer timer.Stop()
+	force := false
+	for {
+		select {
+		case <-conn.NagleCh:
+			// May be a signal left over from an earlier ACK; flushNagle
+			// looks again and keeps holding if it must.
+		case <-timer.C:
+			// Held long enough. If a writer turns out to be sending the
+			// buffer itself, look again after another interval.
+			force = true
+			timer.Reset(NagleTimeout)
+		case <-conn.RetxStop:
+			conn.NagleMu.Lock()
+			conn.tailFlusher = false
+			conn.NagleMu.Unlock()
+			return
+		}
+		if held, _ := d.flushNagle(conn, force, true); !held {
+			return
+		}
+	}
+}
+
+// sendHeldTailBeforeClose sends a remainder Nagle is still holding, so that it
+// is on the wire with a sequence number below the FIN's. It does not wait
+// for the window — a close must not block on a peer that has stopped
+// reading, and the remainder is less than one segment.
+//
+// SendMu is what orders this against flushHeldTail, which holds it only for
+// the instant it takes to hand a remainder on. A writer can hold it for as
+// long as the window stays shut; a close does not wait for that, and goes
+// ahead as it always has.
+func (d *Daemon) sendHeldTailBeforeClose(conn *Connection) {
+	conn.Mu.Lock()
+	established := conn.State == StateEstablished
+	conn.Mu.Unlock()
+	if !established {
+		return
+	}
+	locked := conn.SendMu.TryLock()
+	for i := 0; !locked && i < 20; i++ {
+		time.Sleep(time.Millisecond)
+		locked = conn.SendMu.TryLock()
+	}
+	if !locked {
+		return
+	}
+	defer conn.SendMu.Unlock()
+	conn.NagleMu.Lock()
+	tail := conn.NagleBuf
+	conn.NagleBuf = nil
+	conn.NagleMu.Unlock()
+	for len(tail) > 0 {
+		n := len(tail)
+		if n > SendSegmentSize {
+			n = SendSegmentSize
+		}
+		if err := d.transmitSegment(conn, tail[:n]); err != nil {
+			return
+		}
+		tail = tail[n:]
 	}
 }
 
 // sendDataImmediate sends data in MSS-sized segments without Nagle coalescing.
 func (d *Daemon) sendDataImmediate(conn *Connection, data []byte) error {
 	for offset := 0; offset < len(data); {
-		end := offset + MaxSegmentSize
+		end := offset + SendSegmentSize
 		if end > len(data) {
 			end = len(data)
 		}
@@ -4459,6 +4591,12 @@ func (d *Daemon) sendSegment(conn *Connection, data []byte) error {
 		}
 	}
 
+	return d.transmitSegment(conn, data)
+}
+
+// transmitSegment puts one segment on the wire and tracks it for
+// retransmission, without consulting the window.
+func (d *Daemon) transmitSegment(conn *Connection, data []byte) error {
 	// v1.9.1: reserve seq atomically with the read — pre-incrementing SendSeq
 	// inside the same Mu critical section prevents two concurrent sendSegment
 	// callers from reading the same SendSeq and emitting packets with identical
@@ -4749,6 +4887,7 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	// concurrent sendSegment cannot read the same value and produce a data
 	// segment with the same seq as the FIN sentinel (iter 24 fix, same
 	// pattern as the sendSegment pre-increment fix in iter 23).
+	d.sendHeldTailBeforeClose(conn)
 	conn.Mu.Lock()
 	st := conn.State
 	sendSeq := conn.SendSeq
