@@ -485,7 +485,9 @@ func TestHandshakeTrustPersistence(t *testing.T) {
 		}
 	}
 
-	// Verify trust store file exists
+	// Verify trust store file exists. The store is written just after the
+	// peer is marked trusted in memory, so give the write a moment.
+	waitForFile(trustPathA, 2*time.Second)
 	if _, err := os.Stat(trustPathA); err != nil {
 		t.Fatalf("trust store not created: %v", err)
 	}
@@ -615,6 +617,7 @@ func TestHandshakeTrustLoadVerify(t *testing.T) {
 	}
 
 	// Verify trust file was created and contains correct data
+	waitForFile(trustPath, 2*time.Second)
 	data, err := os.ReadFile(trustPath)
 	if err != nil {
 		t.Fatalf("read trust file: %v", err)
@@ -752,3 +755,13 @@ func TestHandshakeTrustLoadFromDisk(t *testing.T) {
 
 var _ = driver.Connect // keep driver import
 var _ = os.Remove      // keep os import
+
+// waitForFile returns once path exists or the timeout has passed; the
+// caller's own check reports a missing file.
+func waitForFile(path string, timeout time.Duration) {
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+	}
+}
