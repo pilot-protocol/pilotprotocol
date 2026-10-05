@@ -4835,6 +4835,7 @@ func cmdSendMessage(args []string) {
 	firstContact := false
 	if info, err := d.Info(); err == nil {
 		firstContact = !peerSessionUp(info, target.Node)
+		noteDaemonFeatures(info) // maybeAutoHandshake needs them next
 	}
 
 	// Auto-handshake to peers in the embedded trusted-agents list.

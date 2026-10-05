@@ -52,12 +52,19 @@ func daemonHasFeature(d *driver.Driver, feature string) bool {
 	if daemonFeatureSet == nil {
 		daemonFeatureSet = map[string]bool{}
 		if info, err := d.Info(); err == nil {
-			for f := range featuresOf(info) {
-				daemonFeatureSet[f] = true
-			}
+			noteDaemonFeatures(info)
 		}
 	}
 	return daemonFeatureSet[feature]
+}
+
+// noteDaemonFeatures fills the feature cache from an info reply the
+// command already holds, so daemonHasFeature does not ask for another.
+// The reply lists every peer and connection: on a node with a few
+// thousand peers it is several hundred KB, and parsing it costs pilotctl
+// more CPU than the rest of a send.
+func noteDaemonFeatures(info map[string]interface{}) {
+	daemonFeatureSet = featuresOf(info)
 }
 
 func featuresOf(info map[string]interface{}) map[string]bool {

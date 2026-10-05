@@ -300,3 +300,40 @@ func TestAutoHandshakeKeepsHandshakeForOlderDaemon(t *testing.T) {
 		t.Fatal("older daemon: the trusted-agent handshake request must still be sent")
 	}
 }
+
+// A send asks the daemon for its info reply once. The features the
+// auto-handshake checks come from the reply already fetched for the
+// first-contact check: the reply lists every peer and connection, so on a
+// busy node a second one cost more than the rest of the send.
+func TestSendMessageAsksForInfoOnce(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	daemonFeatureSet = nil
+	t.Cleanup(func() { daemonFeatureSet = nil })
+	sd.onJSON(tdCmdInfo, tdCmdInfoOK, `{"node_id":1,"features":["reply_window"]}`)
+	// Not trusted yet, so the auto-handshake goes on to check features.
+	sd.onJSON(tdCmdHandshake, tdCmdHandshakeOK, `{"trusted":false}`)
+
+	out := captureStdout(t, func() {
+		withJSON(func() {
+			cmdSendMessage([]string{"0:0000.0002.BBE4", "--data", "hello"}) // 179172, a trusted agent
+		})
+	})
+	if !strings.Contains(out, `"status":"ok"`) {
+		t.Fatalf("send failed: %s", out)
+	}
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+	infos := 0
+	for _, f := range sd.received {
+		if f[0] == tdCmdInfo {
+			infos++
+		}
+	}
+	if infos != 1 {
+		t.Fatalf("info requests = %d, want 1", infos)
+	}
+	if !daemonFeatureSet["reply_window"] {
+		t.Fatal("features from the first info reply were not kept")
+	}
+}

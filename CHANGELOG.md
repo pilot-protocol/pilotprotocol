@@ -245,6 +245,14 @@ Detailed per-release notes are on the
   unknown type; before it answered that no verifier was configured.
 
 ### Changed
+- **`pilotctl send-message` asks the daemon for its `info` reply once, not
+  twice.** The auto-handshake read the daemon's `features` from a second
+  `info` request, although the command had fetched one a moment earlier for
+  its first-contact check. The reply lists every peer and connection: on a
+  node with 5,400 peers it is several hundred KB, and parsing it costs the
+  CLI 7.5 ms of CPU and 2.9 MB of allocations, more than the rest of a send.
+  The second request happened on every send to an agent in the trusted list
+  (`list-agents`, `pilot-mom`) and to any public peer not yet trusted.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps
