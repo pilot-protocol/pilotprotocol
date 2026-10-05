@@ -124,8 +124,15 @@ func (d *Daemon) pathWatchTick(states map[uint32]*pathPeerState, now time.Time) 
 	defer recoverLayer("L4", "pathWatchTick", d.bus, nil)
 
 	ready := d.tunnels.ReadyPeerIDs()
+	idle := d.tunnels.idleFilter(now)
 	live := make(map[uint32]bool, len(ready))
 	for _, nodeID := range ready {
+		if idle(nodeID) {
+			// Nobody is using this peer: silence from it is expected,
+			// and probing or resetting it would only cost both sides
+			// packets and a key exchange. Its state is dropped below.
+			continue
+		}
 		live[nodeID] = true
 		st := states[nodeID]
 		if st == nil {

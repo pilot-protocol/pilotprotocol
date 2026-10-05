@@ -296,6 +296,21 @@ Detailed per-release notes are on the
   unknown type; before it answered that no verifier was configured.
 
 ### Changed
+- **Peers nobody is using no longer cost anything.** The daemon kept every
+  peer it had ever exchanged keys with warm forever: a NAT keepalive every
+  25 s, path-watchdog probes and resets when the peer went quiet, and for
+  each relayed peer a direct-upgrade attempt (registry lookup, beacon punch,
+  five probes) every 15 s. A public service agent that had answered a few
+  thousand clients sent about 1,600 packets a second on this while serving
+  a few requests a minute. A peer with no application traffic for 2 minutes
+  and no open connection now gets none of it. Sending to it works as
+  before, re-establishing the path through the usual fallbacks if a NAT
+  mapping expired meanwhile. Five minutes after the last frame either way,
+  the stale-peer reaper now drops the peer, as it was meant to: the
+  keepalives counted as contact, so it never fired, and busy nodes held
+  every peer they had ever seen (service agents: 3,500 to 10,900). The next
+  contact runs a fresh key exchange. The reaper also counts relayed inbound
+  frames as contact now, so a peer still sending to us is kept.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps

@@ -692,6 +692,7 @@ func New(cfg Config) *Daemon {
 	// peer trusted only through the registry now gets the redacted event,
 	// which is the conservative side.
 	d.tunnels.SetPeerTrustFn(d.handshakeTrusts)
+	d.tunnels.SetOpenConnPeers(d.ports.ActiveNodeIDs)
 	d.ipc = NewIPCServer(cfg.SocketPath, d)
 	// HandshakeService is wired post-construction by the composition
 	// root via RegisterHandshakeService (T3.3 — handshake plugin moved
@@ -6149,10 +6150,16 @@ func (d *Daemon) reapStalePeers() {
 		lastDirect := d.tunnels.LastDirectRecv(p.NodeID)
 		lastOutbound, ok := d.tunnels.LastOutboundSend(p.NodeID)
 
-		// Find the latest known contact.
+		// Find the latest known contact. Any authenticated inbound frame
+		// counts, relayed ones too (LastDirectRecv skips those): a peer
+		// still talking to us is not stale, and dropping it would only
+		// make its next frame trigger a rekey.
 		latest := lastDirect
 		if ok && lastOutbound.After(latest) {
 			latest = lastOutbound
+		}
+		if lastIn, ok := d.tunnels.LastInboundDecrypt(p.NodeID); ok && lastIn.After(latest) {
+			latest = lastIn
 		}
 
 		if latest.IsZero() {
@@ -6327,7 +6334,13 @@ func (d *Daemon) relayProbeLoop() {
 		case <-d.stopCh:
 			return
 		case <-ticker.C:
+			idle := d.tunnels.idleFilter(time.Now())
 			for _, nodeID := range d.tunnels.RelayPeerIDs() {
+				if idle(nodeID) {
+					// An upgrade costs a registry lookup, a beacon punch
+					// and five probes; nobody is using this path.
+					continue
+				}
 				go d.tryDirectUpgrade(nodeID)
 			}
 		}
