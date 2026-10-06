@@ -14,6 +14,14 @@ import (
 	"github.com/pilot-protocol/common/protocol"
 )
 
+// runLargeHandler is runHandler with time to build a megabyte reply on a
+// slow CI runner under -race.
+func runLargeHandler(t *testing.T, conn net.Conn, fn func()) []byte {
+	t.Helper()
+	go fn()
+	return readIPCReply(t, conn, 20*time.Second)
+}
+
 // A node with more peers than one IPC message can list still answers info:
 // the scalar fields and connections are whole, the peer list is cut to fit
 // and says so, and peers with an open connection are kept. Before, the
@@ -37,7 +45,7 @@ func TestInfoReplyFitsOneIPCMessage(t *testing.T) {
 	d.ports.NewConnection(49152, protocol.Addr{Node: inUse}, protocol.PortDataExchange).State = StateEstablished
 
 	ic, conn := newIPCTestConn(t)
-	reply := runHandler(t, conn, func() { s.handleInfo(ic, 0) })
+	reply := runLargeHandler(t, conn, func() { s.handleInfo(ic, 0) })
 	if len(reply) > ipcutil.MaxMessageSize {
 		t.Fatalf("reply is %d bytes, over the IPC limit", len(reply))
 	}
@@ -79,7 +87,7 @@ func TestTrustedReplyFitsOneIPCMessage(t *testing.T) {
 		})
 	}
 	ic, conn := newIPCTestConn(t)
-	reply := runHandler(t, conn, func() { d.ipc.handleHandshake(ic, 0, []byte{SubHandshakeTrusted}) })
+	reply := runLargeHandler(t, conn, func() { d.ipc.handleHandshake(ic, 0, []byte{SubHandshakeTrusted}) })
 	var r struct {
 		Trusted []struct {
 			NodeID uint32 `json:"node_id"`
