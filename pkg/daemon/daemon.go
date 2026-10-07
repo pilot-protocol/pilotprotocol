@@ -1639,6 +1639,10 @@ func (d *Daemon) Stop() error {
 }
 
 func (d *Daemon) doStop() {
+	// The background goroutines and a relayed-handshake poll in flight
+	// share one deadline.
+	drainDeadline := time.Now().Add(5 * time.Second)
+
 	// Wait for all daemon-scoped background goroutines to notice
 	// stopCh and exit before tearing down shared infrastructure.
 	// Use a 5-second timeout to prevent a hung goroutine (e.g.
@@ -1651,7 +1655,7 @@ func (d *Daemon) doStop() {
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(time.Until(drainDeadline)):
 		slog.Warn("timed out waiting for background goroutines to exit", "leaked", true)
 	}
 
@@ -1705,6 +1709,13 @@ func (d *Daemon) doStop() {
 	}
 	if len(conns) > 0 {
 		slog.Info("closed active connections", "count", len(conns))
+	}
+
+	// A relayed-handshake poll in flight finishes first, while the handshake
+	// manager can still act on and save what it brings back, and no new one
+	// starts: the registry empties the inbox as it answers.
+	if !d.hsPoll.shutdown(drainDeadline) {
+		slog.Warn("relayed-handshake poll still running at shutdown; stopping without its results")
 	}
 
 	// Wait for background handshake RPCs to drain
@@ -6656,10 +6667,8 @@ func (d *Daemon) lookupPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 }
 
 // pollRelayedHandshakes checks the registry for handshake requests and
-// responses relayed to this node and processes them.
-//
-// timeout > 0 bounds the registry call (a local client is waiting on it);
-// 0 leaves it unbounded, as the background loop always ran it.
+// responses relayed to this node and processes them. It runs on the poll
+// goroutine started by pollHandshakes.
 func (d *Daemon) pollRelayedHandshakes() {
 	rc, nodeID := d.reg(), d.NodeID()
 	if rc == nil {

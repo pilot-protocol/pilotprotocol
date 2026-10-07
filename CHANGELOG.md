@@ -314,6 +314,21 @@ Detailed per-release notes are on the
   `appstore upgrade` does not wait.
 
 ### Fixed
+- **A daemon stopping mid-poll no longer loses relayed handshakes.** The
+  registry empties a node's handshake inbox as it answers a poll, and
+  shutdown closed the registry client without waiting for a poll in flight,
+  so a restart during one dropped the requests and approvals it carried.
+  Shutdown now waits for it before stopping the handshake manager, so what it
+  brings back is still acted on and saved, and starts no new poll once it
+  has begun. The wait shares the 5s that shutdown already allows its
+  background goroutines.
+- **A full table of handshake windows lets go of one settled peer, not all
+  of them.** With 64 peers tracked, a new request evicted every peer whose
+  fast-poll window had closed, and those peers lost the hold-off that stops
+  an automatic handshake from reopening their window early. Now only the
+  one whose hold-off ends soonest makes room.
+- **Bytes after a known beacon notify kind are ignored** instead of the
+  whole notify being dropped, so a later beacon can extend the message.
 - **Stream segments fit one packet.** A full stream segment was 4096 bytes,
   about 4.2 KB on the wire and three IP fragments on a 1500-byte path. NATs,
   firewalls and some virtual networks drop fragments, so on those paths

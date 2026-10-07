@@ -2332,8 +2332,12 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 			slog.Debug("dropping notify from non-beacon source", "from", from)
 			return
 		}
-		if len(data) != 2 || data[1] != beaconNotifyHandshake {
+		if len(data) < 2 || data[1] != beaconNotifyHandshake {
 			// A kind this daemon does not know is not a reason to poll.
+			// Bytes after a known kind are ignored, so a later beacon can
+			// add to the message without daemons from this one on dropping
+			// it. (v1.16.0 requires exactly two bytes: a beacon cannot
+			// extend the message while v1.16.0 nodes remain.)
 			slog.Debug("dropping beacon notify of unknown kind", "len", len(data))
 			return
 		}
@@ -2345,7 +2349,7 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 	}
 }
 
-// beaconMsgNotify is a beacon → node message, [0x0A][kind(1)], telling the
+// beaconMsgNotify is a beacon → node message, [0x0A][kind(1)][...], telling the
 // node that the registry is holding something for it. kind 0x01 is a relayed
 // trust-handshake request or answer; the node polls for it. It carries no
 // node ID, address or payload. Daemons that predate it log it as an unknown
