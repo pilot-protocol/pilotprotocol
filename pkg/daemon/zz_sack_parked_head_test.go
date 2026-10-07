@@ -32,7 +32,7 @@ type parkedCfg struct {
 	segs        int           // segments the sender writes
 	holeIdx     int           // segment whose first transmission is dropped
 	freeSlots   int           // RecvBuf slots left free at the start
-	leaked      int           // stale OOOBuf entries injected below ExpectedSeq
+	leaked      int           // reorder-buffer entries far ahead of the transfer, taking slots
 	bigCwnd     bool          // start with a warmed-up congestion window
 	resumeAt    time.Duration // when B's application starts reading
 	deadline    time.Duration
@@ -41,6 +41,7 @@ type parkedCfg struct {
 
 type parkedResult struct {
 	completed   bool
+	parked      bool // the receiver held the segment at its cumulative ACK in its reorder buffer
 	elapsed     time.Duration
 	rst         bool
 	expectedSeq uint32
@@ -115,9 +116,11 @@ func runParkedTransfer(t *testing.T, cfg parkedCfg) parkedResult {
 		cB.RecvBuf <- parkedDummy
 	}
 	for i := 0; i < cfg.leaked; i++ {
-		// Stale duplicates below ExpectedSeq, as left by earlier recoveries.
+		// Entries far ahead of the transfer, as a receiver that has not
+		// upgraded keeps them after earlier recoveries: they take reorder
+		// slots, so a full buffer cannot SACK the last segment.
 		cB.OOOBuf = append(cB.OOOBuf, &recvSegment{
-			seq:  isnA - uint32((i+1)*10*SendSegmentSize),
+			seq:  isnA + (1 << 22) + uint32(i*10*SendSegmentSize),
 			data: make([]byte, SendSegmentSize),
 		})
 	}
@@ -202,14 +205,31 @@ func runParkedTransfer(t *testing.T, cfg parkedCfg) parkedResult {
 		}
 	}()
 
-	// B's application: stopped, resumes reading at resumeAt.
+	// B's application: stopped; it resumes reading at resumeAt, and not
+	// before the receiver has parked the segment at its cumulative ACK —
+	// otherwise the test would not test anything.
 	var gotMu sync.Mutex
 	var got []byte
+	var parked atomic.Bool
 	done := make(chan struct{})
 	start := time.Now()
 	go func() {
+		for !parked.Load() {
+			cB.RecvMu.Lock()
+			for _, seg := range cB.OOOBuf {
+				if seg.seq == cB.ExpectedSeq {
+					parked.Store(true)
+				}
+			}
+			cB.RecvMu.Unlock()
+			select {
+			case <-time.After(10 * time.Millisecond):
+			case <-stop:
+				return
+			}
+		}
 		select {
-		case <-time.After(cfg.resumeAt):
+		case <-time.After(time.Until(start.Add(cfg.resumeAt))):
 		case <-stop:
 			return
 		}
@@ -331,6 +351,7 @@ loop:
 	res.got = append([]byte(nil), got...)
 	gotMu.Unlock()
 
+	res.parked = parked.Load()
 	close(stop)
 	wg.Wait()
 	return res
@@ -360,6 +381,9 @@ func TestParkedHeadIsResentAndTheTransferCompletes(t *testing.T) {
 		extraWrites: 4,
 	})
 	t.Logf("completed=%v elapsed=%v rst=%v retransmits=%d", res.completed, res.elapsed.Round(time.Millisecond), res.rst, res.retx)
+	if !res.parked {
+		t.Fatal("the receiver never parked the segment at its cumulative ACK: the test did not set up its case")
+	}
 	if !res.completed {
 		t.Fatalf("transfer did not complete: receiver ExpectedSeq=+%d of %d", res.expectedSeq, len(res.want))
 	}
@@ -392,6 +416,9 @@ func TestParkedHeadIsResentWithUnsackedSegmentsBehindIt(t *testing.T) {
 		deadline:  time.Duration(parkedEnvInt("PROBE_DEADLINE", 60)) * time.Second,
 	})
 	t.Logf("completed=%v elapsed=%v rst=%v retransmits=%d", res.completed, res.elapsed.Round(time.Millisecond), res.rst, res.retx)
+	if !res.parked {
+		t.Fatal("the receiver never parked the segment at its cumulative ACK: the test did not set up its case")
+	}
 	if !res.completed {
 		t.Fatalf("transfer did not complete (rst=%v): receiver ExpectedSeq=+%d of %d", res.rst, res.expectedSeq, len(res.want))
 	}
