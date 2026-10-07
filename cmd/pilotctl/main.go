@@ -1686,7 +1686,9 @@ Agent tool discovery:
 App store (install + call local capability apps; full help: pilotctl appstore help):
   pilotctl appstore catalogue                         list apps available for one-command install
   pilotctl appstore view <id> [--all-changelog]       app detail page (description, methods, permissions)
-  pilotctl appstore install <app-id> [--force]        install by catalogue ID (fetch + verify + extract)
+  pilotctl appstore install <app-id> [--force] [--no-wait | --wait <dur>]
+                                                      install by catalogue ID (fetch + verify + extract)
+                                                      and wait up to 20s for the app's first start
   pilotctl appstore list                              list installed apps + their IPC methods
   pilotctl appstore call <id> <method> [json-args]    dispatch an IPC call into an app
   pilotctl appstore status|caps|audit|restart|uninstall <id>
@@ -2583,7 +2585,7 @@ func contextCatalog() map[string]interface{} {
 			"subcommands": map[string]interface{}{
 				"catalogue":      map[string]interface{}{"args": []string{}, "description": "List apps available for one-command install (alias: catalog)"},
 				"view":           map[string]interface{}{"args": []string{"<id>", "[--all-changelog]"}, "description": "Detail page: description, vendor, changelog, size, source, methods, permissions (installed or not)"},
-				"install":        map[string]interface{}{"args": []string{"<app-id> [--force]", "| <bundle-dir> --local [--force]"}, "description": "Install by catalogue ID (fetch + verify + extract), or sideload a local bundle with --local"},
+				"install":        map[string]interface{}{"args": []string{"<app-id> [--force]", "| <bundle-dir> --local [--force]", "[--no-wait | --wait <dur>]"}, "description": "Install by catalogue ID (fetch + verify + extract), or sideload a local bundle with --local. With a daemon running, waits up to 20s (--wait <dur>) for the app's first start and exits non-zero (app_start_failed) if it crashed at start, was suspended, or was refused as older than the version the daemon runs; --no-wait returns at once"},
 				"list":           map[string]interface{}{"args": []string{}, "description": "List installed apps and the IPC methods each exposes"},
 				"call":           map[string]interface{}{"args": []string{"<id>", "<method>", "[json-args]", "[--timeout <dur>]"}, "description": "Dispatch an IPC call into an app (default timeout 120s; $PILOT_APPSTORE_CALL_TIMEOUT)"},
 				"status":         map[string]interface{}{"args": []string{"<id>"}, "description": "Deep-dive on one app's pinned state"},
