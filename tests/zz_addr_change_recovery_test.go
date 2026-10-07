@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon"
+	"github.com/pilot-protocol/pilotprotocol/pkg/daemon/keyexchange"
 )
 
 // peerEndpoint returns the endpoint d currently holds for nodeID, or "".
@@ -29,9 +30,9 @@ func peerEndpoint(d *daemon.Daemon, nodeID uint32) string {
 // address, so the address change itself is not reproduced here (that is
 // covered by the Docker lab run described in the changelog entry). What is
 // reproduced is the state the peer is left in: B's entry for A is pointed at
-// an address nobody listens on, which is exactly what B holds after A has
+// an address that never answers, which is exactly what B holds after A has
 // moved. The recovery on A then has to put A's real source address back into
-// B's table.
+// B's table, before anything else in the test could have.
 func TestAddrChangeRecoveryTeachesPeerNewSource(t *testing.T) {
 	env := NewTestEnv(t)
 	encrypted := func(cfg *daemon.Config) { cfg.Encrypt = true }
@@ -66,7 +67,7 @@ func TestAddrChangeRecoveryTeachesPeerNewSource(t *testing.T) {
 	}
 	conn.Close()
 
-	aID := a.Daemon.NodeID()
+	aID, bID := a.Daemon.NodeID(), b.Daemon.NodeID()
 	_, aPort, err := net.SplitHostPort(a.Daemon.TunnelAddr().String())
 	if err != nil {
 		t.Fatalf("tunnel addr: %v", err)
@@ -76,39 +77,73 @@ func TestAddrChangeRecoveryTeachesPeerNewSource(t *testing.T) {
 		t.Fatalf("B's endpoint for A before the test = %q, want A's tunnel port %s", real, aPort)
 	}
 
-	// "A moved": B still holds an address A is no longer at. A reserved,
-	// closed loopback port stands in for the old address.
+	// "A moved": B still holds an address A is no longer at. A loopback
+	// socket that never answers stands in for the old address; it stays open
+	// so B's sends to it vanish silently, as they would at a real old
+	// address, instead of drawing ICMP errors.
 	dead, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("reserve stale addr: %v", err)
 	}
+	defer dead.Close()
 	stale := dead.LocalAddr().(*net.UDPAddr)
-	dead.Close()
 	// Let the echo connection's teardown finish first: any frame A still
 	// sends for it would correct B's entry and hide what the recovery does.
+	// Not much longer, though; see naturalHeal below.
 	time.Sleep(2 * time.Second)
+	poisoned := time.Now()
 	b.Daemon.Tunnels().AddPeer(aID, stale)
 
-	// Nothing corrects B on its own in the short run: A is idle, and its
-	// keepalive toward B is up to 25 s away.
-	time.Sleep(1500 * time.Millisecond)
+	// The earliest anything but the recovery could correct B: AddPeer
+	// starts a key exchange with A (also sent through the beacon, so it
+	// reaches A), retransmitted every RekeyRetransmitInterval, and A may
+	// answer one from its real address once it has heard nothing from B for
+	// KeyExchangeReplyStaleThreshold. With the 2 s pause above, the first
+	// send A could answer goes out about 4 s after the poisoning. (In
+	// practice A's next keepalive is what corrects B, over 20 s later; this
+	// is the lower bound.) The recovery has to have healed B before then, or
+	// the test could not tell which one did it. A slow runner only eats into
+	// the recovery's share of those 4 s, which needs a few milliseconds.
+	lastFromB, ok := a.Daemon.Tunnels().LastInboundDecrypt(bID)
+	if !ok {
+		t.Fatal("A has never decrypted a frame from B; the echo did not run over the tunnel")
+	}
+	naturalHeal := poisoned
+	for naturalHeal.Sub(lastFromB) < keyexchange.KeyExchangeReplyStaleThreshold {
+		naturalHeal = naturalHeal.Add(keyexchange.RekeyRetransmitInterval)
+	}
+	deadline := naturalHeal.Add(-250 * time.Millisecond)
+
+	time.Sleep(100 * time.Millisecond)
 	if got := peerEndpoint(b.Daemon, aID); got != stale.String() {
-		t.Fatalf("B's endpoint for A healed without the recovery (%q); the test cannot tell what fixed it", got)
+		t.Fatalf("B's endpoint for A healed before the recovery ran (%q): echo traffic was still in flight", got)
 	}
 
+	done := make(chan struct{})
 	start := time.Now()
-	a.Daemon.RecoverFromAddrChange()
+	go func() {
+		defer close(done)
+		daemon.RecoverFromAddrChangeForTest(a.Daemon)
+	}()
+	defer func() {
+		// The registry half of the recovery may still be running; let it
+		// finish before the environment is torn down.
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Error("recovery did not return")
+		}
+	}()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if got := peerEndpoint(b.Daemon, aID); got == real {
-			break
-		}
+	for peerEndpoint(b.Daemon, aID) != real {
 		if time.Now().After(deadline) {
-			t.Fatalf("B still holds %q for A 3s after A's recovery, want %q",
-				peerEndpoint(b.Daemon, aID), real)
+			t.Fatalf("B still holds %q for A %v after A's recovery started, want %q "+
+				"(B's own key exchange could correct it from %v after the poisoning, so a later heal proves nothing)",
+				peerEndpoint(b.Daemon, aID), time.Since(start).Truncate(time.Millisecond), real,
+				naturalHeal.Sub(poisoned).Truncate(time.Millisecond))
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
-	t.Logf("B learned A's source address %v after the recovery started", time.Since(start).Truncate(time.Millisecond))
+	t.Logf("B learned A's source address %v after the recovery started (B alone could not have before %v after the poisoning)",
+		time.Since(start).Truncate(time.Millisecond), naturalHeal.Sub(poisoned).Truncate(time.Millisecond))
 }

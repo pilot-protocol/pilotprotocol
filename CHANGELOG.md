@@ -512,27 +512,47 @@ Detailed per-release notes are on the
   daemon now checks once a second which source address the kernel would use
   toward the beacon (a route lookup; nothing is sent) and, when it changes,
   re-registers with the beacon, sends one authenticated probe straight to
-  every tunnel peer so each learns the new address from it, and re-registers
-  with the registry over a fresh connection, also refreshing the LAN
-  addresses it advertises. Measured in a three-node Docker lab, moving one
-  node to a new address: peer to moved node 32 s before, under 1 s after;
-  moved node to peer 30 s before, no failed send after; a node with no
-  existing tunnel timed out after 30 s before and connected directly in 0.2 s
-  after. Peers need no update.
+  every tunnel peer so each learns the new address from it, and sends the
+  registry its new endpoint and LAN addresses over a fresh connection. Only
+  the endpoint is sent: the registry still has the node's visibility,
+  hostname and trust pairs, so they are not written again (the full restore
+  still runs if the registry has not answered for 5 minutes or its reply
+  shows it lost the node). The beacon registration is repeated 31 s later,
+  because the beacon accepts one endpoint update per node every 30 s and
+  drops the rest; a move within 30 s of the last keepalive registration
+  otherwise reached the beacon only with the next one, up to a minute later.
+  Measured in a three-node Docker lab, moving one node to a new address: peer
+  to moved node 32 s before, under 1 s after; moved node to peer 30 s before,
+  no failed send after; a node with no existing tunnel timed out after 30 s
+  before and connected directly in 0.2 s after. Peers need no update.
   - An interface that drops and returns with the same address triggers
     nothing, and neither does an unrelated interface appearing (a Docker
-    bridge, a VPN that does not take the route). Recoveries are at least 10 s
-    apart, and the gap doubles up to 2 minutes while changes keep coming, so
-    a flapping interface cannot flood the registry; a change seen during the
-    gap runs when the gap ends.
+    bridge, a VPN that does not take the route), nor a switch to another
+    beacon by the beacon-list refresh, which may be reached over another
+    route: the comparison starts over with the new beacon. Recoveries are at
+    least 10 s apart, and the gap doubles up to 2 minutes while changes keep
+    coming, so a flapping interface cannot flood the registry; a change seen
+    during the gap runs when the gap ends, unless the address has gone back.
   - Behind NAT the local address does not change when the public one does.
-    The daemon now also reads the address the beacon reports seeing it at
-    (the reply to its periodic beacon registration, every keepalive interval,
-    60 s by default) and runs the same recovery when that IP changes. This
+    The daemon also reads the address the beacon reports seeing it at (the
+    reply to its beacon registration, every keepalive interval, 60 s by
+    default) and runs the same recovery when that IP changes. A reply counts
+    only if it arrives within 2 s of a registration the node sent, and a new
+    IP only once two replies in a row agree on it; when one reply differs,
+    the node registers once more at once to check it. Because a NAT that maps
+    a node to several public IPs looks like a stream of changes, the gap
+    between these recoveries starts at 1 minute and grows to 1 hour. This
     path has unit tests only; it was not exercised against a real NAT.
-  - Publishes `tunnel.addr_changed` (`reason`, `previous`, `current`,
-    `peers_notified`, `registry_ok`). A relay-only or compat-mode node does
-    not probe peers directly.
+  - A host waking from sleep on a new network no longer has its two
+    recoveries (wake and address change) abort each other's registry calls:
+    re-registrations run one at a time, and the wake or rx-watchdog
+    recovery is skipped when one succeeded in the last 5 s.
+  - Publishes `tunnel.addr_changed` (`reason`: `local_address`,
+    `observed_endpoint` or `registry_retry`; `previous` and `current`: the
+    local address, or for `observed_endpoint` the IP the beacon sees;
+    `peers_notified`; `registry_ok`: whether the registry accepted the
+    re-registration). A relay-only or compat-mode node does not probe peers
+    directly.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's

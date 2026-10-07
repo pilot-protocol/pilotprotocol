@@ -439,6 +439,14 @@ type Daemon struct {
 	// signature) from "whole network unreachable" (restart just loops).
 	lastRegistryOKNano atomic.Int64
 
+	// reestablishMu serialises reestablishTransport: the resume handler,
+	// the rx watchdog and the address watcher can all want it at once, and
+	// one caller's forceReconnectRegistry closes the connection another is
+	// mid-request on. reestablishOKWall (wall-clock unix nanos, under the
+	// mutex) is when the last run the registry accepted finished.
+	reestablishMu     sync.Mutex
+	reestablishOKWall int64
+
 	// lastDialOKNano / consecutiveDialTimeouts feed the rx watchdog's
 	// PARTIAL-wedge detector. A daemon can be "up" with rx trickling —
 	// a couple of keepalive packets from existing peers keep PktsRecv
@@ -5887,11 +5895,67 @@ func (d *Daemon) publishHeartbeatEvent() {
 	})
 }
 
-// reRegister re-registers with the registry after a connection loss or registry restart.
-// Checks d.stopCh between regConn calls to avoid racing with Stop().
-func (d *Daemon) reRegister() {
+// reRegister re-registers with the registry after a connection loss or
+// registry restart, and restores everything the registry may have lost with
+// it: visibility, hostname and the trust pairs. Checks d.stopCh between
+// regConn calls to avoid racing with Stop(). Returns an error when the
+// registry did not accept the registration; the restore steps after it are
+// best-effort and only logged.
+func (d *Daemon) reRegister() error {
+	nodeID, _, err := d.registerEndpoint()
+	if err != nil {
+		return err
+	}
+	d.restoreRegistryState(nodeID, true)
+	return nil
+}
+
+// endpointOnlyRegistryFresh bounds when reRegisterEndpoint trusts the
+// registry to still hold this node: it must have answered us within this
+// long. The registry reaps a node after 30 minutes without a heartbeat, and
+// a reaped node comes back without its visibility or hostname.
+const endpointOnlyRegistryFresh = 5 * time.Minute
+
+// reRegisterEndpoint is the re-registration an address change needs. The
+// registry still holds this node, its visibility, hostname and trust pairs;
+// only the endpoint is out of date, so only the endpoint is sent. The full
+// reRegister would also write SetVisibility, SetHostname and one ReportTrust
+// per trusted peer (hundreds of signed writes for a node that trusts the
+// service fleet) for state the registry never lost.
+//
+// It falls back to the full restore when the registry may have dropped the
+// node after all: no answer from it for endpointOnlyRegistryFresh, a reply
+// under a different node ID, or a reply without the configured hostname
+// (the registry echoes a node's hostname on every registration).
+func (d *Daemon) reRegisterEndpoint() error {
+	if ok := d.lastRegistryOKNano.Load(); ok == 0 || time.Since(time.Unix(0, ok)) > endpointOnlyRegistryFresh {
+		return d.reRegister()
+	}
+	before := d.NodeID()
+	nodeID, resp, err := d.registerEndpoint()
+	if err != nil {
+		return err
+	}
+	if nodeID != before {
+		d.restoreRegistryState(nodeID, true)
+		return nil
+	}
+	if host, _ := resp["hostname"].(string); d.config.Hostname != "" && host != d.config.Hostname {
+		d.restoreRegistryState(nodeID, false)
+	}
+	return nil
+}
+
+// registerEndpoint sends this node's current endpoint and LAN addresses to
+// the registry and applies the reply. Returns the node ID the registry
+// answered with, and the reply.
+func (d *Daemon) registerEndpoint() (uint32, map[string]interface{}, error) {
 	if d.stopping() {
-		return
+		return 0, nil, errDaemonStopping
+	}
+	rc := d.reg()
+	if rc == nil {
+		return 0, nil, errors.New("re-registration: no registry connection")
 	}
 
 	var registrationAddr string
@@ -5917,7 +5981,7 @@ func (d *Daemon) reRegister() {
 	d.identityMu.RLock()
 	pubKeyB64 := crypto.EncodePublicKey(d.identity.PublicKey)
 	d.identityMu.RUnlock()
-	resp, err := d.reg().RegisterWithKeyOpts(registry.RegisterOpts{
+	resp, err := rc.RegisterWithKeyOpts(registry.RegisterOpts{
 		ListenAddr: registrationAddr,
 		PublicKey:  pubKeyB64,
 		Owner:      d.config.Owner,
@@ -5927,24 +5991,24 @@ func (d *Daemon) reRegister() {
 	})
 	if err != nil {
 		slog.Error("re-registration failed", "error", err)
-		return
+		return 0, nil, fmt.Errorf("re-registration: %w", err)
 	}
 
 	nodeIDVal, ok := resp["node_id"].(float64)
 	if !ok {
 		slog.Error("re-registration: missing node_id in response")
-		return
+		return 0, nil, errors.New("re-registration: missing node_id in response")
 	}
 	newNodeID := uint32(nodeIDVal)
 	addrStr, ok := resp["address"].(string)
 	if !ok {
 		slog.Error("re-registration: missing address in response")
-		return
+		return 0, nil, errors.New("re-registration: missing address in response")
 	}
 	newAddr, err := protocol.ParseAddr(addrStr)
 	if err != nil {
 		slog.Error("re-registration: invalid address", "address", addrStr, "error", err)
-		return
+		return 0, nil, fmt.Errorf("re-registration: invalid address %q: %w", addrStr, err)
 	}
 
 	d.addrMu.Lock()
@@ -5966,7 +6030,13 @@ func (d *Daemon) reRegister() {
 		"node_id":      nodeID,
 		"reregistered": true,
 	})
+	return nodeID, resp, nil
+}
 
+// restoreRegistryState re-applies what a registry that lost this node also
+// lost: visibility and hostname, and with trust set the local trust pairs
+// and the beacon registration. Best-effort; failures are logged.
+func (d *Daemon) restoreRegistryState(nodeID uint32, trust bool) {
 	if d.stopping() {
 		return
 	}
@@ -5983,7 +6053,7 @@ func (d *Daemon) reRegister() {
 		}
 	}
 
-	if d.stopping() {
+	if d.stopping() || !trust {
 		return
 	}
 

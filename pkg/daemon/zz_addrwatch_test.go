@@ -40,14 +40,26 @@ type fakeAddrSource struct {
 	ok bool
 }
 
-func (f *fakeAddrSource) fn() (string, bool) { return f.ip, f.ok }
+func (f *fakeAddrSource) fn(*net.UDPAddr) (string, bool) { return f.ip, f.ok }
+
+// addrWatchTestBeacon is the beacon newAddrWatchTestDaemon's tunnel uses.
+var addrWatchTestBeacon = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 9001}
 
 func newAddrWatchTestDaemon() *Daemon {
-	return &Daemon{
+	d := &Daemon{
 		tunnels:   NewTunnelManager(),
 		startTime: time.Now(),
 		stopCh:    make(chan struct{}),
 	}
+	d.tunnels.routing.SetBeaconAddrUDP(addrWatchTestBeacon)
+	return d
+}
+
+// observe hands d one discover reply from its current beacon, arriving at
+// now in answer to a discover sent just before.
+func observe(d *Daemon, ip net.IP, now time.Time) {
+	d.tunnels.lastDiscoverNano.Store(now.Add(-50 * time.Millisecond).UnixNano())
+	d.tunnels.noteDiscoverReply(&net.UDPAddr{IP: ip, Port: 40000}, d.tunnels.BeaconUDPAddr(), now)
 }
 
 func TestAddrWatchNoChangeNeverFires(t *testing.T) {
@@ -260,12 +272,12 @@ func TestAddrWatchCooldownResetsAfterQuiet(t *testing.T) {
 		st.noteLocal(ip, true)
 		st.began(now.Add(time.Duration(i)*time.Minute), addrReasonLocal)
 	}
-	if got := st.cooldown(); got != 4*addrRecoverCooldown {
+	if got := st.cooldown(addrReasonLocal); got != 4*addrRecoverCooldown {
 		t.Fatalf("cooldown after 3 recoveries = %v, want %v", got, 4*addrRecoverCooldown)
 	}
 	st.noteLocal("10.0.0.5", true)
 	st.began(now.Add(2*time.Minute+addrRecoverQuiet), addrReasonLocal)
-	if got := st.cooldown(); got != addrRecoverCooldown {
+	if got := st.cooldown(addrReasonLocal); got != addrRecoverCooldown {
 		t.Fatalf("cooldown after a quiet period = %v, want %v", got, addrRecoverCooldown)
 	}
 }
@@ -279,25 +291,127 @@ func TestAddrWatchObservedEndpointChangeFires(t *testing.T) {
 	src := &fakeAddrSource{ip: "192.168.1.20", ok: true}
 	st := &addrWatchState{}
 	now := time.Now()
+	tick := func(sec int) bool { return d.addrWatchTick(st, src.fn, now.Add(time.Duration(sec)*time.Second)) }
+	a, b := net.IPv4(203, 0, 113, 7), net.IPv4(198, 51, 100, 9)
 
-	d.tunnels.observedEndpoint.Store(&net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 40000})
-	d.addrWatchTick(st, src.fn, now) // baseline for both inputs
+	observe(d, a, now)
+	tick(0)
+	observe(d, a, now.Add(time.Second))
+	tick(1) // two agreeing replies: the baseline
 
 	// Same IP, different port: a NAT renumbering ports is not a move.
-	d.tunnels.observedEndpoint.Store(&net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 40001})
-	if d.addrWatchTick(st, src.fn, now.Add(time.Second)) {
+	d.tunnels.lastDiscoverNano.Store(now.Add(2 * time.Second).UnixNano())
+	d.tunnels.noteDiscoverReply(&net.UDPAddr{IP: a, Port: 40001}, addrWatchTestBeacon, now.Add(2*time.Second))
+	if tick(2) {
 		t.Fatal("fired on a port-only change of the observed endpoint")
 	}
 
-	d.tunnels.observedEndpoint.Store(&net.UDPAddr{IP: net.IPv4(198, 51, 100, 9), Port: 40001})
-	if !d.addrWatchTick(st, src.fn, now.Add(2*time.Second)) {
-		t.Fatal("did not fire when the beacon reported a new public IP")
+	observe(d, b, now.Add(3*time.Second))
+	observe(d, b, now.Add(3*time.Second+100*time.Millisecond))
+	if !tick(3) {
+		t.Fatal("did not fire when the beacon reported a new public IP twice")
 	}
-	for i := 3; i < 200; i++ {
-		d.addrWatchTick(st, src.fn, now.Add(time.Duration(i)*time.Second))
+	for i := 4; i < 200; i++ {
+		tick(i)
 	}
 	if len(*calls) != 1 || (*calls)[0].reason != addrReasonObserved || !(*calls)[0].announce {
 		t.Fatalf("calls = %+v, want one %q recovery", *calls, addrReasonObserved)
+	}
+	// The event reports the IPs the beacon saw, not the unchanged local one.
+	if c := (*calls)[0]; c.previous != a.String() || c.current != b.String() {
+		t.Fatalf("recovery moved %q -> %q, want %v -> %v", c.previous, c.current, a, b)
+	}
+}
+
+// One reply is not enough: a datagram from the beacon's address may be
+// forged, and some NATs show us at several public IPs. Only two replies in a
+// row that agree move the observed IP.
+func TestAddrWatchObservedNeedsTwoAgreeingReplies(t *testing.T) {
+	ok := true
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	src := &fakeAddrSource{ip: "192.168.1.20", ok: true}
+	st := &addrWatchState{}
+	now := time.Now()
+	sec := 0
+	step := func(ip net.IP) bool {
+		sec++
+		at := now.Add(time.Duration(sec) * time.Second)
+		observe(d, ip, at)
+		return d.addrWatchTick(st, src.fn, at)
+	}
+	a, b := net.IPv4(203, 0, 113, 7), net.IPv4(198, 51, 100, 9)
+	step(a)
+	step(a) // baseline
+
+	// A, B, A, B, A, ...: no two replies in a row agree on B.
+	for i := 0; i < 20; i++ {
+		ip := b
+		if i%2 == 1 {
+			ip = a
+		}
+		if step(ip) {
+			t.Fatalf("fired on reply %d of an alternating sequence", i)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("recoveries = %d, want 0", len(*calls))
+	}
+	step(b)
+	if !step(b) {
+		t.Fatal("two agreeing replies on a new IP did not fire")
+	}
+}
+
+// A lone reply naming a new IP is checked at once with one more discover,
+// not left until the next keepalive registration a minute later. That
+// discover is sent once per reply and at most once per addrObservedConfirmGap.
+func TestAddrWatchLoneReplyAsksForConfirmation(t *testing.T) {
+	t.Parallel()
+	r := newAddrAnnounceRig(t)
+	d := r.d
+	beacon := d.tunnels.BeaconUDPAddr()
+	src := &fakeAddrSource{ip: "192.168.1.20", ok: true}
+	st := &addrWatchState{}
+	now := time.Now()
+	reply := func(ip net.IP, at time.Time) {
+		d.tunnels.lastDiscoverNano.Store(at.Add(-50 * time.Millisecond).UnixNano())
+		d.tunnels.noteDiscoverReply(&net.UDPAddr{IP: ip, Port: 40000}, beacon, at)
+	}
+	confirmSent := func() bool {
+		msg := readOne(r.beacon, 300*time.Millisecond)
+		return len(msg) == 5 && msg[0] == protocol.BeaconMsgDiscover
+	}
+	a, b, c := net.IPv4(203, 0, 113, 7), net.IPv4(198, 51, 100, 9), net.IPv4(198, 51, 100, 10)
+
+	reply(a, now)
+	d.addrWatchTick(st, src.fn, now)
+	if !confirmSent() {
+		t.Fatal("first reply was not confirmed with a second discover")
+	}
+	reply(a, now.Add(100*time.Millisecond))
+	d.addrWatchTick(st, src.fn, now.Add(time.Second))
+	if confirmSent() {
+		t.Fatal("sent a confirming discover for an IP two replies already agree on")
+	}
+
+	reply(b, now.Add(60*time.Second))
+	d.addrWatchTick(st, src.fn, now.Add(61*time.Second))
+	if !confirmSent() {
+		t.Fatal("a reply naming a new IP was not confirmed")
+	}
+	d.addrWatchTick(st, src.fn, now.Add(62*time.Second))
+	if confirmSent() {
+		t.Fatal("asked twice about the same reply")
+	}
+	reply(c, now.Add(63*time.Second))
+	d.addrWatchTick(st, src.fn, now.Add(64*time.Second))
+	if confirmSent() {
+		t.Fatal("confirming discovers less than addrObservedConfirmGap apart")
+	}
+	d.addrWatchTick(st, src.fn, now.Add(61*time.Second+addrObservedConfirmGap))
+	if !confirmSent() {
+		t.Fatal("no confirming discover once the gap had passed")
 	}
 }
 
@@ -310,22 +424,158 @@ func TestAddrWatchLocalChangeDoesNotDoubleFireOnObserved(t *testing.T) {
 	src := &fakeAddrSource{ip: "10.78.0.3", ok: true}
 	st := &addrWatchState{}
 	now := time.Now()
-	d.tunnels.observedEndpoint.Store(&net.UDPAddr{IP: net.IPv4(10, 78, 0, 3), Port: 4000})
+	observe(d, net.IPv4(10, 78, 0, 3), now)
+	observe(d, net.IPv4(10, 78, 0, 3), now)
 	d.addrWatchTick(st, src.fn, now)
 
 	src.ip = "10.78.0.77"
 	d.addrWatchTick(st, src.fn, now.Add(time.Second))
 	if d.tunnels.ObservedEndpoint() != nil {
-		t.Fatal("the pre-move beacon reply was kept; it would be re-read as the new baseline")
+		t.Fatal("the pre-move beacon replies were kept; they would be re-read as the new baseline")
 	}
 	d.addrWatchTick(st, src.fn, now.Add(2*time.Second))
-	// The beacon's reply to the recovery's registration lands.
-	d.tunnels.observedEndpoint.Store(&net.UDPAddr{IP: net.IPv4(10, 78, 0, 77), Port: 4000})
+	// The beacon's replies to the recovery's registrations land.
+	observe(d, net.IPv4(10, 78, 0, 77), now.Add(2*time.Second))
+	observe(d, net.IPv4(10, 78, 0, 77), now.Add(2*time.Second))
 	for i := 3; i < 200; i++ {
 		d.addrWatchTick(st, src.fn, now.Add(time.Duration(i)*time.Second))
 	}
 	if len(*calls) != 1 {
 		t.Fatalf("recoveries = %d, want 1: %+v", len(*calls), *calls)
+	}
+}
+
+// A→B→A on the observed IP inside the cooldown is cancelled, as it is for
+// the local address: by the time the cooldown ends the beacon sees us where
+// the last recovery already said we are.
+func TestAddrWatchObservedFlapBackIsCancelled(t *testing.T) {
+	ok := true
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	src := &fakeAddrSource{ip: "192.168.1.20", ok: true}
+	st := &addrWatchState{}
+	now := time.Now()
+	at := func(sec int) time.Time { return now.Add(time.Duration(sec) * time.Second) }
+	twice := func(ip net.IP, sec int) {
+		observe(d, ip, at(sec))
+		observe(d, ip, at(sec).Add(100*time.Millisecond))
+	}
+	a, b := net.IPv4(203, 0, 113, 7), net.IPv4(198, 51, 100, 9)
+	twice(a, 0)
+	d.addrWatchTick(st, src.fn, at(0))
+	twice(b, 1)
+	if !d.addrWatchTick(st, src.fn, at(1)) { // announces B
+		t.Fatal("first change did not fire")
+	}
+	twice(a, 10) // back to A inside the cooldown...
+	d.addrWatchTick(st, src.fn, at(10))
+	twice(b, 20) // ...and to B again before it ends
+	for i := 20; i < 600; i++ {
+		d.addrWatchTick(st, src.fn, at(i))
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("recoveries = %d, want 1 (the excursion back to A was never announced): %+v", len(*calls), *calls)
+	}
+}
+
+// A NAT that keeps moving us between public IPs (an address pool, per-flow
+// balancing) must not cost a recovery every two minutes forever: the
+// observed IP's gap grows to addrObservedCooldownMax.
+func TestAddrWatchObservedFlappingBacksOffToTheLongCap(t *testing.T) {
+	ok := true
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	src := &fakeAddrSource{ip: "192.168.1.20", ok: true}
+	st := &addrWatchState{}
+	now := time.Now()
+	ips := []net.IP{net.IPv4(203, 0, 113, 7), net.IPv4(198, 51, 100, 9)}
+
+	var fired []time.Duration
+	const hours = 12
+	for sec := 0; sec <= hours*3600; sec++ {
+		at := now.Add(time.Duration(sec) * time.Second)
+		if sec%60 == 0 { // a keepalive registration; the IP flips every 2 minutes
+			ip := ips[(sec/120)%2]
+			observe(d, ip, at)
+			observe(d, ip, at.Add(100*time.Millisecond))
+		}
+		if d.addrWatchTick(st, src.fn, at) {
+			fired = append(fired, time.Duration(sec)*time.Second)
+		}
+	}
+	if len(*calls) != len(fired) {
+		t.Fatalf("recoveries = %d, fired ticks = %d", len(*calls), len(fired))
+	}
+	// 1m, 2m, 4m, ... 32m, then the 1h cap: about 7 in the first two hours
+	// and one an hour after that. The local-address schedule (2 minute cap)
+	// would have run over 300.
+	if max := 8 + hours; len(fired) > max {
+		t.Fatalf("%d recoveries in %dh of a flapping observed IP, want at most %d: %v", len(fired), hours, max, fired)
+	}
+	for i := 1; i < len(fired); i++ {
+		if gap := fired[i] - fired[i-1]; gap < addrObservedCooldown {
+			t.Fatalf("recoveries %v apart, under the observed-IP minimum %v: %v", gap, addrObservedCooldown, fired)
+		}
+	}
+	var late []time.Duration
+	for i := 1; i < len(fired); i++ {
+		if fired[i] > 4*time.Hour {
+			late = append(late, fired[i]-fired[i-1])
+		}
+	}
+	for _, gap := range late {
+		if gap < addrObservedCooldownMax {
+			t.Fatalf("gap %v after four hours of flapping, want the %v cap: %v", gap, addrObservedCooldownMax, fired)
+		}
+	}
+}
+
+// A beacon switch is not a move. The new beacon can be reached over another
+// route (a private bootstrap beacon beside public ones) and see us at another
+// public IP (NAT that picks the address per destination, dual WAN); both
+// baselines start over, and the old beacon's stored replies are never
+// compared with the new one's.
+func TestAddrWatchBeaconSwitchIsNotAMove(t *testing.T) {
+	ok := true
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	private := &net.UDPAddr{IP: net.IPv4(10, 128, 0, 5), Port: 9001}
+	src := func(b *net.UDPAddr) (string, bool) {
+		if b.String() == private.String() {
+			return "10.128.0.20", true
+		}
+		return "192.168.1.20", true
+	}
+	st := &addrWatchState{}
+	now := time.Now()
+	at := func(sec int) time.Time { return now.Add(time.Duration(sec) * time.Second) }
+
+	observe(d, net.IPv4(203, 0, 113, 7), at(0))
+	observe(d, net.IPv4(203, 0, 113, 7), at(0))
+	for i := 0; i < 5; i++ {
+		d.addrWatchTick(st, src, at(i))
+	}
+
+	// beaconRefreshTick moves us to the private beacon. Its stored replies
+	// are still the public beacon's for a while.
+	d.tunnels.routing.SetBeaconAddrUDP(private)
+	for i := 5; i < 10; i++ {
+		d.addrWatchTick(st, src, at(i))
+	}
+	observe(d, net.IPv4(10, 128, 0, 20), at(10))
+	observe(d, net.IPv4(10, 128, 0, 20), at(10))
+	for i := 10; i < 600; i++ {
+		d.addrWatchTick(st, src, at(i))
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("a beacon switch ran %d recoveries, want 0: %+v", len(*calls), *calls)
+	}
+
+	// Moves seen through the new beacon are still caught.
+	observe(d, net.IPv4(10, 128, 0, 21), at(600))
+	observe(d, net.IPv4(10, 128, 0, 21), at(600))
+	if !d.addrWatchTick(st, src, at(600)) {
+		t.Fatal("an observed change through the new beacon did not fire")
 	}
 }
 
@@ -413,6 +663,7 @@ func TestObservedEndpointOnlyFromBeacon(t *testing.T) {
 		t.Fatalf("SetBeaconAddr: %v", err)
 	}
 	reply := []byte{protocol.BeaconMsgDiscoverReply, 4, 203, 0, 113, 7, 0x9c, 0x40}
+	tm.RegisterWithBeacon() // opens the reply window; no socket, so nothing is sent
 
 	tm.handleBeaconMessage(reply, &net.UDPAddr{IP: net.IPv4(198, 51, 100, 66), Port: 9001})
 	if got := tm.ObservedEndpoint(); got != nil {
@@ -421,6 +672,36 @@ func TestObservedEndpointOnlyFromBeacon(t *testing.T) {
 	tm.handleBeaconMessage(reply, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 9001})
 	if got := tm.ObservedEndpoint(); got == nil || got.String() != "203.0.113.7:40000" {
 		t.Fatalf("observed endpoint = %v, want 203.0.113.7:40000", got)
+	}
+}
+
+// A reply from the beacon's address counts only as the answer to a discover
+// this node sent less than discoverReplyWindow earlier. The beacon never
+// replies unasked, and the source address of a UDP datagram is easy to forge.
+func TestDiscoverReplyMustAnswerADiscover(t *testing.T) {
+	t.Parallel()
+	tm := NewTunnelManager()
+	beacon := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 9001}
+	tm.routing.SetBeaconAddrUDP(beacon)
+	ep := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 40000}
+	now := time.Now()
+
+	if tm.noteDiscoverReply(ep, beacon, now) {
+		t.Fatal("kept a reply although no discover was ever sent")
+	}
+	tm.lastDiscoverNano.Store(now.UnixNano())
+	if tm.noteDiscoverReply(ep, beacon, now.Add(discoverReplyWindow+time.Millisecond)) {
+		t.Fatal("kept a reply that arrived after the window")
+	}
+	if tm.noteDiscoverReply(ep, beacon, now.Add(-time.Millisecond)) {
+		t.Fatal("kept a reply that arrived before the discover was sent")
+	}
+	if !tm.noteDiscoverReply(ep, beacon, now.Add(300*time.Millisecond)) {
+		t.Fatal("dropped the answer to a discover")
+	}
+	latest, prev := tm.beaconObservations()
+	if latest.endpoint != ep || latest.beacon != beacon.String() || prev.endpoint != nil {
+		t.Fatalf("stored latest=%+v prev=%+v", latest, prev)
 	}
 }
 
@@ -583,5 +864,41 @@ func TestRecoverFromAddrChangePublishesEventAndNotifies(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no tunnel.addr_changed event")
+	}
+}
+
+// The beacon takes at most one endpoint update per node every 30 s and drops
+// the rest. A move within 30 s of a keepalive registration has the
+// recovery's own registrations dropped, so the recovery registers once more
+// after addrBeaconReregisterDelay.
+func TestRecoverFromAddrChangeRepeatsBeaconRegistrationAfterTheBeaconLimit(t *testing.T) {
+	// Not parallel: swaps package-level delays.
+	prevRetries, prevDelay := addrAnnounceRetryDelays, addrBeaconReregisterDelay
+	addrAnnounceRetryDelays = []time.Duration{10 * time.Millisecond}
+	addrBeaconReregisterDelay = 600 * time.Millisecond
+	t.Cleanup(func() { addrAnnounceRetryDelays, addrBeaconReregisterDelay = prevRetries, prevDelay })
+
+	r := newAddrAnnounceRig(t)
+	defer func() {
+		close(r.d.stopCh)
+		r.d.bgWG.Wait()
+	}()
+	start := time.Now()
+	r.d.recoverFromAddrChange(addrReasonLocal, "10.0.0.4", "10.0.0.77", true)
+
+	// The recovery's own registrations are already queued at the beacon.
+	immediate := 0
+	for readOne(r.beacon, 150*time.Millisecond) != nil {
+		immediate++
+	}
+	if immediate == 0 {
+		t.Fatal("the recovery did not register with the beacon")
+	}
+	msg := readOne(r.beacon, 3*time.Second)
+	if len(msg) != 5 || msg[0] != protocol.BeaconMsgDiscover {
+		t.Fatalf("no beacon registration after the recovery's own (got % x)", msg)
+	}
+	if since := time.Since(start); since < addrBeaconReregisterDelay {
+		t.Fatalf("repeat registration %v after the start, want it after %v (the beacon would drop it)", since, addrBeaconReregisterDelay)
 	}
 }

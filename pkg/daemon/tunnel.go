@@ -101,9 +101,14 @@ type TunnelManager struct {
 	readWg    sync.WaitGroup // tracks readLoop goroutine for clean shutdown
 	closeOnce sync.Once
 
-	// observedEndpoint is where the beacon last saw this socket (see
-	// handleBeaconMessage / ObservedEndpoint).
-	observedEndpoint atomic.Pointer[net.UDPAddr]
+	// Where the beacon sees this socket, from its discover replies (see
+	// noteDiscoverReply; read by the address watcher). lastDiscoverNano is
+	// when RegisterWithBeacon last sent a discover; obsLatest and obsPrev
+	// are the two latest replies that answered one, under obsMu.
+	lastDiscoverNano atomic.Int64
+	obsMu            sync.Mutex
+	obsLatest        beaconObservation
+	obsPrev          beaconObservation
 
 	// Encryption config
 	encrypt bool             // if true, attempt encrypted tunnels
@@ -822,6 +827,11 @@ func (tm *TunnelManager) RelayPeerIDs() []uint32 {
 // using the real nodeID, so the beacon knows our endpoint for punch coordination.
 // Thin shim over routing.Manager.RegisterWithBeacon.
 func (tm *TunnelManager) RegisterWithBeacon() {
+	// Stamped before the send: on loopback the reply can be read before
+	// Send returns, and it must find the window open.
+	if tm.routing.BeaconAddr() != nil {
+		tm.lastDiscoverNano.Store(time.Now().UnixNano())
+	}
 	if err := tm.routing.RegisterWithBeacon(); err != nil {
 		slog.Warn("beacon registration failed", "error", err)
 		return
@@ -1146,17 +1156,59 @@ func (tm *TunnelManager) SendDirectPathProbe(peerNodeID uint32) error {
 	return tm.SendDirectProbe(peerNodeID, tm.newPathProbePacket(peerNodeID))
 }
 
-// ObservedEndpoint returns the endpoint the beacon last reported seeing us
-// at (the reply to RegisterWithBeacon on the tunnel socket), or nil if no
-// reply has arrived yet.
-func (tm *TunnelManager) ObservedEndpoint() *net.UDPAddr {
-	return tm.observedEndpoint.Load()
+// discoverReplyWindow is how soon after this node's latest discover a
+// discover reply must arrive to be taken as the beacon's answer to it.
+const discoverReplyWindow = 2 * time.Second
+
+// beaconObservation is one discover reply: where the beacon saw this socket.
+type beaconObservation struct {
+	endpoint *net.UDPAddr
+	beacon   string    // the beacon that replied, so replies from two beacons are never compared
+	at       time.Time // when it arrived
 }
 
-// ForgetObservedEndpoint drops the stored beacon reply, so the next
-// ObservedEndpoint is one that arrived afterwards.
-func (tm *TunnelManager) ForgetObservedEndpoint() {
-	tm.observedEndpoint.Store(nil)
+// noteDiscoverReply records a discover reply that came from the beacon's
+// address, if it arrived within discoverReplyWindow of a discover this node
+// sent. The beacon replies to every discover and sends none unasked, so a
+// reply outside that window is a stray or a forgery: the source address is
+// all that marks it as the beacon's, and UDP does not authenticate it.
+// Reports whether the reply was kept.
+func (tm *TunnelManager) noteDiscoverReply(ep, beacon *net.UDPAddr, now time.Time) bool {
+	sent := tm.lastDiscoverNano.Load()
+	if ep == nil || beacon == nil || sent == 0 {
+		return false
+	}
+	if age := now.Sub(time.Unix(0, sent)); age < 0 || age > discoverReplyWindow {
+		slog.Debug("ignoring unsolicited beacon discover reply", "observed", ep, "since_discover", age)
+		return false
+	}
+	tm.obsMu.Lock()
+	tm.obsPrev, tm.obsLatest = tm.obsLatest, beaconObservation{endpoint: ep, beacon: beacon.String(), at: now}
+	tm.obsMu.Unlock()
+	return true
+}
+
+// beaconObservations returns the latest two kept discover replies, newest
+// first; a zero value stands for one that has not arrived.
+func (tm *TunnelManager) beaconObservations() (latest, prev beaconObservation) {
+	tm.obsMu.Lock()
+	defer tm.obsMu.Unlock()
+	return tm.obsLatest, tm.obsPrev
+}
+
+// ObservedEndpoint returns the endpoint the latest kept discover reply
+// reported seeing us at, or nil if none has arrived yet.
+func (tm *TunnelManager) ObservedEndpoint() *net.UDPAddr {
+	latest, _ := tm.beaconObservations()
+	return latest.endpoint
+}
+
+// forgetObservedEndpoints drops the stored discover replies, so the next
+// ones read arrived afterwards.
+func (tm *TunnelManager) forgetObservedEndpoints() {
+	tm.obsMu.Lock()
+	tm.obsLatest, tm.obsPrev = beaconObservation{}, beaconObservation{}
+	tm.obsMu.Unlock()
 }
 
 // BeaconUDPAddr returns the beacon endpoint the tunnel currently uses, or
@@ -2368,11 +2420,12 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 		slog.Debug("beacon discover reply on tunnel socket", "from", from)
 		// Remember where the beacon sees us. A node behind NAT cannot see
 		// its public address change locally; this reply is the only place
-		// it shows up (addrwatch.go compares successive values). Only the
-		// beacon's own reply counts, so a third party cannot feed us one.
+		// it shows up (addrwatch.go compares successive values). Only a
+		// reply from the beacon's address to a discover we just sent
+		// counts, so a third party cannot feed us one at will.
 		if fromBeacon {
 			if ep := parseDiscoverReply(data[1:]); ep != nil {
-				tm.observedEndpoint.Store(ep)
+				tm.noteDiscoverReply(ep, tm.routing.BeaconAddr(), time.Now())
 			}
 		}
 	case protocol.BeaconMsgPunchCommand:

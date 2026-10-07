@@ -239,7 +239,7 @@ func (d *Daemon) rxWatchdogResume(st *rxWatchdogState, now time.Time, gap time.D
 	// The pooled registry conn cannot have survived the suspend, and it
 	// has no half-open detection of its own, so force a fresh one rather
 	// than waiting for a request to hang on the dead socket.
-	d.reestablishTransport("resume", true)
+	d.reestablishTransport("resume", reestablishOpts{freshConn: true})
 
 	// Fresh epoch: re-baseline so the first post-resume tick measures
 	// recovery, not the suspend.
@@ -251,31 +251,72 @@ func (d *Daemon) rxWatchdogResume(st *rxWatchdogState, now time.Time, gap time.D
 	d.consecutiveDialTimeouts.Store(0)
 }
 
+// reestablishCoalesce is how recent a run of reestablishTransport the
+// registry accepted must be for a caller that may coalesce to skip its own.
+const reestablishCoalesce = 5 * time.Second
+
+// reestablishOpts says what a reestablishTransport caller needs.
+type reestablishOpts struct {
+	// freshConn replaces the pooled registry connection first, for callers
+	// that know the old one cannot have survived (a suspend, or a change of
+	// our own address: the TCP connection is bound to the address we no
+	// longer have).
+	freshConn bool
+	// endpointOnly re-registers the endpoint only (reRegisterEndpoint)
+	// instead of the full reRegister with its visibility, hostname and
+	// trust re-sync.
+	endpointOnly bool
+	// always runs even right after another run. Without it the call is
+	// skipped when a run the registry accepted finished less than
+	// reestablishCoalesce ago, since that run did the same work. The address
+	// watcher sets it: a run that started before our address changed
+	// registered the old one.
+	always bool
+}
+
 // reestablishTransport re-registers this node with the beacon and the
 // registry. It is the one recovery routine shared by the rx watchdog's soft
 // recovery, the host-resume handler and the address watcher (addrwatch.go).
 //
 // RegisterWithBeacon re-punches our NAT mapping and gives the beacon our
-// current endpoint for relay delivery and hole-punching; reRegister gives the
-// registry our current endpoint. freshRegistryConn first replaces the pooled
-// registry connection, for callers that know the old one cannot have survived
-// (a suspend, or a change of our own address: the TCP connection is bound to
-// the address we no longer have). Reports whether the registry accepted the
+// current endpoint for relay delivery and hole-punching; the re-registration
+// gives the registry our current endpoint. Runs one at a time: a second
+// caller waits for the first instead of replacing the registry connection
+// under its requests. Reports whether the registry accepted the
 // re-registration; false when no registry is configured.
-func (d *Daemon) reestablishTransport(cause string, freshRegistryConn bool) bool {
+func (d *Daemon) reestablishTransport(cause string, o reestablishOpts) bool {
+	d.reestablishMu.Lock()
+	defer d.reestablishMu.Unlock()
+
+	// Wall clock, not the monotonic one: on Linux the monotonic clock stops
+	// while the host is suspended, so a run from just before a suspend would
+	// look recent to the resume handler.
+	if age := time.Now().UnixNano() - d.reestablishOKWall; !o.always && d.reestablishOKWall != 0 &&
+		age >= 0 && age < int64(reestablishCoalesce) {
+		slog.Info("transport re-established moments ago — not repeating it", "cause", cause,
+			"age", time.Duration(age).Truncate(time.Millisecond).String())
+		return true
+	}
+
 	d.tunnels.RegisterWithBeacon()
 	if d.reg() == nil {
 		return false
 	}
-	if freshRegistryConn {
+	if o.freshConn {
 		if err := d.forceReconnectRegistry(); err != nil {
 			slog.Warn("registry reconnect failed", "cause", cause, "error", err)
 			return false
 		}
 	}
-	before := d.lastRegistryOKNano.Load()
-	d.reRegister()
-	return d.lastRegistryOKNano.Load() != before
+	register := d.reRegister
+	if o.endpointOnly {
+		register = d.reRegisterEndpoint
+	}
+	if err := register(); err != nil {
+		return false // registerEndpoint logs what the registry answered
+	}
+	d.reestablishOKWall = time.Now().UnixNano()
+	return true
 }
 
 // rxWatchdogTick runs one watchdog iteration. Extracted for testability —
@@ -369,7 +410,7 @@ func (d *Daemon) rxWatchdogTick(st *rxWatchdogState, now time.Time) (action rxWa
 		// discover reply also doubles as an active inbound probe) and the
 		// registry. This is what a manual restart effectively did to clear
 		// the partial wedge.
-		d.reestablishTransport("rx-silence", false)
+		d.reestablishTransport("rx-silence", reestablishOpts{})
 		// Reset the dial counter so the next real dial re-tests the path:
 		// if recovery worked the next dial succeeds (counter stays 0); if
 		// not, failures re-accumulate to threshold and softAttempts climbs
