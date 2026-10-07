@@ -48,7 +48,9 @@ import (
 // instance's supervise-start and spawn carry the sha256 of the binary it
 // runs, which is the installed manifest's. So nothing counts before one of
 // those; an exit counts only when it ends a start attempt of the new
-// instance; and a suspend only when it follows one of its exits.
+// instance; and a suspend only when it follows one of its exits. When the
+// binary is identical across versions the old instance's restarts carry the
+// same sha, so the counts start again at the new instance's supervise-start.
 
 // appStartWait is how long install waits for the app's first start unless
 // --wait says otherwise. appStartPoll is how often it looks. Vars so tests
@@ -157,8 +159,12 @@ func readAppStart(tg appStartTarget) appStartStatus {
 			if !thisBinary {
 				continue
 			}
+			// The new instance starts here: anything counted so far was
+			// the old instance's (a manifest-only bump runs an identical
+			// binary, so its restarts log this sha too).
 			ours, attempt, ended, noProcess = true, false, false, false
 			st.Refusal = ""
+			st.Spawns, st.Exits, st.ExitCode, st.StartError, st.Suspended = 0, 0, 0, "", false
 		case "spawn":
 			if !thisBinary {
 				continue // the old instance, restarting before the rescan replaced it

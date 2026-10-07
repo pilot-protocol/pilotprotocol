@@ -89,6 +89,13 @@ func TestReadAppStart(t *testing.T) {
 				t.Errorf("pilotctl's install line counted as a supervisor event: %+v", st)
 			}
 		}},
+		{name: "identical binary: the old instance's crashes before the new supervise-start do not count", setup: func(t *testing.T, dir string) {
+			supLog(t, dir, after, spawn, exit1, spawn, exit1, start, spawn)
+		}, want: appStartStarting, check: func(t *testing.T, st appStartStatus) {
+			if st.Exits != 0 || st.Spawns != 1 {
+				t.Errorf("counts carried over from the old instance: spawns %d, exits %d", st.Spawns, st.Exits)
+			}
+		}},
 		{name: "spawned, socket not there yet", setup: func(t *testing.T, dir string) {
 			supLog(t, dir, after, start, spawn)
 		}, want: appStartStarting},
