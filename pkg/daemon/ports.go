@@ -317,6 +317,11 @@ type Connection struct {
 	// Nagle algorithm (write coalescing)
 	NagleBuf []byte     // pending small write data
 	NagleMu  sync.Mutex // protects NagleBuf and tailFlusher
+	// WriteMu is held by SendData for the whole of one write, so two
+	// writers on a connection cannot interleave: a write larger than
+	// nagleWritePiece goes through the buffer piece by piece, and without it
+	// another writer's bytes could land between pieces. Taken before SendMu.
+	WriteMu sync.Mutex
 	// SendMu is held from taking bytes out of NagleBuf until they are handed
 	// to sendSegment, so segments leave in the order the bytes were written
 	// whichever goroutine sends them. Taken before NagleMu.

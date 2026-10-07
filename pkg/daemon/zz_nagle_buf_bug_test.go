@@ -10,34 +10,14 @@ import (
 	"github.com/pilot-protocol/common/protocol"
 )
 
-// TestSendDataNagleBufGrowsUnbounded reproduces the NagleBuf-OOM bug.
-//
-// Symptom (theoretical, observed-once-and-cleared in pilot service-agent
-// memory profiling): an application that calls SendData faster than the
-// network can drain (slow peer, packet loss, full cwnd) accumulates the
-// unsent bytes in conn.NagleBuf without bound. There is currently NO
-// per-connection send-buffer cap. With many connections in this state,
-// daemon RSS climbs linearly with offered-but-undeliverable load until
-// the host OOM-kills the process.
-//
-// Reproducer: a real UDP peer is reachable but never ACKs anything, so
-// the daemon's cwnd fills after IW10 (10 × 4 KB = 40 KB). The 11th
-// MSS-sized chunk's sendSegment call blocks waiting for cwnd to open
-// (which it never will). The single goroutine calling SendData is
-// stuck in nagleFlush; meanwhile, the data slice the application
-// passed (5 MiB here) sits in conn.NagleBuf, well over any reasonable
-// memory budget. Multiple writers would amplify this further.
-//
-// What v1.9.1's NagleBuf cap fix will change:
-//   - introduce MaxNagleBuf = 64 * MaxSegmentSize (256 KB)
-//   - SendData returns ErrSendBufFull when len(NagleBuf) + len(data) > MaxNagleBuf
-//   - test assertion flips: NagleBuf plateaus at MaxNagleBuf;
-//     SendData returns ErrSendBufFull on the oversized write.
-//
-// This test pins CURRENT (buggy) behavior so the cap patch has a
-// concrete regression target. After the fix, the bug-asserting block
-// below is replaced with the post-fix block (already drafted in
-// comments).
+// TestSendDataNagleBufGrowsUnbounded guards the fix for a NagleBuf OOM: an
+// application calling SendData faster than the network drains (slow peer,
+// loss, a full congestion window) used to pile the unsent bytes up in
+// conn.NagleBuf without bound, and with many such connections the daemon's
+// memory grew until the host killed it. NagleBuf is now capped at
+// MaxNagleBuf. This test checks the cap at its boundary: a small write that
+// would take the buffer past it is refused with ErrSendBufFull and the
+// buffer does not grow. (The name is kept from when it pinned the bug.)
 func TestSendDataNagleBufGrowsUnbounded(t *testing.T) {
 	t.Parallel()
 	d := New(Config{})
@@ -142,8 +122,10 @@ func TestSendDataOversizedWriteStaysWithinNagleCap(t *testing.T) {
 		}
 		conn.NagleMu.Unlock()
 	}
-	if maxBuf > MaxNagleBuf {
-		t.Errorf("NagleBuf reached %d bytes during an oversized write; cap is %d", maxBuf, MaxNagleBuf)
+	// One piece of the write plus, at most, a short remainder held from
+	// before it: the write goes through the buffer piece by piece.
+	if limit := nagleWritePiece + SendSegmentSize; maxBuf > limit {
+		t.Errorf("NagleBuf reached %d bytes during an oversized write, want at most one piece and a tail (%d)", maxBuf, limit)
 	}
 	select {
 	case err := <-done:

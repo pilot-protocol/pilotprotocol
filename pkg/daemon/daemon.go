@@ -4278,12 +4278,13 @@ const QuickACKBudget = 32
 // segments unless NoDelay is set. Large writes (>= MSS) are sent immediately.
 // ErrSendBufFull is returned by SendData when the per-connection
 // NagleBuf would exceed MaxNagleBuf if the caller's write were
-// appended. Callers must back off and retry — typically by waiting
-// for a webhook or polling the connection's send-buffer state.
+// appended. It bounds the daemon's memory per connection.
 //
-// This error replaces the silent unbounded-growth behavior that
-// could OOM the daemon when an application wrote faster than the
-// network drained. Pinned by TestSendDataNagleBufGrowsUnbounded.
+// SendData returns it only before any byte of the write has been buffered,
+// so retrying the whole write is safe. With one write at a time per
+// connection (WriteMu) and large writes fed through in pieces that drain
+// before the next is taken, the buffer holds at most a held tail and one
+// piece, so in practice it is not returned at all.
 var ErrSendBufFull = errors.New("send buffer full")
 
 func (d *Daemon) SendData(conn *Connection, data []byte) error {
@@ -4294,10 +4295,20 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 		return fmt.Errorf("connection not established")
 	}
 
+	// One write at a time per connection: the pieces of a large write
+	// below must not interleave with another writer's bytes.
+	conn.WriteMu.Lock()
+	defer conn.WriteMu.Unlock()
+
 	// If Nagle is disabled (NoDelay), send everything immediately in segments
 	if conn.NoDelay {
 		return d.sendDataImmediate(conn, data)
 	}
+
+	// A write of a segment or more takes its tail with it: it is the end of
+	// a message, not one of a run of small writes that would coalesce.
+	// Decided once, from the whole write, not from each piece.
+	tailNow := len(data) >= SendSegmentSize
 
 	// A write larger than the send buffer can never fit in it, so it used
 	// to be refused outright with ErrSendBufFull — and since an IPC send has
@@ -4305,24 +4316,27 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 	// was dropped while the sender reported success. Feed a large write
 	// through the buffer in whole-segment pieces instead. Each piece is
 	// flushed before the next is taken (sendSegment blocks on the window),
-	// so the buffer never holds more than one piece of this write.
+	// and WriteMu keeps other writers out, so the buffer never holds more
+	// than a held tail and one piece of this write.
 	for len(data) > nagleWritePiece {
-		if err := d.sendDataPiece(conn, data[:nagleWritePiece]); err != nil {
+		if err := d.sendDataPiece(conn, data[:nagleWritePiece], tailNow); err != nil {
 			return err
 		}
 		data = data[nagleWritePiece:]
 	}
-	return d.sendDataPiece(conn, data)
+	return d.sendDataPiece(conn, data, tailNow)
 }
 
 // nagleWritePiece is how much of one large write SendData buffers at a time:
-// a whole number of segments, so a piece leaves no tail behind for Nagle to
-// hold, and well under MaxNagleBuf.
-const nagleWritePiece = 16 * MaxSegmentSize
+// a whole number of SendSegmentSize segments, so only the last piece of a
+// write can end in a short segment, and well under MaxNagleBuf.
+const nagleWritePiece = 56 * SendSegmentSize
 
 // sendDataPiece buffers one write of at most nagleWritePiece bytes (or any
-// smaller caller write) and flushes it under Nagle's algorithm.
-func (d *Daemon) sendDataPiece(conn *Connection, data []byte) error {
+// smaller caller write) and flushes it under Nagle's algorithm. tailNow sends
+// a short remainder at once instead of letting Nagle hold it. Caller holds
+// conn.WriteMu.
+func (d *Daemon) sendDataPiece(conn *Connection, data []byte, tailNow bool) error {
 	conn.NagleMu.Lock()
 	// v1.9.1: cap NagleBuf at MaxNagleBuf. Without this, slow peers /
 	// full cwnd / packet loss caused the buffer to grow without bound,
@@ -4336,9 +4350,7 @@ func (d *Daemon) sendDataPiece(conn *Connection, data []byte) error {
 	conn.NagleBuf = append(conn.NagleBuf, data...)
 	conn.NagleMu.Unlock()
 
-	// A write of a segment or more takes its tail with it: it is the end of
-	// a message, not one of a run of small writes that would coalesce.
-	_, err := d.flushNagle(conn, len(data) >= SendSegmentSize, false)
+	_, err := d.flushNagle(conn, tailNow, false)
 	return err
 }
 

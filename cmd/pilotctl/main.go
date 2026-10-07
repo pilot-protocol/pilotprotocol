@@ -1632,7 +1632,7 @@ Communication commands:
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
   pilotctl send-file <address|hostname> <filepath>
-  pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
+  pilotctl send-message <address|hostname> --data <text> | --data-file <path> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
   pilotctl publish <address|hostname> <topic> --data <message>
@@ -4775,9 +4775,60 @@ func messagePayload(flags map[string]string, stdin io.Reader) (string, error) {
 		data = string(b)
 	}
 	if data == "" {
+		if hasFile {
+			return "", fmt.Errorf("--data-file %s is empty", file)
+		}
 		return "", fmt.Errorf("--data is required")
 	}
+	// One message is one data-exchange frame. A receiver drops a frame over
+	// its limit at the header, which the sender would only see as a missing
+	// acknowledgement, and past 4 GiB the length prefix would wrap.
+	if limit := maxMessageBytes(); len(data) > limit {
+		return "", fmt.Errorf("message is %d bytes; one message can carry at most %d (use send-file for larger payloads)", len(data), limit)
+	}
 	return data, nil
+}
+
+// maxMessageBytes is the most one send-message payload can be: the frame
+// limit, less room for the frame and message-tag headers.
+func maxMessageBytes() int {
+	return int(dataexchange.MaxFrameSize) - 4096
+}
+
+// failIfUndelivered ends a multi-message send with an error when any message
+// failed to send, was not acknowledged, or was refused by the receiver:
+// reporting "ok" for those hid messages that never arrived.
+func failIfUndelivered(target string, results []map[string]interface{}) {
+	if failed, first := undelivered(results); failed > 0 {
+		fatalHint("connection_failed", first, "%d of %d messages to %s were not delivered", failed, len(results), target)
+	}
+}
+
+// undelivered counts the send results that did not end in a stored message,
+// and describes the first of them.
+func undelivered(results []map[string]interface{}) (failed int, first string) {
+	for _, r := range results {
+		why := ""
+		ackText, acked := r["ack"].(string)
+		switch {
+		case r["error"] != nil:
+			why = fmt.Sprint(r["error"])
+		case !acked:
+			why = "not acknowledged"
+			if e, ok := r["ack_error"].(string); ok {
+				why += " (" + e + ")"
+			}
+		case strings.HasPrefix(ackText, "ERR "):
+			why = "receiver rejected it: " + ackText
+		}
+		if why != "" {
+			failed++
+			if first == "" {
+				first = fmt.Sprintf("message %v: %s", r["seq"], why)
+			}
+		}
+	}
+	return failed, first
 }
 
 func cmdSendMessage(args []string) {
@@ -4804,7 +4855,7 @@ func cmdSendMessage(args []string) {
 		defer timer.Stop()
 	}
 	if len(pos) != 1 {
-		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend]")
+		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> | --data - | --data-file <path> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend]")
 	}
 
 	sendCount := flagInt(flags, "count", 1)
@@ -4848,6 +4899,13 @@ func cmdSendMessage(args []string) {
 		}
 	}
 
+	// Read and check the payload first, so a missing file or an oversized
+	// message is reported before the daemon or the network is touched.
+	data, err := messagePayload(flags, os.Stdin)
+	if err != nil {
+		fatalCode("invalid_argument", "%v", err)
+	}
+
 	d := connectDriver()
 	tracef("connectDriver")
 	// d may be replaced by a fresh connection when a dial is retried.
@@ -4859,10 +4917,6 @@ func cmdSendMessage(args []string) {
 		fatalCode("not_found", "%v", err)
 	}
 
-	data, err := messagePayload(flags, os.Stdin)
-	if err != nil {
-		fatalCode("invalid_argument", "%v", err)
-	}
 	msgType := flagString(flags, "type", "text")
 
 	// First contact: the daemon holds no session with the peer yet, so this
@@ -4939,6 +4993,9 @@ func cmdSendMessage(args []string) {
 		if ack != nil {
 			r["ack"] = string(ack.Payload)
 		}
+		if ackErr != nil {
+			r["ack_error"] = ackErr.Error()
+		}
 		if traceTime {
 			r["total_ms"] = float64(time.Duration(ackRecvAtNs-sentAtNs).Microseconds()) / 1000.0
 			if ack != nil && ack.Type == dataexchange.TypeJSON {
@@ -5013,13 +5070,22 @@ func cmdSendMessage(args []string) {
 		// Every receiver answers a stored message with an ACK frame. No ACK
 		// means the message was not stored, or was never sent — the daemon
 		// drops a write it cannot buffer without telling the client — so
-		// "ok" here was reporting messages that never arrived.
-		if _, failed := r["error"]; !failed {
-			if _, acked := r["ack"]; !acked {
-				fatalHint("connection_failed",
-					"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
-					"%s did not acknowledge the message (%d bytes)", target, len(data))
+		// "ok" here was reporting messages that never arrived. A send that
+		// failed outright was reported as "ok" with an error field; it is a
+		// failure too.
+		if e, failed := r["error"].(string); failed {
+			fatalHint("connection_failed",
+				"the message was not sent; check `pilotctl peers` and the daemon log, then send again",
+				"sending to %s failed: %s", target, e)
+		}
+		if _, acked := r["ack"]; !acked {
+			why := ""
+			if e, ok := r["ack_error"].(string); ok {
+				why = ": " + e
 			}
+			fatalHint("connection_failed",
+				"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
+				"%s did not acknowledge the message (%d bytes)%s", target, len(data), why)
 		}
 		// The receiver answers "ERR ..." when it could not store the
 		// message (disk full, inbox unwritable). That is a failed send, not
@@ -5059,8 +5125,7 @@ func cmdSendMessage(args []string) {
 			// more on a new stream if nothing arrived by mid-window.
 			// --no-resend opts out for requests that are not safe to
 			// repeat.
-			_, sendFailed := r["error"]
-			if firstContact && !sendFailed && !flagBool(flags, "no-resend") {
+			if firstContact && !flagBool(flags, "no-resend") {
 				if after := resendDelay(waitDur); after > 0 {
 					cfg.resendAfter = after
 					cfg.resend = func() (time.Time, error) {
@@ -5131,6 +5196,7 @@ func cmdSendMessage(args []string) {
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
+		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
 			"target":     target.String(),
 			"to":         target.String(),
@@ -5151,6 +5217,7 @@ func cmdSendMessage(args []string) {
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
+		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
 			"target":     target.String(),
 			"to":         target.String(),

@@ -43,7 +43,7 @@ Communication commands:
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
   pilotctl send-file <address|hostname> <filepath>
-  pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
+  pilotctl send-message <address|hostname> --data <text> | --data-file <path> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
   pilotctl publish <address|hostname> <topic> --data <message>
