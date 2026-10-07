@@ -4278,19 +4278,26 @@ const QuickACKBudget = 32
 // segments unless NoDelay is set. Large writes (>= MSS) are sent immediately.
 // ErrSendBufFull is returned by SendData when the per-connection
 // NagleBuf would exceed MaxNagleBuf if the caller's write were
-// appended. Callers must back off and retry — typically by waiting
-// for a webhook or polling the connection's send-buffer state.
+// appended. It bounds the daemon's memory per connection.
 //
-// This error replaces the silent unbounded-growth behavior that
-// could OOM the daemon when an application wrote faster than the
-// network drained. Pinned by TestSendDataNagleBufGrowsUnbounded.
+// SendData returns it only before any byte of the write has been buffered,
+// so retrying the whole write is safe. With one write at a time per
+// connection (WriteMu) and large writes fed through in pieces that drain
+// before the next is taken, the buffer holds at most a held tail and one
+// piece, so in practice it is not returned at all.
 var ErrSendBufFull = errors.New("send buffer full")
 
 func (d *Daemon) SendData(conn *Connection, data []byte) error {
-	conn.Mu.Lock()
-	st := conn.State
-	conn.Mu.Unlock()
-	if st != StateEstablished {
+	if !connEstablished(conn) {
+		return fmt.Errorf("connection not established")
+	}
+
+	// One write at a time per connection: the pieces of a large write
+	// below must not interleave with another writer's bytes.
+	conn.WriteMu.Lock()
+	defer conn.WriteMu.Unlock()
+	// The connection may have been closed while this writer queued.
+	if !connEstablished(conn) {
 		return fmt.Errorf("connection not established")
 	}
 
@@ -4299,6 +4306,73 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 		return d.sendDataImmediate(conn, data)
 	}
 
+	// A write of a segment or more takes its tail with it: it is the end of
+	// a message, not one of a run of small writes that would coalesce.
+	// Decided once, from the whole write, not from each piece.
+	tailNow := len(data) >= SendSegmentSize
+
+	// A write larger than the send buffer can never fit in it, so it used
+	// to be refused outright with ErrSendBufFull — and since an IPC send has
+	// no reply, the client never knew: a message over MaxNagleBuf (256 KB)
+	// was dropped while the sender reported success. Feed a large write
+	// through the buffer in whole-segment pieces instead. Each piece is
+	// flushed before the next is taken (sendSegment blocks on the window),
+	// and WriteMu keeps other writers out, so the buffer never holds more
+	// than a held tail and one piece of this write.
+	for len(data) > nagleWritePiece {
+		if err := d.sendDataPiece(conn, data[:nagleWritePiece], tailNow); err != nil {
+			if err := d.drainAfterSendError(conn, err, tailNow); err != nil {
+				return err
+			}
+		}
+		data = data[nagleWritePiece:]
+		// Closed while this write waited on the window: send no more of
+		// it, nothing may follow the FIN.
+		if !connEstablished(conn) {
+			return protocol.ErrConnClosed
+		}
+	}
+	return d.sendDataPiece(conn, data, tailNow)
+}
+
+// connEstablished reports whether conn is still open for sending.
+func connEstablished(conn *Connection) bool {
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	return conn.State == StateEstablished
+}
+
+// drainAfterSendError finishes flushing a piece of a large write after a
+// send error, so the rest of the write can follow it.
+//
+// A tunnel send error does not lose the segment: it was given its sequence
+// number and tracked before the send, and the retransmit loop resends it.
+// Stopping the write there instead dropped the pieces not yet buffered — they
+// never got sequence numbers — and the connection's next write landed in
+// their place in the stream. Every failed attempt still commits a segment, so
+// this ends (or blocks on the window like any write). It gives up only when
+// the connection is gone.
+func (d *Daemon) drainAfterSendError(conn *Connection, err error, tailNow bool) error {
+	for err != nil {
+		if errors.Is(err, protocol.ErrConnClosed) || errors.Is(err, ErrSendBufFull) || !connEstablished(conn) {
+			return err
+		}
+		slog.Debug("stream send failed; the segment will be retransmitted", "conn_id", conn.ID, "err", err)
+		_, err = d.flushNagle(conn, tailNow, false)
+	}
+	return nil
+}
+
+// nagleWritePiece is how much of one large write SendData buffers at a time:
+// a whole number of SendSegmentSize segments, so only the last piece of a
+// write can end in a short segment, and well under MaxNagleBuf.
+const nagleWritePiece = 56 * SendSegmentSize
+
+// sendDataPiece buffers one write of at most nagleWritePiece bytes (or any
+// smaller caller write) and flushes it under Nagle's algorithm. tailNow sends
+// a short remainder at once instead of letting Nagle hold it. Caller holds
+// conn.WriteMu.
+func (d *Daemon) sendDataPiece(conn *Connection, data []byte, tailNow bool) error {
 	conn.NagleMu.Lock()
 	// v1.9.1: cap NagleBuf at MaxNagleBuf. Without this, slow peers /
 	// full cwnd / packet loss caused the buffer to grow without bound,
@@ -4312,9 +4386,7 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 	conn.NagleBuf = append(conn.NagleBuf, data...)
 	conn.NagleMu.Unlock()
 
-	// A write of a segment or more takes its tail with it: it is the end of
-	// a message, not one of a run of small writes that would coalesce.
-	_, err := d.flushNagle(conn, len(data) >= SendSegmentSize, false)
+	_, err := d.flushNagle(conn, tailNow, false)
 	return err
 }
 

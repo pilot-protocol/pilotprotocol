@@ -10,6 +10,14 @@ Detailed per-release notes are on the
 ## [Unreleased]
 
 ### Added
+- **`pilotctl send-message` can take its payload from stdin or a file**:
+  `--data -` and `--data-file <path>`. A payload passed as an argument is
+  capped by the OS — a 1 MB `--data` failed with "Argument list too long",
+  and on Linux a single argument stops at 128 KiB — which is why senders of
+  large bodies needed a separate stdin helper.
+  `--data -` now means stdin, so a message that is just `-` has to come from
+  `--data-file`. One message can carry up to the 64 MiB data-exchange frame
+  limit; a larger payload is refused before anything is sent.
 - **A client can ask the daemon whether a datagram was actually sent.** The
   IPC `SendTo` command is fire-and-forget: when the daemon could not send a
   datagram (no route to the node, port policy, ephemeral ports exhausted) it
@@ -364,6 +372,15 @@ Detailed per-release notes are on the
   with 2 of 5 failing before, 10.3–11.8s with none failing after; at 0.5%
   loss 9.4–10.5s before, 7.3–7.6s after; without loss 8.2–8.4s before,
   7.6–7.7s after.
+- **A message larger than 256 KB is delivered instead of silently dropped.**
+  The daemon refused any single stream write bigger than its send buffer, and
+  an IPC send has no reply, so the client never knew: `send-message` printed
+  `"status":"ok"` for a 1 MB message that never left the node. A large write is
+  now fed through the buffer in pieces, blocking on the window like any other
+  write. The buffer's size cap is unchanged.
+- **`pilotctl send-message` fails when the receiver does not acknowledge the
+  message.** Every receiver answers a stored message with an ACK; with none,
+  the command used to exit 0.
 - **`-advertise-endpoint` survives a re-registration.** When the daemon
   re-registered (registry reconnect, transport watchdog recovery) it sent
   the tunnel socket's local address instead of the advertised endpoint, so
