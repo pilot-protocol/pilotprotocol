@@ -110,12 +110,11 @@ func TestRetransmitUnackedRecentlySackedWaits(t *testing.T) {
 	}
 }
 
-// Every outstanding segment is marked SACKed, yet the cumulative ACK has
-// stayed below the oldest for an RTO: the receiver has it parked, not
-// delivered (a receiver whose application stopped reading does this). It
-// used to be skipped forever, and the transfer stood still until the
-// application gave up. RFC 2018 §5.1: forget the SACK marks and resend from
-// the cumulative ACK.
+// The oldest unacknowledged segment is marked SACKed and has gone an RTO
+// since it was sent: the receiver has it parked, not delivered (a receiver
+// whose application stopped reading does this). It used to be skipped
+// forever, and the transfer stood still until the application gave up.
+// RFC 2018 §5.1: forget the SACK marks and resend from the cumulative ACK.
 func TestRetransmitUnackedResendsAStaleSackedHead(t *testing.T) {
 	t.Parallel()
 	d := &Daemon{ports: NewPortManager()}
@@ -478,5 +477,24 @@ func TestRetransmitUnackedResendsStaleSackedDataBeforeTheFIN(t *testing.T) {
 	}
 	if p := captured.Last(); p.Seq != 1000 || p.HasFlag(protocol.FlagFIN) {
 		t.Errorf("resent seq=%d flags=%d, want the data segment 1000", p.Seq, p.Flags)
+	}
+}
+
+// A parked head is resent even when a segment behind it is not SACKed: a
+// receiver whose reorder buffer is full cannot SACK the rest, and waiting
+// for every segment to be SACKed left the head stuck until the connection
+// was reset.
+func TestRetransmitUnackedResendsAStaleSackedHeadWithUnsackedSegmentsBehind(t *testing.T) {
+	t.Parallel()
+	d := &Daemon{ports: NewPortManager()}
+	conn, captured := newDaemonRetxConn(t)
+	conn.Unacked = []*retxEntry{
+		{seq: 1000, data: []byte("a"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true, attempts: 1},
+		{seq: 1001, data: []byte("b"), sentAt: time.Now(), attempts: 1},
+	}
+	d.retransmitUnacked(conn)
+
+	if captured.Len() != 1 || captured.Last().Seq != 1000 {
+		t.Fatalf("expected the parked head (seq 1000) resent, got %d packets", captured.Len())
 	}
 }

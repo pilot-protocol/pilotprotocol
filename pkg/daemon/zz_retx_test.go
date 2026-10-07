@@ -180,8 +180,9 @@ func TestRetransmitUnackedSackedSkippedAllBreakOnFirstUntimed(t *testing.T) {
 	d := New(Config{})
 	conn, cs := newRetxConn(t)
 	// First entry is sacked (skip), second is fresh (loop breaks on non-timed-out).
+	// The sacked head was sent within the RTO, so it is not taken for parked.
 	conn.Unacked = []*retxEntry{
-		{data: []byte("a"), seq: 100, sentAt: time.Now().Add(-2 * InitialRTO), attempts: 1, sacked: true},
+		{data: []byte("a"), seq: 100, sentAt: time.Now(), attempts: 1, sacked: true},
 		{data: []byte("b"), seq: 200, sentAt: time.Now(), attempts: 1},
 	}
 	d.retransmitUnacked(conn)

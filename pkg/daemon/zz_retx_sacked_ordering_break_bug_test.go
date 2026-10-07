@@ -69,9 +69,11 @@ func TestRetransmitUnackedBreakSkipsTimedOutEntryAfterRecentNonSacked(t *testing
 
 	now := time.Now()
 	conn.Unacked = []*retxEntry{
-		// A: sacked — should be skipped via continue
+		// A: sacked — should be skipped via continue. Sent within the RTO:
+		// a SACKed head that has gone a whole RTO is resent as parked at
+		// the receiver (TestRetransmitUnackedResendsAStaleSackedHead).
 		{seq: 1000, data: []byte("A"), attempts: 1, sacked: true,
-			sentAt: now.Add(-2 * RTOMin)},
+			sentAt: now.Add(-50 * time.Millisecond)},
 		// B: not sacked, recently retransmitted — sentAt updated to recent time
 		//    (50ms ago, well within RTO=200ms — this entry is NOT timed out)
 		{seq: 2000, data: []byte("B"), attempts: 2, sacked: false,

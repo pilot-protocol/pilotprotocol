@@ -4842,17 +4842,6 @@ func (d *Daemon) retxLoop(conn *Connection) {
 	}
 }
 
-// allDataSacked reports whether every data entry in unacked (the FIN
-// sentinel aside) is marked SACKed.
-func allDataSacked(unacked []*retxEntry) bool {
-	for _, e := range unacked {
-		if !e.isFIN && !e.sacked {
-			return false
-		}
-	}
-	return true
-}
-
 // unackedHasData returns true if conn.Unacked contains any data entry,
 // SACKed or not. Used by retxLoop to decide whether the FinWait state
 // still has work to do (data not yet cumulatively acknowledged) or just
@@ -4886,19 +4875,20 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 		return
 	}
 
-	// RFC 2018 §5.1: a SACK is advice, not an acknowledgement. When every
-	// outstanding data segment is marked SACKed — nothing is in flight —
-	// and the cumulative ACK has stayed below the oldest for a whole RTO,
-	// the receiver does not hold it where it counts. A receiver whose
-	// application stopped reading parks the next in-order segment in its
-	// reorder buffer when delivery times out, keeps SACKing it, and only
-	// delivers it when that segment arrives again (v1.15.0 and later do
-	// this). Skipping SACKed segments, as the loop below does, then resent
-	// nothing: the transfer stood still until the application gave up —
-	// about one in ten bulk transfers into a v1.15.0 node over the relay.
-	// Forget the marks so the timeout resends from the cumulative ACK; a
-	// receiver that really holds the data says so again in its next ACK.
-	if first := conn.Unacked[0]; first.sacked && now.Sub(first.sentAt) > conn.RTO && allDataSacked(conn.Unacked) {
+	// RFC 2018 §5.1: a SACK is advice, not an acknowledgement. The oldest
+	// unacknowledged segment marked SACKed means the receiver does not hold
+	// it where it counts: a receiver that holds the segment at its
+	// cumulative ACK delivers it and moves the ACK on. A receiver whose
+	// application stopped reading parks that segment in its reorder buffer
+	// when delivery times out, keeps SACKing it, and only delivers it when
+	// it arrives again (v1.15.0 and later do this). Skipping SACKed
+	// segments, as the loop below does, then never resent it: the transfer
+	// stood still until the application gave up — about one in ten bulk
+	// transfers into a v1.15.0 node over the relay. Once the head has gone
+	// an RTO since it was last sent, forget the marks so the timeout
+	// resends from the cumulative ACK (Linux's SACK-reneging check does the
+	// same); a receiver that really holds the data says so in its next ACK.
+	if first := conn.Unacked[0]; first.sacked && now.Sub(first.sentAt) > conn.RTO {
 		for _, e := range conn.Unacked {
 			e.sacked = false
 		}
