@@ -29,6 +29,7 @@ package main
 // first-contact reply does not show up, and say which step failed.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -171,12 +172,14 @@ func dialFailureHint(target string, err error, attempts int, elapsed time.Durati
 //   - From a peer known to echo IDs, an untagged message can instead be the
 //     answer to someone else's untagged request, with our own tagged reply
 //     still on its way. A peer is known to echo when one of its earlier
-//     messages in the inbox carries a reply_to (peerEchoedBefore). If our
-//     request reached the receiver with its ID (markTagged), an untagged
-//     message from such a peer is held for untaggedReplyGrace first, and
-//     taken only if no reply naming our request arrives meanwhile (or when
-//     the wait ends). Holding replies from peers with no such history would
-//     only delay them: no service responder echoes IDs yet.
+//     messages in the inbox carries a reply_to (peerEchoedBefore, which runs
+//     beside the send and is waited for only when an untagged message
+//     arrives). If our request reached the receiver with its ID
+//     (markTagged), an untagged message from such a peer is held until
+//     untaggedReplyGrace after it arrived, and taken only if no reply naming
+//     our request arrives meanwhile (or when the wait ends). Holding replies
+//     from peers with no such history would only delay them: no service
+//     responder echoes IDs yet.
 //   - Once the peer has been seen naming another request in reply_to during
 //     this wait, it evidently echoes IDs, and only a reply naming ours is
 //     taken.
@@ -186,8 +189,9 @@ type inboxWatch struct {
 	cutoff time.Time
 	seen   map[string]bool
 
-	// echoedBefore is set by newInboxWatch and only read afterwards: an
-	// earlier message from the peer in the inbox carries a reply_to.
+	// The echo-history scan newInboxWatch starts: echoedBefore is its
+	// result, valid once echoDone is closed (nil when no scan was started).
+	echoDone     chan struct{}
 	echoedBefore bool
 
 	mu     sync.Mutex
@@ -203,19 +207,32 @@ type inboxWatch struct {
 // untaggedReplyGrace is how long an untagged message from a peer known to
 // echo IDs is held back, after our request reached the receiver with its
 // ID, in case the reply that names our request follows. Replies from such
-// a peer normally name our request and are not delayed at all. The
-// send-message help quotes this value.
+// a peer normally name our request and are not delayed at all. awaitReply
+// polls early so the hold ends on time. The send-message help quotes this
+// value.
 const untaggedReplyGrace = 750 * time.Millisecond
 
-// The look for a peer's echo history reads at most echoHistoryFiles of the
-// newest inbox records, and stops after echoHistoryPeerRecords of them from
-// the peer: the sender is only known once a record is read, and a big inbox
-// must not slow the send. A peer whose last reply_to lies further back is
-// treated as not echoing, which is how every peer was treated before.
+// replyPollInterval is how often awaitReply looks at the inbox.
+const replyPollInterval = 250 * time.Millisecond
+
+// The look for a peer's echo history reads only the newest inbox records:
+// at most echoHistoryFiles files and echoHistoryBytes bytes, and no further
+// than echoHistoryPeerRecords records from the peer. A record over
+// echoHistoryRecordBytes is a large message rather than an answer worth
+// reading, and is skipped. A record's sender is only known once it is read,
+// and the inbox holds up to 256 MiB. A peer whose last reply_to lies further
+// back is treated as not echoing, which is how every peer was treated
+// before.
 const (
 	echoHistoryPeerRecords = 200
 	echoHistoryFiles       = 1000
+	echoHistoryBytes       = 16 << 20
+	echoHistoryRecordBytes = 1 << 20
 )
+
+// peerEchoScan is peerEchoedBefore; tests replace it to see that the send
+// does not wait for it.
+var peerEchoScan = peerEchoedBefore
 
 func inboxDirPath() (string, error) {
 	home, err := os.UserHomeDir()
@@ -238,9 +255,28 @@ func newInboxWatch(from string) *inboxWatch {
 		for _, e := range entries {
 			w.seen[e.Name()] = true
 		}
-		w.echoedBefore = peerEchoedBefore(dir, entries, from)
+		// The scan reads files, tens of milliseconds on a full inbox, and
+		// its answer matters only once an untagged message arrives: run it
+		// beside the send instead of before it.
+		w.echoDone = make(chan struct{})
+		scan := peerEchoScan
+		go func() {
+			defer close(w.echoDone)
+			w.echoedBefore = scan(dir, entries, from)
+		}()
 	}
 	return w
+}
+
+// knownToEcho reports whether the peer is known to echo IDs from its
+// messages already in the inbox, waiting for newInboxWatch's scan if it is
+// still running.
+func (w *inboxWatch) knownToEcho() bool {
+	if w.echoDone == nil {
+		return false
+	}
+	<-w.echoDone
+	return w.echoedBefore
 }
 
 // inboxNameKey orders inbox files by arrival. Their names are
@@ -256,36 +292,51 @@ func inboxNameKey(name string) string {
 // peerEchoedBefore reports whether one of the newest records in entries
 // (the inbox at dir) from peer carries a reply_to: the peer has answered a
 // message by naming its ID, so it is known to echo IDs. The scan is bounded
-// by echoHistoryFiles and echoHistoryPeerRecords.
+// by the echoHistory constants.
 func peerEchoedBefore(dir string, entries []os.DirEntry, peer string) bool {
 	if peer == "" {
 		return false
 	}
-	names := make([]string, 0, len(entries))
+	files := make([]os.DirEntry, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
-			names = append(names, e.Name())
+			files = append(files, e)
 		}
 	}
-	sort.Slice(names, func(i, j int) bool { return inboxNameKey(names[i]) > inboxNameKey(names[j]) })
-	if len(names) > echoHistoryFiles {
-		names = names[:echoHistoryFiles]
+	sort.Slice(files, func(i, j int) bool { return inboxNameKey(files[i].Name()) > inboxNameKey(files[j].Name()) })
+	if len(files) > echoHistoryFiles {
+		files = files[:echoHistoryFiles]
 	}
+	// The daemon writes records with encoding/json, without spaces, so these
+	// byte patterns find the sender and a reply_to without parsing the
+	// record; only a record that has both is parsed to be sure.
+	fromPattern := []byte(`"from":"` + peer + `"`)
+	replyToPattern := []byte(`"reply_to":"`)
+	var read int64
 	fromPeer := 0
-	for _, name := range names {
-		body, err := os.ReadFile(filepath.Join(dir, name))
+	for _, e := range files {
+		info, err := e.Info()
+		if err != nil || info.Size() > echoHistoryRecordBytes {
+			continue
+		}
+		if read += info.Size(); read > echoHistoryBytes {
+			break
+		}
+		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			continue
 		}
-		var rec struct {
-			From    string `json:"from"`
-			ReplyTo string `json:"reply_to"`
-		}
-		if json.Unmarshal(body, &rec) != nil || rec.From != peer {
+		if !bytes.Contains(body, fromPattern) {
 			continue
 		}
-		if rec.ReplyTo != "" {
-			return true
+		if bytes.Contains(body, replyToPattern) {
+			var rec struct {
+				From    string `json:"from"`
+				ReplyTo string `json:"reply_to"`
+			}
+			if json.Unmarshal(body, &rec) == nil && rec.From == peer && rec.ReplyTo != "" {
+				return true
+			}
 		}
 		if fromPeer++; fromPeer == echoHistoryPeerRecords {
 			break
@@ -391,8 +442,9 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 		case replyOurs:
 			return msg, nil
 		case replyOther:
-			// Another request's answer. It stays out of w.seen: an ID
-			// added later (the re-send) is checked against it again.
+			// Another request's answer, not taken. Every poll reads it
+			// again, so an ID added later (the re-send's) is still
+			// checked against it.
 			w.peerEchoes = true
 		case replyUntagged:
 			if untagged == nil {
@@ -407,9 +459,10 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 // peer (nil if there is none), is taken as the reply now. It is when our
 // request went out without its ID, or when the peer is not known to echo
 // IDs (as before IDs existed). From a peer with an echo history it is held
-// back for untaggedReplyGrace from the poll that first saw it, so a reply
-// naming our request that arrives meanwhile wins; and it is never taken
-// from a peer seen naming another request during this wait.
+// back until untaggedReplyGrace after it arrived (its received_at, or the
+// poll that first saw it), so a reply naming our request that arrives
+// meanwhile wins; and it is never taken from a peer seen naming another
+// request during this wait.
 func (w *inboxWatch) untaggedReply(msg map[string]interface{}, now time.Time) map[string]interface{} {
 	if msg == nil {
 		w.held = nil
@@ -418,11 +471,16 @@ func (w *inboxWatch) untaggedReply(msg map[string]interface{}, now time.Time) ma
 	w.mu.Lock()
 	tagged := w.tagged
 	w.mu.Unlock()
-	if !tagged || !w.echoedBefore && !w.peerEchoes {
+	if !tagged || !w.peerEchoes && !w.knownToEcho() {
 		return msg
 	}
 	if w.held == nil {
 		w.heldSince = now
+		if ts, _ := msg["received_at"].(string); ts != "" {
+			if at, err := time.Parse(time.RFC3339Nano, ts); err == nil && at.Before(now) {
+				w.heldSince = at
+			}
+		}
 	}
 	w.held = msg
 	if w.peerEchoes || now.Sub(w.heldSince) < untaggedReplyGrace {
@@ -439,6 +497,18 @@ func (w *inboxWatch) heldReply() map[string]interface{} {
 		return nil
 	}
 	return w.held
+}
+
+// holdLeft is how much of the grace period a held message has left at now,
+// or 0 when nothing is held that may still be taken.
+func (w *inboxWatch) holdLeft(now time.Time) time.Duration {
+	if w.heldReply() == nil {
+		return 0
+	}
+	if left := w.heldSince.Add(untaggedReplyGrace).Sub(now); left > 0 {
+		return left
+	}
+	return 0
 }
 
 // replyWait configures awaitReply.
@@ -526,7 +596,13 @@ func awaitReply(w *inboxWatch, ackAt time.Time, cfg replyWait) (replyOutcome, er
 			out.waited = time.Since(ackAt)
 			return out, nil
 		}
-		time.Sleep(250 * time.Millisecond)
+		// Poll early when a held message's grace period ends sooner, so it
+		// is taken on time rather than up to a poll interval late.
+		sleep := replyPollInterval
+		if left := w.holdLeft(time.Now()); left > 0 && left < sleep {
+			sleep = left
+		}
+		time.Sleep(sleep)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,11 +20,49 @@ import (
 
 func writeInboxRecord(t *testing.T, dir, name string, rec map[string]any) {
 	t.Helper()
-	body, _ := json.Marshal(rec)
-	if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
+	if err := putInboxRecord(dir, name, rec); err != nil {
 		t.Fatal(err)
 	}
 }
+
+// putInboxRecord writes an inbox record as the daemon does. It returns the
+// error rather than failing the test, for goroutines and receiver callbacks,
+// which must not call t.Fatal.
+func putInboxRecord(dir, name string, rec map[string]any) error {
+	body, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name), body, 0o600)
+}
+
+// putInboxRecordLater writes an inbox record after delay, from a goroutine.
+// The returned channel is closed once it is written (or failed to be).
+func putInboxRecordLater(t *testing.T, delay time.Duration, dir, name string, rec map[string]any) <-chan struct{} {
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		time.Sleep(delay)
+		if err := putInboxRecord(dir, name, rec); err != nil {
+			t.Error(err)
+		}
+	}()
+	return written
+}
+
+// awaitClosed fails the test if ch is not closed within a few seconds.
+func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// atOnce bounds how long an untagged reply that is not held may take: well
+// under the hold, with room for a loaded machine.
+const atOnce = 400 * time.Millisecond
 
 const replyPeer = "0:0000.0002.BBE4"
 
@@ -134,6 +173,11 @@ func TestInboxWatchWithoutIDsIgnoresReplyTo(t *testing.T) {
 // instead of acknowledging the frame: the sender's ack read fails.
 const dxDropConnection = "\x00drop"
 
+// dxCutAck, returned by a dxReceiver's answer, sends the first bytes of an
+// ack and then closes the connection: the sender's ack read fails with
+// "unexpected EOF" rather than "EOF".
+const dxCutAck = "\x00cut"
+
 // dxReceiver turns the stream daemon's echo into a data-exchange receiver:
 // answer is called with each complete wire frame (its type and payload) the
 // client wrote and returns the acknowledgement text (or dxDropConnection).
@@ -171,6 +215,13 @@ func newDXReceiver(sd *streamDaemon, answer func(ftype uint32, payload []byte, d
 			r.types = append(r.types, ftype)
 			r.frames = append(r.frames, decoded)
 			text := answer(ftype, payload, decoded)
+			if text == dxCutAck {
+				part := make([]byte, 5+3)
+				part[0] = tdCmdRecv
+				binary.BigEndian.PutUint32(part[1:5], connID)
+				out = append(out, part)
+				text = dxDropConnection
+			}
 			if text == dxDropConnection {
 				closed := make([]byte, 5)
 				closed[0] = tdCmdCloseOK
@@ -357,12 +408,16 @@ func TestSendMessageWaitTakesTheReplyToItsOwnRequest(t *testing.T) {
 	}
 	const peer = "0:0000.0000.002A"
 	newDXReceiver(sd, func(_ uint32, _ []byte, f *dataexchange.Frame) string {
-		writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{
+		if err := putInboxRecord(inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{
 			"from": peer, "data": "answer to somebody else's request", "reply_to": "somebody-else",
-		})
-		writeInboxRecord(t, inbox, "TEXT-20260924-100006.000-000002.json", map[string]any{
+		}); err != nil {
+			t.Error(err)
+		}
+		if err := putInboxRecord(inbox, "TEXT-20260924-100006.000-000002.json", map[string]any{
 			"from": peer, "data": "pong", "reply_to": f.MessageID,
-		})
+		}); err != nil {
+			t.Error(err)
+		}
 		return "ACK TEXT 4 bytes"
 	})
 
@@ -417,7 +472,7 @@ func TestAwaitReplyTakesAnUntaggedReplyAtOnceFromAPeerWithNoEchoHistory(t *testi
 	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
 		t.Fatalf("awaitReply = %+v, %v; want the untagged answer", out, err)
 	}
-	if el := time.Since(start); el >= untaggedReplyGrace/3 {
+	if el := time.Since(start); el >= atOnce {
 		t.Fatalf("answer taken after %s; a peer with no echo history is not held back", el)
 	}
 }
@@ -437,15 +492,10 @@ func TestAwaitReplyHoldsAnUntaggedMessageForALaterTaggedReply(t *testing.T) {
 	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{
 		"from": replyPeer, "data": "answer to another client's untagged request",
 	})
-	written := make(chan struct{})
-	defer func() { <-written }()
-	go func() {
-		defer close(written)
-		time.Sleep(400 * time.Millisecond)
-		writeInboxRecord(t, dir, "TEXT-20260924-100006.000-000002.json", map[string]any{
-			"from": replyPeer, "data": "our answer", "reply_to": "our-request",
-		})
-	}()
+	written := putInboxRecordLater(t, 400*time.Millisecond, dir, "TEXT-20260924-100006.000-000002.json", map[string]any{
+		"from": replyPeer, "data": "our answer", "reply_to": "our-request",
+	})
+	defer awaitClosed(t, written, "the tagged reply to be written")
 	out, err := awaitReply(watch, time.Now(), replyWait{wait: 5 * time.Second})
 	if err != nil || out.reply == nil || out.reply["data"] != "our answer" {
 		t.Fatalf("awaitReply = %+v, %v; want the reply naming our request", out, err)
@@ -503,7 +553,7 @@ func TestAwaitReplyTakesAnUntaggedReplyAtOnceForAnUntaggedRequest(t *testing.T) 
 	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
 		t.Fatalf("awaitReply = %+v, %v", out, err)
 	}
-	if el := time.Since(start); el >= untaggedReplyGrace/3 {
+	if el := time.Since(start); el >= atOnce {
 		t.Fatalf("answer taken after %s; an untagged request has nothing to wait for", el)
 	}
 }
@@ -563,6 +613,96 @@ func TestPeerEchoedBeforeIsBounded(t *testing.T) {
 	if echoed(dir) {
 		t.Fatalf("echo record behind %d newer files was read", echoHistoryFiles)
 	}
+
+	// By bytes: past echoHistoryBytes nothing more is read. A record over
+	// echoHistoryRecordBytes (a large message) is skipped, not read.
+	big := func(dir, name string, size int) {
+		writeInboxRecord(t, dir, name, map[string]any{"from": "0:0000.0009.0001", "data": strings.Repeat("x", size)})
+	}
+	dir = t.TempDir()
+	storeEchoHistory(t, dir, replyPeer)
+	half := echoHistoryRecordBytes / 2
+	for i := 0; i <= echoHistoryBytes/half; i++ {
+		big(dir, fmt.Sprintf("TEXT-20260924-100000.000-%06d.json", i+1), half)
+	}
+	if echoed(dir) {
+		t.Fatalf("echo record behind %d MiB of newer records was read", echoHistoryBytes>>20)
+	}
+	dir = t.TempDir()
+	storeEchoHistory(t, dir, replyPeer)
+	big(dir, "TEXT-20260924-100000.000-000001.json", echoHistoryBytes)
+	if !echoed(dir) {
+		t.Fatal("a record as large as the byte budget stopped the scan instead of being skipped")
+	}
+}
+
+// The echo-history scan runs beside the send: the request leaves while it
+// is still running, and the scan is waited for only when the untagged reply
+// has to be judged.
+func TestSendMessageDoesNotWaitForTheEchoHistoryScan(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var scanDone atomic.Bool
+	defer func(old func(string, []os.DirEntry, string) bool) { peerEchoScan = old }(peerEchoScan)
+	peerEchoScan = func(string, []os.DirEntry, string) bool {
+		select {
+		case <-release:
+		case <-time.After(3 * time.Second):
+		}
+		scanDone.Store(true)
+		return false
+	}
+
+	sd := newStreamDaemon(t)
+	home := sd.useDaemonNoRegistry(t)
+	inbox := filepath.Join(home, ".pilot", "inbox")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const peer = "0:0000.0000.002A"
+	var sentDuringScan atomic.Bool
+	newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+		sentDuringScan.Store(!scanDone.Load())
+		if err := putInboxRecord(inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": peer, "data": "pong"}); err != nil {
+			t.Error(err)
+		}
+		releaseOnce.Do(func() { close(release) })
+		return "ACK TEXT 4 bytes"
+	})
+
+	data := sendMessageJSON(t, peer, "--data", "ping", "--wait", "5s")
+	if !sentDuringScan.Load() {
+		t.Fatal("the request left only after the echo-history scan finished")
+	}
+	if reply, _ := data["reply"].(map[string]interface{}); reply == nil || reply["data"] != "pong" {
+		t.Fatalf("result = %v; want the pong", data)
+	}
+}
+
+// The hold runs from the message's arrival (its received_at), not from the
+// poll that first sees it, and awaitReply polls again when it ends rather
+// than at the next 250 ms tick: a message that arrived 50 ms short of the
+// grace period before the first poll is taken about 50 ms later.
+func TestAwaitReplyHoldEndsTheGracePeriodAfterArrival(t *testing.T) {
+	dir := tempInbox(t)
+	storeEchoHistory(t, dir, replyPeer)
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	watch.markTagged()
+	const left = 50 * time.Millisecond
+	arrived := time.Now().Add(-(untaggedReplyGrace - left))
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{
+		"from": replyPeer, "data": "the answer", "received_at": arrived.Format(time.RFC3339Nano),
+	})
+
+	start := time.Now()
+	out, err := awaitReply(watch, start, replyWait{wait: 5 * time.Second})
+	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
+		t.Fatalf("awaitReply = %+v, %v; want the untagged answer", out, err)
+	}
+	if el := time.Since(start); el < left-10*time.Millisecond || el >= replyPollInterval-50*time.Millisecond {
+		t.Fatalf("answer taken %s after the first poll, want about %s", el, left)
+	}
 }
 
 // Through send-message, to a peer with no echo history: the request is
@@ -576,7 +716,9 @@ func TestSendMessageWaitTakesAnUntaggedReplyAtOnceWithoutEchoHistory(t *testing.
 	}
 	const peer = "0:0000.0000.002A"
 	newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
-		writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": peer, "data": "pong"})
+		if err := putInboxRecord(inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": peer, "data": "pong"}); err != nil {
+			t.Error(err)
+		}
 		return "ACK TEXT 4 bytes"
 	})
 
@@ -585,7 +727,7 @@ func TestSendMessageWaitTakesAnUntaggedReplyAtOnceWithoutEchoHistory(t *testing.
 	if reply == nil || reply["data"] != "pong" || data["tagged"] != true {
 		t.Fatalf("result = %v; want the untagged pong for a tagged request", data)
 	}
-	if ms, _ := data["reply_after_ms"].(float64); ms >= float64(untaggedReplyGrace.Milliseconds()/3) {
+	if ms, _ := data["reply_after_ms"].(float64); ms >= float64(atOnce.Milliseconds()) {
 		t.Fatalf("reply taken after %v ms; a peer with no echo history is not held back", ms)
 	}
 }
@@ -602,23 +744,26 @@ func TestSendMessageWaitHoldsAnUntaggedMessageForItsTaggedReply(t *testing.T) {
 	}
 	const peer = "0:0000.0000.002A"
 	storeEchoHistory(t, inbox, peer)
-	written := make(chan struct{})
+	written := make(chan (<-chan struct{}), 1)
 	newDXReceiver(sd, func(_ uint32, _ []byte, f *dataexchange.Frame) string {
-		writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{
+		if err := putInboxRecord(inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{
 			"from": peer, "data": "answer to another client's untagged request",
+		}); err != nil {
+			t.Error(err)
+		}
+		written <- putInboxRecordLater(t, 400*time.Millisecond, inbox, "TEXT-20260924-100006.000-000002.json", map[string]any{
+			"from": peer, "data": "pong", "reply_to": f.MessageID,
 		})
-		go func() {
-			defer close(written)
-			time.Sleep(400 * time.Millisecond)
-			writeInboxRecord(t, inbox, "TEXT-20260924-100006.000-000002.json", map[string]any{
-				"from": peer, "data": "pong", "reply_to": f.MessageID,
-			})
-		}()
 		return "ACK TEXT 4 bytes"
 	})
 
 	data := sendMessageJSON(t, peer, "--data", "ping", "--wait", "5s")
-	<-written
+	select {
+	case w := <-written:
+		awaitClosed(t, w, "the tagged reply to be written")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the receiver never got the request")
+	}
 	reply, _ := data["reply"].(map[string]interface{})
 	if reply == nil || reply["data"] != "pong" || reply["reply_to"] != data["message_id"] {
 		t.Fatalf("reply = %v for message_id %v; want the answer to this request", reply, data["message_id"])
@@ -672,6 +817,10 @@ func TestSendMessageReplyToLooksUpAnInboxID(t *testing.T) {
 	}
 	if data["reply_to"] != requestID {
 		t.Fatalf("result reply_to = %v, want %s", data["reply_to"], requestID)
+	}
+	// The file name as ls shows it, with .json, is looked up the same way.
+	if got, err := resolveReplyTo("TEXT-20260924-100005.000-000001.json"); err != nil || got != requestID {
+		t.Fatalf("--reply-to with .json = %q, %v; want %s", got, err, requestID)
 	}
 }
 
@@ -738,7 +887,7 @@ func TestInboxShowsMessageIDAndReplyTo(t *testing.T) {
 		}
 	}
 	read := captureStdout(t, func() { withText(func() { cmdInbox([]string{"read", "TEXT-20260924-100006.000-000002"}) }) })
-	for _, want := range []string{"Message ID: ans-1", "Reply to:   req-1"} {
+	for _, want := range []string{"ID:         TEXT-20260924-100006.000-000002\n", "Bytes:      4\n", "Message ID: ans-1\n", "Reply to:   req-1\n"} {
 		if !strings.Contains(read, want) {
 			t.Errorf("inbox read lacks %q:\n%s", want, read)
 		}
@@ -810,6 +959,51 @@ func TestSendMessageSendsAgainWhenTheAckIsLost(t *testing.T) {
 		}
 	})
 
+	// The retry is lost too: the message was sent twice before the send was
+	// judged, and with no ack at all it fails, with the retry's ack error.
+	t.Run("retry unacknowledged too", func(t *testing.T) {
+		sd := newStreamDaemon(t)
+		sd.useDaemonNoRegistry(t)
+		calls := 0
+		rcv := newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+			if calls++; calls == 1 {
+				return dxDropConnection
+			}
+			return dxCutAck
+		})
+
+		var f *trappedFatal
+		withJSON(func() {
+			_, _, f = runTrapped(t, func() { cmdSendMessage([]string{peer, "--data", "hello"}) })
+		})
+		if f == nil || f.Code != "connection_failed" || !strings.Contains(f.Message, "did not acknowledge") || !strings.HasSuffix(f.Message, ": dataexchange: read ack: unexpected EOF") || strings.Contains(f.Message, "sending again failed") {
+			t.Fatalf("send = %+v, want connection_failed: not acknowledged, with only the retry's ack error", f)
+		}
+		if types, _ := rcv.seen(); len(types) != 2 {
+			t.Fatalf("receiver saw frame types %v, want the message and its retry", types)
+		}
+	})
+
+	// --trace: receivers do not suppress a repeated trace frame, so even a
+	// current receiver would store the message twice. It is sent once, and
+	// with no ack the send fails.
+	t.Run("--trace", func(t *testing.T) {
+		sd := newStreamDaemon(t)
+		sd.useDaemonNoRegistry(t)
+		rcv := newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string { return dxDropConnection })
+
+		var f *trappedFatal
+		withJSON(func() {
+			_, _, f = runTrapped(t, func() { cmdSendMessage([]string{peer, "--data", "hello", "--trace"}) })
+		})
+		if f == nil || f.Code != "connection_failed" || !strings.Contains(f.Message, "did not acknowledge") {
+			t.Fatalf("send = %+v, want connection_failed: not acknowledged", f)
+		}
+		if types, _ := rcv.seen(); len(types) != 1 {
+			t.Fatalf("receiver saw frame types %v, want the traced message once", types)
+		}
+	})
+
 	// --no-resend: sent once, and with no ack the send fails. Whether the
 	// receiver got the ID is not known without its ack, so the result does
 	// not claim either.
@@ -847,4 +1041,16 @@ func TestSendMessageSendsAgainWhenTheAckIsLost(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A message whose first ack was lost and whose retry was acknowledged was
+// delivered: a --count run with it succeeds.
+func TestUndeliveredCountsARetriedAndAcknowledgedMessageAsDelivered(t *testing.T) {
+	results := []map[string]interface{}{
+		{"seq": 0, "ack": "ACK TEXT 5 bytes", "retried": true, "tagged": true},
+		{"seq": 1, "ack": "ACK TEXT 5 bytes"},
+	}
+	if failed, _, first := undelivered(results); failed != 0 {
+		t.Fatalf("undelivered = %d (%s), want 0", failed, first)
+	}
 }

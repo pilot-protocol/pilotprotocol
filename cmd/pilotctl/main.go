@@ -914,7 +914,10 @@ Flags:
   --no-resend           never send the request a second time (by default it
                         is re-sent once on a new stream when, on first
                         contact, no reply came by mid-wait, or when its
-                        acknowledgement was lost)
+                        acknowledgement was lost; a receiver from v1.13.10
+                        on keeps one copy of a repeat, but one through
+                        v1.13.9 can store it twice if the ack of its
+                        untagged copy is lost)
   --timeout <dur>       total wall time, including connect, handshake and reply
   --trace               print per-step timing breakdown to stderr
   --no-auto-handshake   skip automatic trust handshake with known agents
@@ -928,8 +931,8 @@ Every message is sent with a new message ID (message_id in the --json result).
 --wait takes the message from the peer whose reply_to is that ID, and never one
 whose reply_to names another message. A reply without reply_to is matched by
 sender and arrival time, as before. From a peer known to echo IDs (one of its
-earlier messages in the inbox carries a reply_to) such a reply is held back up
-to 0.75s in case the reply naming the ID follows.
+earlier messages in the inbox carries a reply_to) such a reply is held back
+until 0.75s after it arrived, in case the reply naming the ID follows.
 
 Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
@@ -2520,7 +2523,7 @@ func contextCatalog() map[string]interface{} {
 			// Messaging
 			"send-message": map[string]interface{}{
 				"args":        []string{"<address|hostname>", "--data <text> | --data - | --data-file <path>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]", "[--reply-to <message_id>]"},
-				"description": "Send a typed message to a node via data exchange (port 1001). --data - reads the payload from stdin, --data-file from a file (up to 64 MiB; a command-line argument is capped by the OS). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Fails unless every message is acknowledged. Default type: text. Every message carries a new message_id; --wait returns the reply whose reply_to names it, or else the next message from the peer without reply_to (held up to 0.75s if the peer is known to echo IDs); --reply-to <message_id> answers a received message",
+				"description": "Send a typed message to a node via data exchange (port 1001). --data - reads the payload from stdin, --data-file from a file (up to 64 MiB; a command-line argument is capped by the OS). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Fails unless every message is acknowledged. Default type: text. Every message carries a new message_id; --wait returns the reply whose reply_to names it, or else the next message from the peer without reply_to (held until 0.75s after it arrived if the peer is known to echo IDs); --reply-to <message_id> answers a received message",
 				"returns":     "target, to, type, bytes, ack, reuse_conn, message_id, tagged, reply_to, reply",
 			},
 			"send-file": map[string]interface{}{
@@ -5047,22 +5050,34 @@ func cmdSendMessage(args []string) {
 		frame := messageFrame(innerType, []byte(data), messageID, replyTo, traceTime, sentAtNs)
 		res, sendErr := cl.Send(frame)
 		retried := false
-		if res == nil && isAckReadError(sendErr) && !noResend {
+		if res == nil && isAckReadError(sendErr) && !noResend && !traceTime {
 			// The frame was written but no ack came back, so whether it was
 			// stored is unknown. A receiver through v1.13.9 never stores the
 			// tagged form, and the untagged copy only follows its answer to
 			// that, so with the first ack lost the message is lost too.
 			// Send the same frame once more on a new connection: a receiver
-			// that knows message IDs recognises the repeat by its ID and
-			// keeps one copy, and an older one answers the tagged frame
-			// again and gets the untagged copy. The one case that stores
-			// the message twice is an older receiver that lost the ack of
-			// the untagged copy; --no-resend opts out of the retry.
+			// from v1.13.10 on recognises the repeat by its ID and keeps one
+			// copy, and an older one answers the tagged frame again and gets
+			// the untagged copy. The one case that stores the message twice
+			// is a receiver through v1.13.9 that stored the untagged copy
+			// and lost its ack; --no-resend opts out of the retry. A --trace
+			// message is never sent again: receivers do not suppress
+			// repeated trace frames, so every receiver would store it twice.
+			//
+			// This runs before the send is judged: a message whose retry is
+			// acknowledged is delivered, and the ack error reported for one
+			// that is not is the retry's.
 			slog.Debug("send-message ACK read failed; sending again on a new connection", "err", sendErr)
 			if c2, err := redial(); err == nil {
 				retried = true
-				if res2, err2 := c2.Send(frame); res2 != nil {
+				res2, err2 := c2.Send(frame)
+				switch {
+				case res2 != nil, isAckReadError(err2):
 					res, sendErr = res2, err2
+				default:
+					// The retry was not written: the first attempt, written
+					// but unacknowledged, is what happened to the message.
+					sendErr = fmt.Errorf("%w; sending again failed: %v", sendErr, err2)
 				}
 				c2.Close()
 			}
@@ -5375,6 +5390,10 @@ var inboxFileID = regexp.MustCompile(`^[A-Z_]+-[0-9]{8}-[0-9]{6}\.[0-9]{3}-[0-9]
 func resolveReplyTo(raw string) (string, error) {
 	if raw == "true" {
 		return "", errors.New("--reply-to needs a value: the message_id of the message you are answering (pilotctl inbox shows it)")
+	}
+	// The file name itself, as ls shows it, is the same mistake.
+	if name := strings.TrimSuffix(raw, ".json"); name != raw && inboxFileID.MatchString(name) {
+		raw = name
 	}
 	if inboxFileID.MatchString(raw) {
 		dir, err := inboxDirPath()
@@ -7317,7 +7336,8 @@ func cmdInboxRead(dir, id string) {
 	ts, _ := m["received_at"].(string)
 	msgType, _ := m["type"].(string)
 	bytes, _ := m["bytes"].(float64)
-	fmt.Printf("ID:    %s\nFrom:  %s\nWhen:  %s\nType:  %s\nBytes: %d\n", m["id"], from, ts, msgType, int(bytes))
+	// Labels padded to the longest, "Message ID:", so the values line up.
+	fmt.Printf("ID:         %s\nFrom:       %s\nWhen:       %s\nType:       %s\nBytes:      %d\n", m["id"], from, ts, msgType, int(bytes))
 	if id, _ := m["message_id"].(string); id != "" {
 		fmt.Printf("Message ID: %s\n", id)
 	}
