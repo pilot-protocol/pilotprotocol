@@ -29,6 +29,38 @@ Detailed per-release notes are on the
   existing `SendTo` command is unchanged and still never replies, so
   current clients and SDKs are unaffected; `pilotctl dgram` switches to the
   confirmed send once the driver release that carries it is picked up.
+- **`pilotctl send-message --wait` can match the reply by message ID.** The
+  wait takes the oldest new message from the peer, so two concurrent
+  requests to one peer, or anything else the peer sends in the window, can
+  hand a caller another request's answer. Every message is now sent with a
+  new message ID (`message_id` in the `--json` result, and in the receiver's
+  inbox record). A reply whose `reply_to` is that ID is matched exactly, and
+  a message whose `reply_to` names another request is never taken. Exact
+  matching needs the responder to echo the request's `message_id` as
+  `reply_to`, which no service responder does yet. An untagged reply still
+  works: it is matched by sender and arrival time and taken as soon as it
+  arrives, as before, so for such responders concurrent waits can still be
+  crossed. From a peer known to echo IDs (one of its newest messages in the
+  inbox carries a `reply_to`) an untagged message is held back until 0.75 s
+  after it arrived, in case the reply naming the request follows; the inbox
+  is searched for that history beside the send, not before it. Once the
+  peer has been seen naming another request in `reply_to` during the wait,
+  only a reply naming ours is taken. New flag `--reply-to <message_id>`
+  sends a message as the answer to a received one (an inbox file id is
+  looked up; a bare flag is refused).
+  `pilotctl inbox` now shows each message's `message_id` and `reply_to`, in
+  the listing and with `--json` (new fields; `id` is still the file name).
+  A first-contact re-send uses an ID of its own (the receiver would drop a
+  repeat of the same ID as a duplicate) and a reply to either is accepted.
+  When the ack is lost, the message is sent once more on a new connection
+  with the same ID (`"retried": true`; `--no-resend` opts out). A receiver
+  from v1.13.10 on recognises the repeat and keeps one copy; one through
+  v1.13.9 can store the message twice when the ack of its untagged copy is
+  the one lost. A `--trace` message is never sent again: receivers do not
+  suppress repeated trace frames. Receivers that predate message IDs still
+  get the message, in the old format (`"tagged": false` in the result); that
+  costs one extra exchange on the same connection. No dependency change: the
+  dataexchange release already required carries the IDs.
 - **The daemon caps its own log file.** launchd never rotates the daemon's
   `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
   without bound — 22 MB on one laptop. When stderr is a regular file the
