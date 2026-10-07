@@ -378,10 +378,8 @@ func TestCmdDgramJSON(t *testing.T) {
 	if data["confirmed"] != true {
 		t.Errorf("confirmed = %v, want true from a daemon that confirms sends", data["confirmed"])
 	}
-	// SendTo is fire-and-forget; the daemon may or may not have processed
-	// the frame by the time cmdDgram returns. Give it a brief window via
-	// a follow-up RPC (Info) that forces a round-trip through the IPC.
-	_, _ = (&dummyForceRT{sd: sd}).Force()
+	// The confirmed send is answered, so the daemon has seen the frame by
+	// the time cmdDgram returns.
 	if sd.dgramCount.Load() < 1 {
 		t.Errorf("daemon never saw cmdSendTo (count=%d)", sd.dgramCount.Load())
 	}
@@ -420,7 +418,7 @@ func TestCmdDgramReportsTheDaemonsRefusal(t *testing.T) {
 	if failure == nil {
 		t.Fatal("dgram succeeded although the daemon refused the send")
 	}
-	if failure.Code != "connection_failed" || !strings.Contains(failure.Message, "not allowed by network 0 policy") {
+	if failure.Code != "connection_failed" || !strings.Contains(failure.Message, "not allowed by network 0 policy") || strings.Count(failure.Message, "sendto:") != 1 {
 		t.Errorf("failure = %+v, want connection_failed naming the daemon's reason", failure)
 	}
 }
@@ -445,7 +443,10 @@ func TestCmdDgramOnADaemonThatCannotConfirm(t *testing.T) {
 	if data := env["data"].(map[string]interface{}); data["confirmed"] != false {
 		t.Errorf("confirmed = %v, want false from a daemon that cannot confirm", data["confirmed"])
 	}
-	_, _ = (&dummyForceRT{sd: sd}).Force()
+	// The legacy send that follows the probe is not answered: wait for it.
+	for deadline := time.Now().Add(2 * time.Second); sd.dgramCount.Load() < 2 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if n := sd.dgramCount.Load(); n != 2 {
 		t.Errorf("daemon saw %d datagram frames, want the probe and the legacy send", n)
 	}
