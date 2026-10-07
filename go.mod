@@ -6,7 +6,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/pilot-protocol/app-store v1.0.5
 	github.com/pilot-protocol/beacon v0.2.10
-	github.com/pilot-protocol/common v0.6.0
+	github.com/pilot-protocol/common v0.6.1
 	github.com/pilot-protocol/dataexchange v0.3.1
 	github.com/pilot-protocol/eventstream v0.3.0
 	github.com/pilot-protocol/handshake v0.3.1
