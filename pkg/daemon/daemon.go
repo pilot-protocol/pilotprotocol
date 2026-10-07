@@ -451,8 +451,8 @@ type Daemon struct {
 	// it. consecutiveDialTimeouts counts back-to-back dial timeouts
 	// (reset to 0 on any successful dial); a run of them to distinct
 	// peers means our outbound path is wedged, not that one peer is dead.
-	// A timeout is not counted when the tunnel decrypted anything from
-	// that peer during the dial (see dialConnectionLocked).
+	// A timeout is not counted when another dial succeeded while it ran
+	// (see dialConnectionLocked).
 	lastDialOKNano          atomic.Int64
 	consecutiveDialTimeouts atomic.Uint64
 
@@ -4199,12 +4199,15 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 				// Full direct+relay retry budget exhausted with no SYN-ACK.
 				// Feeds the rx-watchdog's partial-wedge detector: a run of
 				// these to distinct peers means our outbound is wedged.
-				// Not when the peer was heard from while we dialed: it is
-				// reachable and declined this SYN (its SYN limiter under a
-				// burst of our own dials, a full accept path), which says
-				// nothing about our transport.
-				if last, ok := d.tunnels.LastInboundDecrypt(dstAddr.Node); ok && last.After(dialStart) {
-					slog.Debug("dial timed out but the peer was heard from during the dial; not counted as a transport wedge",
+				// Not when another dial completed while this one ran: that
+				// SYN reached its peer and the SYN-ACK came back, so our
+				// outbound path worked during this dial and this one was
+				// declined (a peer's SYN limiter under a burst of our own
+				// dials, a full accept path). Traffic merely received from
+				// the peer is no evidence — its keepalives still arrive
+				// when it is our outbound path that is dead.
+				if d.lastDialOKNano.Load() > dialStart.UnixNano() {
+					slog.Debug("dial timed out while another dial succeeded; not counted as a transport wedge",
 						"peer_node_id", dstAddr.Node, "dst_port", dstPort)
 				} else {
 					d.consecutiveDialTimeouts.Add(1)

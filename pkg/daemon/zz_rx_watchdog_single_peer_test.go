@@ -49,15 +49,16 @@ func dialTimeoutBurst(t *testing.T, before, during func(d *Daemon, peerNode uint
 	return d
 }
 
-// TestRxWatchdogDialTimeoutsToAnsweringPeerAreNotAWedge: a burst of dials to
-// ONE peer times out while that peer is demonstrably reachable — the tunnel
-// keeps decrypting packets from it (it answered the dials that got through
-// its SYN limiter and dropped the rest). That says something about the peer,
-// not about this node's transport, so the watchdog must not start its
-// recovery (beacon + registry re-registration, escalating to a process
-// exit). Before the fix every such timeout bumped the global
-// consecutiveDialTimeouts and four of them tripped "outbound-dial-wedged".
-func TestRxWatchdogDialTimeoutsToAnsweringPeerAreNotAWedge(t *testing.T) {
+// TestRxWatchdogDialTimeoutsWhileAnotherDialSucceedsAreNotAWedge: a burst of
+// dials times out while another dial completes — its SYN reached the peer
+// and the SYN-ACK came back, so this node's outbound path demonstrably
+// worked (a peer's SYN limiter answered some of our burst and dropped the
+// rest). That says something about the peer, not about this node's
+// transport, so the watchdog must not start its recovery (beacon and
+// registry re-registration, escalating to a process exit). Before the fix
+// every such timeout bumped the global consecutiveDialTimeouts and four of
+// them tripped "outbound-dial-wedged".
+func TestRxWatchdogDialTimeoutsWhileAnotherDialSucceedsAreNotAWedge(t *testing.T) {
 	if testing.Short() {
 		t.Skip("long retry-budget test")
 	}
@@ -65,22 +66,49 @@ func TestRxWatchdogDialTimeoutsToAnsweringPeerAreNotAWedge(t *testing.T) {
 
 	now := time.Now()
 	d := dialTimeoutBurst(t, nil, func(d *Daemon, peerNode uint32) {
-		d.tunnels.kx.RecordInboundDecrypt(peerNode)
+		// What a dial that completes does (dialConnectionLocked).
+		d.lastDialOKNano.Store(time.Now().UnixNano())
+		d.consecutiveDialTimeouts.Store(0)
 	})
 	if c := d.consecutiveDialTimeouts.Load(); c != 0 {
-		t.Errorf("consecutiveDialTimeouts = %d after timeouts to a peer heard from during the dials, want 0", c)
+		t.Errorf("consecutiveDialTimeouts = %d after timeouts during which another dial succeeded, want 0", c)
 	}
 
 	st := &rxWatchdogState{lastProgress: now, recvSeen: atomic.LoadUint64(&d.tunnels.PktsRecv)}
 	atomic.AddUint64(&d.tunnels.PktsRecv, 25)
 	if got := d.rxWatchdogTick(st, now.Add(rxWatchdogTickInterval)); got != rxActionProgress {
-		t.Fatalf("dial timeouts to an answering peer: action = %q, want %q", got, rxActionProgress)
+		t.Fatalf("dial timeouts while another dial succeeded: action = %q, want %q", got, rxActionProgress)
+	}
+}
+
+// TestRxWatchdogPeerKeepalivesDoNotHideAWedge: a node whose outbound path is
+// dead still receives its peers' keepalives, so traffic from the dialled peer
+// during the dials is not evidence that the transport works. An earlier
+// version of this fix treated it as such, and a node with every outbound
+// frame dropped never reached the threshold.
+func TestRxWatchdogPeerKeepalivesDoNotHideAWedge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long retry-budget test")
+	}
+	t.Parallel()
+
+	now := time.Now()
+	d := dialTimeoutBurst(t, nil, func(d *Daemon, peerNode uint32) {
+		d.tunnels.kx.RecordInboundDecrypt(peerNode) // the peer's keepalive arrives
+	})
+	if c := d.consecutiveDialTimeouts.Load(); c != dialWedgeThreshold {
+		t.Fatalf("consecutiveDialTimeouts = %d with only the peer's keepalives arriving, want %d", c, dialWedgeThreshold)
+	}
+
+	st := &rxWatchdogState{lastProgress: now, recvSeen: atomic.LoadUint64(&d.tunnels.PktsRecv)}
+	atomic.AddUint64(&d.tunnels.PktsRecv, 3)
+	if got := d.rxWatchdogTick(st, now.Add(rxWatchdogTickInterval)); got != rxActionSoftRecover {
+		t.Fatalf("outbound dead, keepalives arriving: action = %q, want %q", got, rxActionSoftRecover)
 	}
 }
 
 // TestRxWatchdogDialTimeoutsToSilentPeerStillCount keeps the partial-wedge
-// detector (2026-07-15) intact: when nothing arrived from the peer during
-// the dials — a decrypt from before they started is not evidence — every
+// detector (2026-07-15) intact: with no dial succeeding meanwhile, every
 // timeout counts and the watchdog recovers even though rx is trickling.
 func TestRxWatchdogDialTimeoutsToSilentPeerStillCount(t *testing.T) {
 	if testing.Short() {
