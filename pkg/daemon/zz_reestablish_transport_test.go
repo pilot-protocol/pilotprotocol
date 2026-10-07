@@ -296,12 +296,74 @@ func TestReestablishTransportCoalescesRecentRuns(t *testing.T) {
 	if got := log.get("register"); got != 2 {
 		t.Fatalf("registers = %d, want the address change to run regardless", got)
 	}
+	// The address change re-registered the endpoint only. A resume wants the
+	// full re-registration, so it does not count as done.
+	run("resume", reestablishOpts{freshConn: true})
+	if got := log.get("register"); got != 3 {
+		t.Fatalf("registers = %d, want a full caller to run after an endpoint-only run", got)
+	}
+	run("rx-silence", reestablishOpts{})
+	if got := log.get("register"); got != 3 {
+		t.Fatalf("registers = %d, want rx-silence skipped right after a full run", got)
+	}
 
 	d.reestablishMu.Lock()
 	d.reestablishOKWall = time.Now().Add(-2 * reestablishCoalesce).UnixNano()
 	d.reestablishMu.Unlock()
 	run("resume", reestablishOpts{freshConn: true})
-	if got := log.get("register"); got != 3 {
+	if got := log.get("register"); got != 4 {
 		t.Fatalf("registers = %d, want a run once the last one is older than %v", got, reestablishCoalesce)
+	}
+}
+
+// The heartbeat's own reconnect and re-registration (trustRepublishLoop)
+// take reestablishMu too, so they cannot replace or use the registry
+// connection under a recovery's requests either: while a recovery holds the
+// mutex they wait for it.
+func TestHeartbeatRegistryCallsWaitForARecovery(t *testing.T) {
+	t.Parallel()
+	var log registryLog
+	addr, stop := serveFakeRegistry(t, func(req map[string]interface{}) map[string]interface{} {
+		typ, _ := req["type"].(string)
+		log.add(typ)
+		if typ == "register" {
+			return registerOK("")
+		}
+		return map[string]interface{}{"type": "ok"}
+	})
+	defer stop()
+	d := newRegistryTestDaemon(t, addr, Config{})
+
+	for _, call := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"reconnect", d.reconnectRegistrySerialised},
+		{"re-register", d.reRegisterSerialised},
+	} {
+		before := d.reg()
+		registers := log.get("register")
+		d.reestablishMu.Lock() // a recovery in progress
+		done := make(chan error, 1)
+		go func() { done <- call.fn() }()
+		select {
+		case err := <-done:
+			d.reestablishMu.Unlock()
+			t.Fatalf("heartbeat %s ran while a recovery held the lock (err %v)", call.name, err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if d.reg() != before || log.get("register") != registers {
+			d.reestablishMu.Unlock()
+			t.Fatalf("heartbeat %s touched the registry while a recovery held the lock", call.name)
+		}
+		d.reestablishMu.Unlock()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("heartbeat %s: %v", call.name, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("heartbeat %s never ran once the recovery let go", call.name)
+		}
 	}
 }

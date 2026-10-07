@@ -268,9 +268,9 @@ type reestablishOpts struct {
 	endpointOnly bool
 	// always runs even right after another run. Without it the call is
 	// skipped when a run the registry accepted finished less than
-	// reestablishCoalesce ago, since that run did the same work. The address
-	// watcher sets it: a run that started before our address changed
-	// registered the old one.
+	// reestablishCoalesce ago and did at least the same work: a full
+	// re-registration for a full caller. The address watcher sets it: a run
+	// that started before our address changed registered the old one.
 	always bool
 }
 
@@ -291,7 +291,8 @@ func (d *Daemon) reestablishTransport(cause string, o reestablishOpts) bool {
 	// Wall clock, not the monotonic one: on Linux the monotonic clock stops
 	// while the host is suspended, so a run from just before a suspend would
 	// look recent to the resume handler.
-	if age := time.Now().UnixNano() - d.reestablishOKWall; !o.always && d.reestablishOKWall != 0 &&
+	covered := o.endpointOnly || d.reestablishOKFull
+	if age := time.Now().UnixNano() - d.reestablishOKWall; !o.always && covered && d.reestablishOKWall != 0 &&
 		age >= 0 && age < int64(reestablishCoalesce) {
 		slog.Info("transport re-established moments ago — not repeating it", "cause", cause,
 			"age", time.Duration(age).Truncate(time.Millisecond).String())
@@ -316,6 +317,7 @@ func (d *Daemon) reestablishTransport(cause string, o reestablishOpts) bool {
 		return false // registerEndpoint logs what the registry answered
 	}
 	d.reestablishOKWall = time.Now().UnixNano()
+	d.reestablishOKFull = !o.endpointOnly
 	return true
 }
 

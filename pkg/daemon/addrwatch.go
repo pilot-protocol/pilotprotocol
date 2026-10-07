@@ -49,7 +49,8 @@ import (
 // another one, which may be reached over another route (a private bootstrap
 // beacon beside public ones) or see us at another public IP (a NAT that picks
 // the public address per destination, dual WAN). A beacon switch therefore
-// starts both baselines over instead of reading as a move.
+// starts both baselines over instead of reading as a move. A local change
+// still waiting to be announced at that moment is kept and still runs.
 //
 // Recovery (recoverFromAddrChange), in the order that matters for latency:
 //  1. beacon: re-register, so relay delivery and hole-punching use the new
@@ -73,7 +74,10 @@ import (
 // then one every two minutes; a NAT whose public IP keeps flapping costs one
 // an hour. A change seen during the cooldown is not lost: it runs when the
 // cooldown ends, unless the address has gone back to the one already
-// announced.
+// announced. The gaps are measured on the wall clock (addrWatchNow), so time
+// the host spends asleep counts.
+//
+// -no-addr-watch (Config.DisableAddrWatch) turns the watcher off.
 const (
 	// addrWatchPollInterval is how often the source address is sampled.
 	addrWatchPollInterval = time.Second
@@ -132,7 +136,8 @@ const (
 // made by its methods on values handed in, so tests drive it without real
 // interfaces or clocks.
 type addrWatchState struct {
-	beacon string // the beacon both baselines were taken against ("" = none)
+	beacon     string       // the beacon both baselines were taken against ("" = none)
+	beaconAddr *net.UDPAddr // the same beacon, for one last sample on its route at a switch
 
 	local     string // source address seen on the latest sample with a route
 	announced string // local address the last recovery announced (or the baseline)
@@ -156,16 +161,22 @@ type addrBackoff struct {
 }
 
 // noteBeacon records which beacon this tick's inputs come from. On a switch
-// both baselines start over: the new beacon may be reached from another local
-// address and see us at another public IP without anything having moved. A
-// change still owed from before the switch goes with them; the switch itself
-// registered us with the new beacon.
+// the baselines start over: the new beacon may be reached from another local
+// address and see us at another public IP without anything having moved.
+//
+// A local change that is still waiting to be announced is kept, though:
+// one deferred by the cooldown, or one the caller's last sample on the old
+// route has just seen. Our address really did change, and the beacon switch
+// tells the peers and the registry nothing. It runs when it is due and
+// announces whatever address the new route uses by then.
 func (st *addrWatchState) noteBeacon(beacon string) {
 	if beacon == st.beacon {
 		return
 	}
 	st.beacon = beacon
-	st.local, st.announced = "", ""
+	if st.local == st.announced {
+		st.local, st.announced = "", ""
+	}
 	st.observed, st.observedCurrent = "", ""
 	st.confirmAskedFor, st.lastConfirm = time.Time{}, time.Time{}
 }
@@ -210,7 +221,7 @@ func (st *addrWatchState) wantConfirm(latest beaconObservation, now time.Time) b
 		latest.endpoint.IP.String() == st.observedCurrent || latest.at.Equal(st.confirmAskedFor) {
 		return false
 	}
-	if !st.lastConfirm.IsZero() && now.Sub(st.lastConfirm) < addrObservedConfirmGap {
+	if recentlyAt(st.lastConfirm, now, addrObservedConfirmGap) {
 		return false
 	}
 	st.confirmAskedFor, st.lastConfirm = latest.at, now
@@ -267,13 +278,25 @@ func (st *addrWatchState) due(now time.Time) (reason string, ok bool) {
 	if reason == "" {
 		return "", false
 	}
-	if !st.lastRecover.IsZero() && now.Sub(st.lastRecover) < addrRecoverCooldown {
+	if recentlyAt(st.lastRecover, now, addrRecoverCooldown) {
 		return "", false
 	}
-	if b := st.gapFor(reason); !b.last.IsZero() && now.Sub(b.last) < st.cooldown(reason) {
+	if b := st.gapFor(reason); recentlyAt(b.last, now, st.cooldown(reason)) {
 		return "", false
 	}
 	return reason, true
+}
+
+// recentlyAt reports whether t is set and less than d before now. The
+// watcher runs on the wall clock (addrWatchNow), which can be stepped back;
+// a t that lies ahead of now says nothing about how long ago it was, so it
+// does not hold anything back.
+func recentlyAt(t, now time.Time, d time.Duration) bool {
+	if t.IsZero() {
+		return false
+	}
+	since := now.Sub(t)
+	return since >= 0 && since < d
 }
 
 // began marks a recovery for reason as started at now, and returns the
@@ -362,6 +385,9 @@ func (d *Daemon) addrWatchSource() addrSourceFn {
 }
 
 func (d *Daemon) addrWatchLoop() {
+	if d.config.DisableAddrWatch {
+		return
+	}
 	// A compat-mode daemon has no UDP socket and no direct paths: all its
 	// traffic rides one WSS connection to the beacon, which reconnects on
 	// its own when the address under it changes.
@@ -377,10 +403,19 @@ func (d *Daemon) addrWatchLoop() {
 		case <-d.stopCh:
 			return
 		case <-ticker.C:
-			d.addrWatchTick(st, src, time.Now())
+			d.addrWatchTick(st, src, addrWatchNow())
 		}
 	}
 }
+
+// addrWatchNow is the watcher's clock: the wall clock, with the monotonic
+// reading stripped. Go measures the time between two readings that both
+// carry a monotonic reading on the monotonic clock, and on Linux that clock
+// does not advance while the host is suspended. A laptop that recovered,
+// slept for an hour and woke on a new network would still be "inside" its
+// 10 s cooldown, and its backoff would never see the quiet hour; a host
+// waking somewhere else is exactly when the watcher matters.
+func addrWatchNow() time.Time { return time.Now().Round(0) }
 
 // addrWatchTick takes one sample and runs a recovery if one is due.
 // Extracted for testability — production drives it from addrWatchLoop.
@@ -397,7 +432,16 @@ func (d *Daemon) addrWatchTick(st *addrWatchState, src addrSourceFn, now time.Ti
 	if beacon != nil {
 		beaconKey = beacon.String()
 	}
-	st.noteBeacon(beaconKey)
+	if beaconKey != st.beacon {
+		// One more sample on the old route before the baselines start
+		// over: a move in the same second as the switch shows up there,
+		// and noteBeacon keeps it as a change still to announce.
+		if st.announced != "" {
+			st.noteLocal(src(st.beaconAddr))
+		}
+		st.noteBeacon(beaconKey)
+		st.beaconAddr = beacon
+	}
 	ip, ok := src(beacon)
 	st.noteLocal(ip, ok)
 	latest, prev := d.tunnels.beaconObservations()

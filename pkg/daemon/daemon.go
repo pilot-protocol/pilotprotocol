@@ -198,6 +198,14 @@ type Config struct {
 	// full daemon restart. Default false (watchdog on).
 	DisablePathWatch bool
 
+	// DisableAddrWatch turns off the own-address watcher (addrwatch.go).
+	// The watcher notices this host's IP address changing under the daemon
+	// (or the public IP the beacon sees it at) and re-announces the node to
+	// the beacon, the registry and every tunnel peer at once, instead of
+	// leaving peers to find the new address through their own timeouts.
+	// Default false (watcher on).
+	DisableAddrWatch bool
+
 	// Telemetry consent gate. When set to the telemetry endpoint URL,
 	// the daemon initialises a telemetry client that emits signed events
 	// (install, usage, view, review). When empty (default), the client
@@ -439,13 +447,17 @@ type Daemon struct {
 	// signature) from "whole network unreachable" (restart just loops).
 	lastRegistryOKNano atomic.Int64
 
-	// reestablishMu serialises reestablishTransport: the resume handler,
-	// the rx watchdog and the address watcher can all want it at once, and
-	// one caller's forceReconnectRegistry closes the connection another is
-	// mid-request on. reestablishOKWall (wall-clock unix nanos, under the
-	// mutex) is when the last run the registry accepted finished.
+	// reestablishMu serialises registry reconnects and re-registrations:
+	// reestablishTransport (the resume handler, the rx watchdog and the
+	// address watcher) and the heartbeat's own in trustRepublishLoop. They
+	// can all want one at once, and one caller's forceReconnectRegistry
+	// closes the connection another is mid-request on. reestablishOKWall
+	// (wall-clock unix nanos, under the mutex) is when the last
+	// reestablishTransport run the registry accepted finished, and
+	// reestablishOKFull whether it was a full re-registration.
 	reestablishMu     sync.Mutex
 	reestablishOKWall int64
+	reestablishOKFull bool
 
 	// lastDialOKNano / consecutiveDialTimeouts feed the rx watchdog's
 	// PARTIAL-wedge detector. A daemon can be "up" with rx trickling —
@@ -5715,7 +5727,7 @@ func (d *Daemon) trustRepublishLoop() {
 				if errors.Is(err, errRegistryCallTimedOut) {
 					slog.Warn("heartbeat timed out — registry connection likely half-open, forcing reconnect",
 						"consecutive_failures", consecutiveFailures, "deadline", registryCallDeadline)
-					if rcErr := d.forceReconnectRegistry(); rcErr != nil {
+					if rcErr := d.reconnectRegistrySerialised(); rcErr != nil {
 						slog.Warn("registry force-reconnect failed", "error", rcErr)
 					} else {
 						consecutiveFailures = HeartbeatReregThresh
@@ -5736,7 +5748,7 @@ func (d *Daemon) trustRepublishLoop() {
 					time.Sleep(reregBackoff + jitter)
 
 					slog.Info("attempting re-registration", "backoff", reregBackoff)
-					d.reRegister()
+					_ = d.reRegisterSerialised() // logs its own failure; the next heartbeat tells
 					consecutiveFailures = 0
 
 					// Exponential backoff: 100ms → 200ms → 400ms → ... → 30s max.
@@ -5755,6 +5767,22 @@ func (d *Daemon) trustRepublishLoop() {
 			}
 		}
 	}
+}
+
+// reconnectRegistrySerialised and reRegisterSerialised are the heartbeat's
+// own registry reconnect and re-registration, under reestablishMu like the
+// recoveries' (reestablishTransport): run at the same time as one, either
+// would replace or use the registry connection under the other's requests.
+func (d *Daemon) reconnectRegistrySerialised() error {
+	d.reestablishMu.Lock()
+	defer d.reestablishMu.Unlock()
+	return d.forceReconnectRegistry()
+}
+
+func (d *Daemon) reRegisterSerialised() error {
+	d.reestablishMu.Lock()
+	defer d.reestablishMu.Unlock()
+	return d.reRegister()
 }
 
 // tunnelKeepaliveLoop (L4) refreshes the daemon's beacon registration so the

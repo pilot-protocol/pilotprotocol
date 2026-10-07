@@ -5,6 +5,7 @@ package daemon
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -900,5 +901,121 @@ func TestRecoverFromAddrChangeRepeatsBeaconRegistrationAfterTheBeaconLimit(t *te
 	}
 	if since := time.Since(start); since < addrBeaconReregisterDelay {
 		t.Fatalf("repeat registration %v after the start, want it after %v (the beacon would drop it)", since, addrBeaconReregisterDelay)
+	}
+}
+
+// -no-addr-watch (Config.DisableAddrWatch) keeps the watcher from running at
+// all; without it the loop runs until the daemon stops.
+func TestAddrWatchLoopHonoursDisableAddrWatch(t *testing.T) {
+	t.Parallel()
+	d := newAddrWatchTestDaemon()
+	d.config.DisableAddrWatch = true
+	done := make(chan struct{})
+	go func() { d.addrWatchLoop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("addrWatchLoop ran with DisableAddrWatch set")
+	}
+
+	d = newAddrWatchTestDaemon()
+	done = make(chan struct{})
+	go func() { d.addrWatchLoop(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("addrWatchLoop returned at once without DisableAddrWatch")
+	case <-time.After(1500 * time.Millisecond):
+	}
+	close(d.stopCh)
+	<-done
+}
+
+// A move to .5, then to .6 inside the cooldown, then a beacon switch: the
+// switch starts the baselines over, but .6 was never announced and must
+// still be once the cooldown ends.
+func TestAddrWatchChangeDeferredByCooldownSurvivesBeaconSwitch(t *testing.T) {
+	ok := true
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	src := &fakeAddrSource{ip: "10.0.0.4", ok: true}
+	st := &addrWatchState{}
+	now := time.Now()
+	at := func(sec int) time.Time { return now.Add(time.Duration(sec) * time.Second) }
+	d.addrWatchTick(st, src.fn, at(0))
+
+	src.ip = "10.0.0.5"
+	d.addrWatchTick(st, src.fn, at(1)) // announces .5
+	src.ip = "10.0.0.6"
+	d.addrWatchTick(st, src.fn, at(2)) // deferred by the cooldown
+	d.tunnels.routing.SetBeaconAddrUDP(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 9001})
+	for i := 3; i < 120; i++ {
+		d.addrWatchTick(st, src.fn, at(i))
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("recoveries = %d, want 2 (.5, then .6 once the cooldown ended): %+v", len(*calls), *calls)
+	}
+	if c := (*calls)[1]; c.reason != addrReasonLocal || c.previous != "10.0.0.5" || c.current != "10.0.0.6" {
+		t.Fatalf("second recovery = %+v, want .5 -> .6", c)
+	}
+}
+
+// A move and a beacon switch in the same tick: the old route shows the move,
+// so the switch does not swallow it as a new baseline.
+func TestAddrWatchMoveInTheSameTickAsABeaconSwitchRuns(t *testing.T) {
+	ok := true
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	src := &fakeAddrSource{ip: "10.0.0.4", ok: true}
+	st := &addrWatchState{}
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		d.addrWatchTick(st, src.fn, now.Add(time.Duration(i)*time.Second))
+	}
+
+	src.ip = "10.0.0.77"
+	d.tunnels.routing.SetBeaconAddrUDP(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 9001})
+	if !d.addrWatchTick(st, src.fn, now.Add(5*time.Second)) {
+		t.Fatal("a move in the same tick as a beacon switch did not run a recovery")
+	}
+	for i := 6; i < 120; i++ {
+		d.addrWatchTick(st, src.fn, now.Add(time.Duration(i)*time.Second))
+	}
+	if len(*calls) != 1 || (*calls)[0].previous != "10.0.0.4" || (*calls)[0].current != "10.0.0.77" {
+		t.Fatalf("calls = %+v, want one .4 -> .77 recovery", *calls)
+	}
+}
+
+// The watcher's cooldowns must count the time the host spent asleep. Go
+// takes the difference of two readings that both carry a monotonic reading
+// on the monotonic clock, which on Linux stops during suspend. A test cannot
+// suspend the host, so this checks the clock the loop hands addrWatchTick:
+// it must carry no monotonic reading, which makes every gap the watcher
+// measures a wall-clock one.
+func TestAddrWatchClockIsTheWallClock(t *testing.T) {
+	t.Parallel()
+	if s := addrWatchNow().String(); strings.Contains(s, " m=") {
+		t.Fatalf("addrWatchNow() = %s carries a monotonic reading; a cooldown would not count a suspend", s)
+	}
+}
+
+// The wall clock can be stepped back (NTP, a VM restored from a snapshot).
+// A last recovery that now lies in the future says nothing about how long
+// ago it was, and must not hold a real change back until the clock catches
+// up.
+func TestAddrWatchClockSteppedBackDoesNotBlockRecovery(t *testing.T) {
+	ok := true
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	src := &fakeAddrSource{ip: "10.0.0.4", ok: true}
+	st := &addrWatchState{}
+	now := time.Now().Round(0)
+	d.addrWatchTick(st, src.fn, now)
+	src.ip = "10.0.0.5"
+	d.addrWatchTick(st, src.fn, now.Add(time.Second))
+
+	stepped := now.Add(-time.Hour)
+	src.ip = "10.0.0.6"
+	if !d.addrWatchTick(st, src.fn, stepped) {
+		t.Fatalf("a change after the clock stepped back an hour waited: %+v", *calls)
 	}
 }

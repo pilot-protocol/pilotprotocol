@@ -529,10 +529,13 @@ Detailed per-release notes are on the
     nothing, and neither does an unrelated interface appearing (a Docker
     bridge, a VPN that does not take the route), nor a switch to another
     beacon by the beacon-list refresh, which may be reached over another
-    route: the comparison starts over with the new beacon. Recoveries are at
+    route: the comparison starts over with the new beacon (a change still
+    waiting to be announced at that moment still runs). Recoveries are at
     least 10 s apart, and the gap doubles up to 2 minutes while changes keep
     coming, so a flapping interface cannot flood the registry; a change seen
     during the gap runs when the gap ends, unless the address has gone back.
+    The gaps are measured on the wall clock, so time asleep counts toward
+    them.
   - Behind NAT the local address does not change when the public one does.
     The daemon also reads the address the beacon reports seeing it at (the
     reply to its beacon registration, every keepalive interval, 60 s by
@@ -545,8 +548,10 @@ Detailed per-release notes are on the
     path has unit tests only; it was not exercised against a real NAT.
   - A host waking from sleep on a new network no longer has its two
     recoveries (wake and address change) abort each other's registry calls:
-    re-registrations run one at a time, and the wake or rx-watchdog
-    recovery is skipped when one succeeded in the last 5 s.
+    registry reconnects and re-registrations, the heartbeat's included, run
+    one at a time, and the wake or rx-watchdog recovery is skipped when a
+    full re-registration succeeded in the last 5 s.
+  - `-no-addr-watch` (config.json `no_addr_watch`) turns the watcher off.
   - Publishes `tunnel.addr_changed` (`reason`: `local_address`,
     `observed_endpoint` or `registry_retry`; `previous` and `current`: the
     local address, or for `observed_endpoint` the IP the beacon sees;
