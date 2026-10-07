@@ -456,6 +456,15 @@ Detailed per-release notes are on the
     one per 5s after that, whatever arrives.
   An idle node still makes one poll per minute, as before. Nodes and
   servers that are not updated keep working at the old pace for their part.
+- **Dial timeouts while other dials succeed no longer read as a wedged
+  transport.** The watchdog's `outbound-dial-wedged` check counted every
+  dial timeout, so a burst of parallel sends to one peer whose SYN limiter
+  dropped some of them (`dial_timeouts=32`) made a healthy node re-register
+  with the beacon and registry, and could escalate to a restart. A timeout
+  is no longer counted when another dial completed while it ran: that dial's
+  SYN-ACK shows the outbound path was working. Traffic merely received from
+  the peer does not count as evidence, because a node whose outbound path is
+  dead still receives its peers' keepalives.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's

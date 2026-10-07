@@ -451,7 +451,12 @@ type Daemon struct {
 	// it. consecutiveDialTimeouts counts back-to-back dial timeouts
 	// (reset to 0 on any successful dial); a run of them to distinct
 	// peers means our outbound path is wedged, not that one peer is dead.
+	// A timeout is not counted when another dial succeeded while it ran
+	// (see dialConnectionLocked): dialOKSeq counts completed dials, and a
+	// dial compares it with the count it saw when it started. A counter,
+	// not lastDialOKNano, so a wall-clock step cannot hide timeouts.
 	lastDialOKNano          atomic.Int64
+	dialOKSeq               atomic.Uint64
 	consecutiveDialTimeouts atomic.Uint64
 
 	startTime       time.Time
@@ -3897,6 +3902,7 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	dialsOKAtStart := d.dialOKSeq.Load()
 
 	// Enforce outbound port policy: prevent dialing ports blocked by the network
 	if !d.evaluatePortPolicy(PolicyEventDial, dstAddr.Network, dstPort, dstAddr.Node, 0, "") {
@@ -4088,6 +4094,7 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 			// A completed handshake proves the outbound path is alive —
 			// clears the rx-watchdog's partial-wedge signal.
 			d.lastDialOKNano.Store(time.Now().UnixNano())
+			d.dialOKSeq.Add(1)
 			d.consecutiveDialTimeouts.Store(0)
 			return conn, nil, true
 		}
@@ -4196,7 +4203,19 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 				// Full direct+relay retry budget exhausted with no SYN-ACK.
 				// Feeds the rx-watchdog's partial-wedge detector: a run of
 				// these to distinct peers means our outbound is wedged.
-				d.consecutiveDialTimeouts.Add(1)
+				// Not when another dial completed while this one ran: that
+				// SYN reached its peer and the SYN-ACK came back, so our
+				// outbound path worked during this dial and this one was
+				// declined (a peer's SYN limiter under a burst of our own
+				// dials, a full accept path). Traffic merely received from
+				// the peer is no evidence — its keepalives still arrive
+				// when it is our outbound path that is dead.
+				if d.dialOKSeq.Load() != dialsOKAtStart {
+					slog.Debug("dial timed out while another dial succeeded; not counted as a transport wedge",
+						"peer_node_id", dstAddr.Node, "dst_port", dstPort)
+				} else {
+					d.consecutiveDialTimeouts.Add(1)
+				}
 				if keyMissing {
 					// Not one SYN left this node: the peer never completed
 					// the key exchange. Say so, so callers can tell "busy
