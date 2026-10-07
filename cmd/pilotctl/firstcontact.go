@@ -168,19 +168,27 @@ func dialFailureHint(target string, err error, attempts int, elapsed time.Durati
 //     ID). The oldest such message from the peer is taken, as before IDs
 //     existed. Two concurrent requests to such a peer, or anything else it
 //     sends in the window, still cannot be told apart.
-//   - When our request reached the receiver with its ID (markTagged), an
-//     untagged message can also be the answer to someone else's untagged
-//     request to a peer that does echo IDs, with our own tagged reply still
-//     on its way. So it is held for untaggedReplyGrace first, and taken only
-//     if no reply naming our request arrives meanwhile (or when the wait
-//     ends). Once the peer has been seen naming another request in
-//     reply_to during this wait, it evidently echoes IDs, and only a reply
-//     naming ours is taken.
+//   - From a peer known to echo IDs, an untagged message can instead be the
+//     answer to someone else's untagged request, with our own tagged reply
+//     still on its way. A peer is known to echo when one of its earlier
+//     messages in the inbox carries a reply_to (peerEchoedBefore). If our
+//     request reached the receiver with its ID (markTagged), an untagged
+//     message from such a peer is held for untaggedReplyGrace first, and
+//     taken only if no reply naming our request arrives meanwhile (or when
+//     the wait ends). Holding replies from peers with no such history would
+//     only delay them: no service responder echoes IDs yet.
+//   - Once the peer has been seen naming another request in reply_to during
+//     this wait, it evidently echoes IDs, and only a reply naming ours is
+//     taken.
 type inboxWatch struct {
 	dir    string
 	from   string
 	cutoff time.Time
 	seen   map[string]bool
+
+	// echoedBefore is set by newInboxWatch and only read afterwards: an
+	// earlier message from the peer in the inbox carries a reply_to.
+	echoedBefore bool
 
 	mu     sync.Mutex
 	ids    map[string]bool // message IDs of our request (and of its re-send)
@@ -192,13 +200,22 @@ type inboxWatch struct {
 	heldSince  time.Time
 }
 
-// untaggedReplyGrace is how long an untagged message from the peer is held
-// back, after our request reached the receiver with its ID, in case the
-// reply that names our request follows. A peer that does not echo IDs
-// (every service responder today) has its reply delayed by this much; a
-// peer that echoes them is not delayed at all. The send-message help
-// quotes this value.
+// untaggedReplyGrace is how long an untagged message from a peer known to
+// echo IDs is held back, after our request reached the receiver with its
+// ID, in case the reply that names our request follows. Replies from such
+// a peer normally name our request and are not delayed at all. The
+// send-message help quotes this value.
 const untaggedReplyGrace = 750 * time.Millisecond
+
+// The look for a peer's echo history reads at most echoHistoryFiles of the
+// newest inbox records, and stops after echoHistoryPeerRecords of them from
+// the peer: the sender is only known once a record is read, and a big inbox
+// must not slow the send. A peer whose last reply_to lies further back is
+// treated as not echoing, which is how every peer was treated before.
+const (
+	echoHistoryPeerRecords = 200
+	echoHistoryFiles       = 1000
+)
 
 func inboxDirPath() (string, error) {
 	home, err := os.UserHomeDir()
@@ -221,8 +238,60 @@ func newInboxWatch(from string) *inboxWatch {
 		for _, e := range entries {
 			w.seen[e.Name()] = true
 		}
+		w.echoedBefore = peerEchoedBefore(dir, entries, from)
 	}
 	return w
+}
+
+// inboxNameKey orders inbox files by arrival. Their names are
+// {TYPE}-{timestamp}-{seq}.json, so the part after the type sorts by time
+// whatever the message types.
+func inboxNameKey(name string) string {
+	if i := strings.Index(name, "-"); i >= 0 {
+		return name[i:]
+	}
+	return name
+}
+
+// peerEchoedBefore reports whether one of the newest records in entries
+// (the inbox at dir) from peer carries a reply_to: the peer has answered a
+// message by naming its ID, so it is known to echo IDs. The scan is bounded
+// by echoHistoryFiles and echoHistoryPeerRecords.
+func peerEchoedBefore(dir string, entries []os.DirEntry, peer string) bool {
+	if peer == "" {
+		return false
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Slice(names, func(i, j int) bool { return inboxNameKey(names[i]) > inboxNameKey(names[j]) })
+	if len(names) > echoHistoryFiles {
+		names = names[:echoHistoryFiles]
+	}
+	fromPeer := 0
+	for _, name := range names {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		var rec struct {
+			From    string `json:"from"`
+			ReplyTo string `json:"reply_to"`
+		}
+		if json.Unmarshal(body, &rec) != nil || rec.From != peer {
+			continue
+		}
+		if rec.ReplyTo != "" {
+			return true
+		}
+		if fromPeer++; fromPeer == echoHistoryPeerRecords {
+			break
+		}
+	}
+	return false
 }
 
 // addID registers the message ID of a request this watch waits on. The
@@ -241,8 +310,9 @@ func (w *inboxWatch) addID(id string) {
 
 // markTagged records that a request reached the receiver with its message
 // ID (SendResult.Tagged), so the peer can name it in reply_to. Until then
-// an untagged message is taken at once: a receiver that predates IDs
-// dropped ours, and its peer can never name our request.
+// an untagged message is taken at once even from a peer known to echo: a
+// receiver that predates IDs dropped ours, and the peer can never name our
+// request.
 func (w *inboxWatch) markTagged() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -293,16 +363,8 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 		}
 		return nil, fmt.Errorf("read inbox: %w", err)
 	}
-	// Inbox files are {TYPE}-{timestamp}-{seq}.json: order by the part
-	// after the type so the oldest new message wins.
-	sort.Slice(entries, func(i, j int) bool {
-		ni, nj := entries[i].Name(), entries[j].Name()
-		di, dj := strings.Index(ni, "-"), strings.Index(nj, "-")
-		if di < 0 || dj < 0 {
-			return ni < nj
-		}
-		return ni[di:] < nj[dj:]
-	})
+	// Oldest first, so the oldest new message wins.
+	sort.Slice(entries, func(i, j int) bool { return inboxNameKey(entries[i].Name()) < inboxNameKey(entries[j].Name()) })
 	var untagged map[string]interface{}
 	for _, e := range entries {
 		if e.IsDir() || w.seen[e.Name()] {
@@ -343,10 +405,11 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 
 // untaggedReply decides whether msg, the oldest untagged message from the
 // peer (nil if there is none), is taken as the reply now. It is when our
-// request went out without its ID. Otherwise it is held back for
-// untaggedReplyGrace from the poll that first saw it, so a reply naming
-// our request that arrives meanwhile wins; and it is never taken from a
-// peer seen echoing IDs.
+// request went out without its ID, or when the peer is not known to echo
+// IDs (as before IDs existed). From a peer with an echo history it is held
+// back for untaggedReplyGrace from the poll that first saw it, so a reply
+// naming our request that arrives meanwhile wins; and it is never taken
+// from a peer seen naming another request during this wait.
 func (w *inboxWatch) untaggedReply(msg map[string]interface{}, now time.Time) map[string]interface{} {
 	if msg == nil {
 		w.held = nil
@@ -355,7 +418,7 @@ func (w *inboxWatch) untaggedReply(msg map[string]interface{}, now time.Time) ma
 	w.mu.Lock()
 	tagged := w.tagged
 	w.mu.Unlock()
-	if !tagged {
+	if !tagged || !w.echoedBefore && !w.peerEchoes {
 		return msg
 	}
 	if w.held == nil {

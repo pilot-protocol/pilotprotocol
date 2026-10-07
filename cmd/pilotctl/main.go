@@ -926,9 +926,10 @@ Flags:
 
 Every message is sent with a new message ID (message_id in the --json result).
 --wait takes the message from the peer whose reply_to is that ID, and never one
-whose reply_to names another message. A peer that does not echo the ID is
-matched by sender and arrival time, as before; its reply is held back up to
-0.75s in case a reply naming the ID follows.
+whose reply_to names another message. A reply without reply_to is matched by
+sender and arrival time, as before. From a peer known to echo IDs (one of its
+earlier messages in the inbox carries a reply_to) such a reply is held back up
+to 0.75s in case the reply naming the ID follows.
 
 Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
@@ -2519,7 +2520,7 @@ func contextCatalog() map[string]interface{} {
 			// Messaging
 			"send-message": map[string]interface{}{
 				"args":        []string{"<address|hostname>", "--data <text> | --data - | --data-file <path>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]", "[--reply-to <message_id>]"},
-				"description": "Send a typed message to a node via data exchange (port 1001). --data - reads the payload from stdin, --data-file from a file (up to 64 MiB; a command-line argument is capped by the OS). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Fails unless every message is acknowledged. Default type: text. Every message carries a new message_id; --wait returns the reply whose reply_to names it (or, from a peer that does not echo IDs, the next message from the peer); --reply-to <message_id> answers a received message",
+				"description": "Send a typed message to a node via data exchange (port 1001). --data - reads the payload from stdin, --data-file from a file (up to 64 MiB; a command-line argument is capped by the OS). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Fails unless every message is acknowledged. Default type: text. Every message carries a new message_id; --wait returns the reply whose reply_to names it, or else the next message from the peer without reply_to (held up to 0.75s if the peer is known to echo IDs); --reply-to <message_id> answers a received message",
 				"returns":     "target, to, type, bytes, ack, reuse_conn, message_id, tagged, reply_to, reply",
 			},
 			"send-file": map[string]interface{}{

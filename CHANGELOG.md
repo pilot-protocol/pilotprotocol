@@ -37,14 +37,16 @@ Detailed per-release notes are on the
   inbox record). A reply whose `reply_to` is that ID is matched exactly, and
   a message whose `reply_to` names another request is never taken. Exact
   matching needs the responder to echo the request's `message_id` as
-  `reply_to`, which no service responder does yet: an untagged reply still
-  works and is matched by sender and arrival time as before, so for such
-  responders concurrent waits can still be crossed. An untagged message is
-  held back up to 0.75 s in case the reply naming the request follows, which
-  delays replies from those responders by that much; once the peer has been
-  seen naming another request in `reply_to`, only a reply naming ours is
-  taken. New flag `--reply-to <message_id>` sends a message as the answer to
-  a received one (an inbox file id is looked up; a bare flag is refused).
+  `reply_to`, which no service responder does yet. An untagged reply still
+  works: it is matched by sender and arrival time and taken as soon as it
+  arrives, as before, so for such responders concurrent waits can still be
+  crossed. From a peer known to echo IDs (one of its newest messages in the
+  inbox carries a `reply_to`) an untagged message is held back up to 0.75 s
+  in case the reply naming the request follows, and once the peer has been
+  seen naming another request in `reply_to` during the wait, only a reply
+  naming ours is taken. New flag `--reply-to <message_id>` sends a message
+  as the answer to a received one (an inbox file id is looked up; a bare
+  flag is refused).
   `pilotctl inbox` now shows each message's `message_id` and `reply_to`, in
   the listing and with `--json` (new fields; `id` is still the file name).
   A first-contact re-send uses an ID of its own (the receiver would drop a

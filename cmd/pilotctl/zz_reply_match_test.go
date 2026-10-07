@@ -389,12 +389,47 @@ func TestSendMessageRejectsInvalidReplyTo(t *testing.T) {
 
 // ── an untagged message ahead of our tagged reply ─────────────────────────
 
-// Our request reached the receiver with its ID, and the peer echoes IDs.
-// First comes an untagged message from the peer (its answer to an untagged
-// request another client on this host sent it), then, 400 ms later, the
-// reply that names our request. The untagged one used to be taken at once.
+// storeEchoHistory puts an earlier answer from peer into the inbox, one
+// that named a request in reply_to: the peer is known to echo IDs. It has
+// to be there before the watch snapshots the inbox.
+func storeEchoHistory(t *testing.T, dir, peer string) {
+	t.Helper()
+	writeInboxRecord(t, dir, "TEXT-20260924-090000.000-000000.json", map[string]any{
+		"from": peer, "data": "an earlier answer", "reply_to": "an-earlier-request",
+	})
+}
+
+// A peer with no echo history (every service responder today) has its
+// untagged reply taken at once, even though our request was tagged. The
+// inbox holds an earlier message from the peer without reply_to, and one
+// from another peer with reply_to, which says nothing about this peer.
+func TestAwaitReplyTakesAnUntaggedReplyAtOnceFromAPeerWithNoEchoHistory(t *testing.T) {
+	dir := tempInbox(t)
+	writeInboxRecord(t, dir, "TEXT-20260924-090000.000-000000.json", map[string]any{"from": replyPeer, "data": "an earlier answer"})
+	storeEchoHistory(t, dir, "0:0000.0009.0001")
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	watch.markTagged()
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": replyPeer, "data": "the answer"})
+
+	start := time.Now()
+	out, err := awaitReply(watch, start, replyWait{wait: 5 * time.Second})
+	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
+		t.Fatalf("awaitReply = %+v, %v; want the untagged answer", out, err)
+	}
+	if el := time.Since(start); el >= untaggedReplyGrace/3 {
+		t.Fatalf("answer taken after %s; a peer with no echo history is not held back", el)
+	}
+}
+
+// Our request reached the receiver with its ID, and the peer is known to
+// echo IDs. First comes an untagged message from the peer (its answer to an
+// untagged request another client on this host sent it), then, 400 ms
+// later, the reply that names our request. The untagged one used to be
+// taken at once.
 func TestAwaitReplyHoldsAnUntaggedMessageForALaterTaggedReply(t *testing.T) {
 	dir := tempInbox(t)
+	storeEchoHistory(t, dir, replyPeer)
 	watch := newInboxWatch(replyPeer)
 	watch.addID("our-request")
 	watch.markTagged()
@@ -417,10 +452,11 @@ func TestAwaitReplyHoldsAnUntaggedMessageForALaterTaggedReply(t *testing.T) {
 	}
 }
 
-// A peer that does not echo IDs (every responder today) still has its reply
-// taken, once the grace period is over.
-func TestAwaitReplyTakesAnUntaggedReplyAfterTheGracePeriod(t *testing.T) {
+// From a peer known to echo IDs, an untagged reply is held for the grace
+// period, then taken when no reply naming our request came.
+func TestAwaitReplyHoldsAnUntaggedReplyFromAPeerThatEchoedBefore(t *testing.T) {
 	dir := tempInbox(t)
+	storeEchoHistory(t, dir, replyPeer)
 	watch := newInboxWatch(replyPeer)
 	watch.addID("our-request")
 	watch.markTagged()
@@ -440,6 +476,7 @@ func TestAwaitReplyTakesAnUntaggedReplyAfterTheGracePeriod(t *testing.T) {
 // held message is the reply rather than a timeout.
 func TestAwaitReplyTakesTheHeldMessageWhenTheWaitEnds(t *testing.T) {
 	dir := tempInbox(t)
+	storeEchoHistory(t, dir, replyPeer)
 	watch := newInboxWatch(replyPeer)
 	watch.addID("our-request")
 	watch.markTagged()
@@ -452,9 +489,11 @@ func TestAwaitReplyTakesTheHeldMessageWhenTheWaitEnds(t *testing.T) {
 }
 
 // A request delivered without its ID (a receiver that predates IDs) cannot
-// be named by any reply: an untagged message is taken at once, as before.
+// be named by any reply: an untagged message is taken at once, even from a
+// peer known to echo IDs.
 func TestAwaitReplyTakesAnUntaggedReplyAtOnceForAnUntaggedRequest(t *testing.T) {
 	dir := tempInbox(t)
+	storeEchoHistory(t, dir, replyPeer)
 	watch := newInboxWatch(replyPeer)
 	watch.addID("our-request")
 	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": replyPeer, "data": "the answer"})
@@ -464,14 +503,14 @@ func TestAwaitReplyTakesAnUntaggedReplyAtOnceForAnUntaggedRequest(t *testing.T) 
 	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
 		t.Fatalf("awaitReply = %+v, %v", out, err)
 	}
-	if el := time.Since(start); el >= untaggedReplyGrace {
+	if el := time.Since(start); el >= untaggedReplyGrace/3 {
 		t.Fatalf("answer taken after %s; an untagged request has nothing to wait for", el)
 	}
 }
 
-// A peer seen naming another request in reply_to echoes IDs, so an untagged
-// message from it is not the answer to our tagged request, not even when the
-// wait ends.
+// A peer seen naming another request in reply_to during the wait echoes
+// IDs, even with no history in the inbox, so an untagged message from it is
+// not the answer to our tagged request, not even when the wait ends.
 func TestAwaitReplyWantsATaggedReplyFromAPeerThatEchoesIDs(t *testing.T) {
 	dir := tempInbox(t)
 	watch := newInboxWatch(replyPeer)
@@ -490,9 +529,70 @@ func TestAwaitReplyWantsATaggedReplyFromAPeerThatEchoesIDs(t *testing.T) {
 	}
 }
 
-// The same through send-message: the receiver knows message IDs, so the
-// request is tagged; the peer's untagged message lands first and the reply
-// naming the request 400 ms later.
+// The look for echo history stops after the newest echoHistoryPeerRecords
+// records from the peer and the newest echoHistoryFiles records in all, so
+// a big inbox does not slow the send.
+func TestPeerEchoedBeforeIsBounded(t *testing.T) {
+	echoed := func(dir string) bool {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return peerEchoedBefore(dir, entries, replyPeer)
+	}
+	fill := func(dir, from string, n int) {
+		for i := 0; i < n; i++ {
+			writeInboxRecord(t, dir, fmt.Sprintf("TEXT-20260924-100000.000-%06d.json", i+1), map[string]any{"from": from, "data": "x"})
+		}
+	}
+
+	dir := t.TempDir()
+	storeEchoHistory(t, dir, replyPeer)
+	fill(dir, replyPeer, echoHistoryPeerRecords-1)
+	if !echoed(dir) {
+		t.Fatalf("echo record behind %d newer records from the peer not found", echoHistoryPeerRecords-1)
+	}
+	fill(dir, replyPeer, echoHistoryPeerRecords)
+	if echoed(dir) {
+		t.Fatalf("echo record behind %d newer records from the peer was read", echoHistoryPeerRecords)
+	}
+
+	dir = t.TempDir()
+	storeEchoHistory(t, dir, replyPeer)
+	fill(dir, "0:0000.0009.0001", echoHistoryFiles)
+	if echoed(dir) {
+		t.Fatalf("echo record behind %d newer files was read", echoHistoryFiles)
+	}
+}
+
+// Through send-message, to a peer with no echo history: the request is
+// tagged, and the peer's untagged reply is returned without a hold.
+func TestSendMessageWaitTakesAnUntaggedReplyAtOnceWithoutEchoHistory(t *testing.T) {
+	sd := newStreamDaemon(t)
+	home := sd.useDaemonNoRegistry(t)
+	inbox := filepath.Join(home, ".pilot", "inbox")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const peer = "0:0000.0000.002A"
+	newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+		writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": peer, "data": "pong"})
+		return "ACK TEXT 4 bytes"
+	})
+
+	data := sendMessageJSON(t, peer, "--data", "ping", "--wait", "5s")
+	reply, _ := data["reply"].(map[string]interface{})
+	if reply == nil || reply["data"] != "pong" || data["tagged"] != true {
+		t.Fatalf("result = %v; want the untagged pong for a tagged request", data)
+	}
+	if ms, _ := data["reply_after_ms"].(float64); ms >= float64(untaggedReplyGrace.Milliseconds()/3) {
+		t.Fatalf("reply taken after %v ms; a peer with no echo history is not held back", ms)
+	}
+}
+
+// The same through send-message, to a peer known to echo IDs: the request
+// is tagged; the peer's untagged message lands first and the reply naming
+// the request 400 ms later.
 func TestSendMessageWaitHoldsAnUntaggedMessageForItsTaggedReply(t *testing.T) {
 	sd := newStreamDaemon(t)
 	home := sd.useDaemonNoRegistry(t)
@@ -501,6 +601,7 @@ func TestSendMessageWaitHoldsAnUntaggedMessageForItsTaggedReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	const peer = "0:0000.0000.002A"
+	storeEchoHistory(t, inbox, peer)
 	written := make(chan struct{})
 	newDXReceiver(sd, func(_ uint32, _ []byte, f *dataexchange.Frame) string {
 		writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{
