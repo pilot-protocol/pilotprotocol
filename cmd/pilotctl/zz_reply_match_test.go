@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pilot-protocol/dataexchange"
 )
@@ -129,9 +130,13 @@ func TestInboxWatchWithoutIDsIgnoresReplyTo(t *testing.T) {
 
 // ── send-message against receivers of each generation ────────────────────
 
+// dxDropConnection, returned by a dxReceiver's answer, closes the connection
+// instead of acknowledging the frame: the sender's ack read fails.
+const dxDropConnection = "\x00drop"
+
 // dxReceiver turns the stream daemon's echo into a data-exchange receiver:
 // answer is called with each complete wire frame (its type and payload) the
-// client wrote and returns the acknowledgement text.
+// client wrote and returns the acknowledgement text (or dxDropConnection).
 type dxReceiver struct {
 	mu     sync.Mutex
 	buf    map[uint32][]byte
@@ -165,8 +170,16 @@ func newDXReceiver(sd *streamDaemon, answer func(ftype uint32, payload []byte, d
 			r.buf[connID] = b[8+n:]
 			r.types = append(r.types, ftype)
 			r.frames = append(r.frames, decoded)
+			text := answer(ftype, payload, decoded)
+			if text == dxDropConnection {
+				closed := make([]byte, 5)
+				closed[0] = tdCmdCloseOK
+				binary.BigEndian.PutUint32(closed[1:5], connID)
+				out = append(out, closed)
+				break
+			}
 			var ack bytes.Buffer
-			_ = dataexchange.WriteFrame(&ack, &dataexchange.Frame{Type: dataexchange.TypeText, Payload: []byte(answer(ftype, payload, decoded))})
+			_ = dataexchange.WriteFrame(&ack, &dataexchange.Frame{Type: dataexchange.TypeText, Payload: []byte(text)})
 			push := make([]byte, 5+ack.Len())
 			push[0] = tdCmdRecv
 			binary.BigEndian.PutUint32(push[1:5], connID)
@@ -372,4 +385,365 @@ func TestSendMessageRejectsInvalidReplyTo(t *testing.T) {
 			t.Errorf("--reply-to %q: %+v, want invalid_argument", bad, f)
 		}
 	}
+}
+
+// ── an untagged message ahead of our tagged reply ─────────────────────────
+
+// Our request reached the receiver with its ID, and the peer echoes IDs.
+// First comes an untagged message from the peer (its answer to an untagged
+// request another client on this host sent it), then, 400 ms later, the
+// reply that names our request. The untagged one used to be taken at once.
+func TestAwaitReplyHoldsAnUntaggedMessageForALaterTaggedReply(t *testing.T) {
+	dir := tempInbox(t)
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	watch.markTagged()
+
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{
+		"from": replyPeer, "data": "answer to another client's untagged request",
+	})
+	written := make(chan struct{})
+	defer func() { <-written }()
+	go func() {
+		defer close(written)
+		time.Sleep(400 * time.Millisecond)
+		writeInboxRecord(t, dir, "TEXT-20260924-100006.000-000002.json", map[string]any{
+			"from": replyPeer, "data": "our answer", "reply_to": "our-request",
+		})
+	}()
+	out, err := awaitReply(watch, time.Now(), replyWait{wait: 5 * time.Second})
+	if err != nil || out.reply == nil || out.reply["data"] != "our answer" {
+		t.Fatalf("awaitReply = %+v, %v; want the reply naming our request", out, err)
+	}
+}
+
+// A peer that does not echo IDs (every responder today) still has its reply
+// taken, once the grace period is over.
+func TestAwaitReplyTakesAnUntaggedReplyAfterTheGracePeriod(t *testing.T) {
+	dir := tempInbox(t)
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	watch.markTagged()
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": replyPeer, "data": "the answer"})
+
+	start := time.Now()
+	out, err := awaitReply(watch, start, replyWait{wait: 5 * time.Second})
+	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
+		t.Fatalf("awaitReply = %+v, %v; want the untagged answer", out, err)
+	}
+	if el := time.Since(start); el < untaggedReplyGrace || el > untaggedReplyGrace+time.Second {
+		t.Fatalf("answer taken after %s, want about %s", el, untaggedReplyGrace)
+	}
+}
+
+// The grace period never outlasts the wait: when the wait ends first, the
+// held message is the reply rather than a timeout.
+func TestAwaitReplyTakesTheHeldMessageWhenTheWaitEnds(t *testing.T) {
+	dir := tempInbox(t)
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	watch.markTagged()
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": replyPeer, "data": "the answer"})
+
+	out, err := awaitReply(watch, time.Now(), replyWait{wait: 300 * time.Millisecond})
+	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
+		t.Fatalf("awaitReply = %+v, %v; want the held answer when the wait ends", out, err)
+	}
+}
+
+// A request delivered without its ID (a receiver that predates IDs) cannot
+// be named by any reply: an untagged message is taken at once, as before.
+func TestAwaitReplyTakesAnUntaggedReplyAtOnceForAnUntaggedRequest(t *testing.T) {
+	dir := tempInbox(t)
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": replyPeer, "data": "the answer"})
+
+	start := time.Now()
+	out, err := awaitReply(watch, start, replyWait{wait: 5 * time.Second})
+	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
+		t.Fatalf("awaitReply = %+v, %v", out, err)
+	}
+	if el := time.Since(start); el >= untaggedReplyGrace {
+		t.Fatalf("answer taken after %s; an untagged request has nothing to wait for", el)
+	}
+}
+
+// A peer seen naming another request in reply_to echoes IDs, so an untagged
+// message from it is not the answer to our tagged request, not even when the
+// wait ends.
+func TestAwaitReplyWantsATaggedReplyFromAPeerThatEchoesIDs(t *testing.T) {
+	dir := tempInbox(t)
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	watch.markTagged()
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{
+		"from": replyPeer, "data": "answer to another request", "reply_to": "another-request",
+	})
+	writeInboxRecord(t, dir, "TEXT-20260924-100006.000-000002.json", map[string]any{
+		"from": replyPeer, "data": "answer to an untagged request",
+	})
+
+	out, err := awaitReply(watch, time.Now(), replyWait{wait: 1200 * time.Millisecond})
+	if err != nil || out.reply != nil {
+		t.Fatalf("awaitReply = %+v, %v; want no reply", out, err)
+	}
+}
+
+// The same through send-message: the receiver knows message IDs, so the
+// request is tagged; the peer's untagged message lands first and the reply
+// naming the request 400 ms later.
+func TestSendMessageWaitHoldsAnUntaggedMessageForItsTaggedReply(t *testing.T) {
+	sd := newStreamDaemon(t)
+	home := sd.useDaemonNoRegistry(t)
+	inbox := filepath.Join(home, ".pilot", "inbox")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const peer = "0:0000.0000.002A"
+	written := make(chan struct{})
+	newDXReceiver(sd, func(_ uint32, _ []byte, f *dataexchange.Frame) string {
+		writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{
+			"from": peer, "data": "answer to another client's untagged request",
+		})
+		go func() {
+			defer close(written)
+			time.Sleep(400 * time.Millisecond)
+			writeInboxRecord(t, inbox, "TEXT-20260924-100006.000-000002.json", map[string]any{
+				"from": peer, "data": "pong", "reply_to": f.MessageID,
+			})
+		}()
+		return "ACK TEXT 4 bytes"
+	})
+
+	data := sendMessageJSON(t, peer, "--data", "ping", "--wait", "5s")
+	<-written
+	reply, _ := data["reply"].(map[string]interface{})
+	if reply == nil || reply["data"] != "pong" || reply["reply_to"] != data["message_id"] {
+		t.Fatalf("reply = %v for message_id %v; want the answer to this request", reply, data["message_id"])
+	}
+}
+
+// ── --reply-to values ─────────────────────────────────────────────────────
+
+// withoutDaemon points pilotctl at a socket nobody listens on: a --reply-to
+// value that got past validation fails on connecting instead.
+func withoutDaemon(t *testing.T) {
+	t.Helper()
+	t.Setenv("PILOT_SOCKET", filepath.Join(t.TempDir(), "no-daemon.sock"))
+}
+
+// A bare --reply-to parses as "true", a valid message ID, which no request
+// was ever sent with.
+func TestSendMessageRejectsABareReplyTo(t *testing.T) {
+	withTempHomeFull(t)
+	withoutDaemon(t)
+	for _, args := range [][]string{
+		{"0:0000.0000.002A", "--data", "x", "--reply-to"},
+		{"0:0000.0000.002A", "--reply-to", "--data", "x"},
+	} {
+		_, _, f := runTrapped(t, func() { cmdSendMessage(args) })
+		if f == nil || f.Code != "invalid_argument" || !strings.Contains(f.Message, "needs a value") {
+			t.Errorf("%v: %+v, want invalid_argument asking for a value", args, f)
+		}
+	}
+}
+
+// The id `pilotctl inbox` lists is the record's file name. Given as
+// --reply-to, it is replaced by the message_id stored in that record.
+func TestSendMessageReplyToLooksUpAnInboxID(t *testing.T) {
+	sd := newStreamDaemon(t)
+	home := sd.useDaemonNoRegistry(t)
+	inbox := filepath.Join(home, ".pilot", "inbox")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const requestID = "5d1e9c0a7b3f4e21a8c6d0b9e2f71a34"
+	writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{
+		"from": "0:0000.0000.002A", "data": "ping", "message_id": requestID,
+	})
+	rcv := newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string { return "ACK TEXT 4 bytes" })
+
+	data := sendMessageJSON(t, "0:0000.0000.002A", "--data", "pong", "--reply-to", "TEXT-20260924-100005.000-000001")
+	_, frames := rcv.seen()
+	if len(frames) != 1 || frames[0] == nil || frames[0].ReplyTo != requestID {
+		t.Fatalf("receiver got %+v, want reply_to %s", frames, requestID)
+	}
+	if data["reply_to"] != requestID {
+		t.Fatalf("result reply_to = %v, want %s", data["reply_to"], requestID)
+	}
+}
+
+// An inbox id whose record has no message_id (or no record at all) has no
+// ID to name: refused before anything is sent.
+func TestSendMessageReplyToRefusesAnInboxIDWithoutMessageID(t *testing.T) {
+	inbox := tempInbox(t)
+	withoutDaemon(t)
+	writeInboxRecord(t, inbox, "TEXT-20260924-100005.000-000001.json", map[string]any{"from": "0:0000.0000.002A", "data": "ping"})
+	for id, want := range map[string]string{
+		"TEXT-20260924-100005.000-000001": "carries no message_id",
+		"TEXT-20260924-100009.000-000009": "not a message_id",
+	} {
+		_, _, f := runTrapped(t, func() { cmdSendMessage([]string{"0:0000.0000.002A", "--data", "x", "--reply-to", id}) })
+		if f == nil || f.Code != "invalid_argument" || !strings.Contains(f.Message, want) {
+			t.Errorf("--reply-to %s: %+v, want invalid_argument %q", id, f, want)
+		}
+	}
+}
+
+// ── the inbox shows message_id and reply_to ───────────────────────────────
+
+func TestInboxShowsMessageIDAndReplyTo(t *testing.T) {
+	dir := tempInbox(t)
+	for name, rec := range map[string]map[string]any{
+		"TEXT-20260924-100004.000-000000.json": {"from": replyPeer, "type": "TEXT", "data": "untagged", "bytes": 8, "received_at": "2026-09-24T10:00:04Z"},
+		"TEXT-20260924-100005.000-000001.json": {"from": replyPeer, "type": "TEXT", "data": "ping", "bytes": 4, "received_at": "2026-09-24T10:00:05Z", "message_id": "req-1"},
+		"TEXT-20260924-100006.000-000002.json": {"from": replyPeer, "type": "TEXT", "data": "pong", "bytes": 4, "received_at": "2026-09-24T10:00:06Z", "message_id": "ans-1", "reply_to": "req-1"},
+	} {
+		writeInboxRecord(t, dir, name, rec)
+	}
+
+	var env struct {
+		Data struct {
+			Messages []map[string]interface{} `json:"messages"`
+		} `json:"data"`
+	}
+	out := captureStdout(t, func() { withJSON(func() { cmdInbox(nil) }) })
+	if err := json.Unmarshal([]byte(out), &env); err != nil || len(env.Data.Messages) != 3 {
+		t.Fatalf("inbox --json: %v\n%s", err, out)
+	}
+	byID := map[string]map[string]interface{}{}
+	for _, m := range env.Data.Messages {
+		byID[m["id"].(string)] = m
+	}
+	if m := byID["TEXT-20260924-100005.000-000001"]; m["message_id"] != "req-1" || m["from"] != replyPeer || m["preview"] != "ping" {
+		t.Errorf("request entry = %v", m)
+	}
+	if m := byID["TEXT-20260924-100006.000-000002"]; m["message_id"] != "ans-1" || m["reply_to"] != "req-1" {
+		t.Errorf("answer entry = %v", m)
+	}
+	m := byID["TEXT-20260924-100004.000-000000"]
+	if _, has := m["message_id"]; has {
+		t.Errorf("untagged entry = %v, want no message_id", m)
+	}
+	if _, has := m["reply_to"]; has {
+		t.Errorf("untagged entry = %v, want no reply_to", m)
+	}
+
+	text := captureStdout(t, func() { withText(func() { cmdInbox(nil) }) })
+	for _, want := range []string{"message_id req-1", "message_id ans-1 · reply_to req-1"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("inbox listing lacks %q:\n%s", want, text)
+		}
+	}
+	read := captureStdout(t, func() { withText(func() { cmdInbox([]string{"read", "TEXT-20260924-100006.000-000002"}) }) })
+	for _, want := range []string{"Message ID: ans-1", "Reply to:   req-1"} {
+		if !strings.Contains(read, want) {
+			t.Errorf("inbox read lacks %q:\n%s", want, read)
+		}
+	}
+}
+
+// ── a lost ack ────────────────────────────────────────────────────────────
+
+// The first connection drops before the receiver's ack comes back.
+func TestSendMessageSendsAgainWhenTheAckIsLost(t *testing.T) {
+	const peer = "0:0000.0000.002A"
+
+	// A receiver through v1.13.9 stored nothing for the tagged frame. Sent
+	// again on a new connection, the message reaches it untagged, once.
+	t.Run("receiver that predates message IDs", func(t *testing.T) {
+		sd := newStreamDaemon(t)
+		sd.useDaemonNoRegistry(t)
+		calls := 0
+		var stored []string
+		rcv := newDXReceiver(sd, func(ftype uint32, payload []byte, _ *dataexchange.Frame) string {
+			calls++
+			if calls == 1 {
+				return dxDropConnection
+			}
+			if ftype != dataexchange.TypeText {
+				return fmt.Sprintf("ACK UNKNOWN(10) %d bytes", len(payload))
+			}
+			stored = append(stored, string(payload))
+			return fmt.Sprintf("ACK TEXT %d bytes", len(payload))
+		})
+
+		data := sendMessageJSON(t, peer, "--data", "hello")
+		types, _ := rcv.seen()
+		if len(types) != 3 || types[0] != dataexchange.TypeTagged || types[1] != dataexchange.TypeTagged || types[2] != dataexchange.TypeText {
+			t.Fatalf("receiver saw frame types %v, want [TAGGED TAGGED TEXT]", types)
+		}
+		if len(stored) != 1 || stored[0] != "hello" {
+			t.Fatalf("receiver stored %q, want exactly [hello]", stored)
+		}
+		if data["retried"] != true || data["tagged"] != false || data["ack"] != "ACK TEXT 5 bytes" {
+			t.Fatalf("result = %v", data)
+		}
+	})
+
+	// A receiver that knows message IDs may have stored the first copy. The
+	// second carries the same ID, which it recognises as a repeat.
+	t.Run("receiver that knows message IDs", func(t *testing.T) {
+		sd := newStreamDaemon(t)
+		sd.useDaemonNoRegistry(t)
+		calls := 0
+		rcv := newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+			calls++
+			if calls == 1 {
+				return dxDropConnection
+			}
+			return "ACK TEXT 5 bytes (duplicate)"
+		})
+
+		data := sendMessageJSON(t, peer, "--data", "hello")
+		_, frames := rcv.seen()
+		if len(frames) != 2 || frames[0] == nil || frames[1] == nil {
+			t.Fatalf("receiver saw %+v, want two frames", frames)
+		}
+		if frames[0].MessageID != frames[1].MessageID || frames[0].MessageID != data["message_id"] {
+			t.Fatalf("message IDs %q then %q (result %v), want the same one twice", frames[0].MessageID, frames[1].MessageID, data["message_id"])
+		}
+		if data["retried"] != true || data["tagged"] != true {
+			t.Fatalf("result = %v", data)
+		}
+	})
+
+	// --no-resend: sent once, and with no ack the send fails. Whether the
+	// receiver got the ID is not known without its ack, so the result does
+	// not claim either.
+	t.Run("--no-resend", func(t *testing.T) {
+		sd := newStreamDaemon(t)
+		sd.useDaemonNoRegistry(t)
+		rcv := newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string { return dxDropConnection })
+		t.Cleanup(func() { fatalResults = nil })
+
+		var stderr string
+		var f *trappedFatal
+		withJSON(func() {
+			_, stderr, f = runTrapped(t, func() { cmdSendMessage([]string{peer, "--data", "hello", "--no-resend", "--count", "2"}) })
+		})
+		if f == nil || f.Code != "connection_failed" || !strings.Contains(f.Message, "not acknowledged") {
+			t.Fatalf("send = %+v, want connection_failed for the unacknowledged messages", f)
+		}
+		if types, _ := rcv.seen(); len(types) != 2 {
+			t.Fatalf("receiver saw frame types %v, want one frame per message", types)
+		}
+		var env struct {
+			Results []map[string]interface{} `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(stderr[strings.Index(stderr, "{"):]), &env); err != nil || len(env.Results) != 2 {
+			t.Fatalf("error envelope: %v\n%s", err, stderr)
+		}
+		for _, r := range env.Results {
+			for _, key := range []string{"tagged", "retried", "ack"} {
+				if v, has := r[key]; has {
+					t.Errorf("result has %s=%v: %v", key, v, r)
+				}
+			}
+			if _, has := r["ack_error"]; !has {
+				t.Errorf("result has no ack_error: %v", r)
+			}
+		}
+	})
 }

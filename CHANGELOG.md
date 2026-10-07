@@ -29,22 +29,32 @@ Detailed per-release notes are on the
   existing `SendTo` command is unchanged and still never replies, so
   current clients and SDKs are unaffected; `pilotctl dgram` switches to the
   confirmed send once the driver release that carries it is picked up.
-- **`pilotctl send-message --wait` matches the reply by message ID.** The
-  wait took the oldest new message from the peer, so two concurrent requests
-  to one peer, or anything else the peer sent in the window, could hand a
-  caller another request's answer. Every message is now sent with a new
-  message ID (`message_id` in the `--json` result, and in the receiver's inbox
-  record), and a message from the peer whose `reply_to` is that ID is the
-  reply. A message whose `reply_to` names another request is never taken. A
-  peer that does not echo the ID is matched by sender and arrival time as
-  before, so nothing changes for it — that is every service responder today.
-  New flag `--reply-to <id>` sends a message as the answer to a received one.
+- **`pilotctl send-message --wait` can match the reply by message ID.** The
+  wait takes the oldest new message from the peer, so two concurrent
+  requests to one peer, or anything else the peer sends in the window, can
+  hand a caller another request's answer. Every message is now sent with a
+  new message ID (`message_id` in the `--json` result, and in the receiver's
+  inbox record). A reply whose `reply_to` is that ID is matched exactly, and
+  a message whose `reply_to` names another request is never taken. Exact
+  matching needs the responder to echo the request's `message_id` as
+  `reply_to`, which no service responder does yet: an untagged reply still
+  works and is matched by sender and arrival time as before, so for such
+  responders concurrent waits can still be crossed. An untagged message is
+  held back up to 0.75 s in case the reply naming the request follows, which
+  delays replies from those responders by that much; once the peer has been
+  seen naming another request in `reply_to`, only a reply naming ours is
+  taken. New flag `--reply-to <message_id>` sends a message as the answer to
+  a received one (an inbox file id is looked up; a bare flag is refused).
+  `pilotctl inbox` now shows each message's `message_id` and `reply_to`, in
+  the listing and with `--json` (new fields; `id` is still the file name).
   A first-contact re-send uses an ID of its own (the receiver would drop a
   repeat of the same ID as a duplicate) and a reply to either is accepted.
-  Receivers that predate message IDs still get the message, in the old format
-  (`"tagged": false` in the result); that costs one extra exchange on the same
-  connection. No dependency change: dataexchange v0.2.3 already carries the
-  IDs.
+  When the ack is lost, the message is sent once more on a new connection
+  with the same ID, which a current receiver keeps only once (`"retried":
+  true`; `--no-resend` opts out). Receivers that predate message IDs still
+  get the message, in the old format (`"tagged": false` in the result); that
+  costs one extra exchange on the same connection. No dependency change: the
+  dataexchange release already required carries the IDs.
 - **The daemon caps its own log file.** launchd never rotates the daemon's
   `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
   without bound — 22 MB on one laptop. When stderr is a regular file the
