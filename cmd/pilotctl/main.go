@@ -5079,7 +5079,7 @@ func cmdSendMessage(args []string) {
 					// but unacknowledged, is what happened to the message.
 					sendErr = fmt.Errorf("%w; sending again failed: %v", sendErr, err2)
 				}
-				c2.Close()
+				_ = c2.Close()
 			}
 		}
 		ackRecvAtNs := time.Now().UnixNano()
@@ -5400,7 +5400,7 @@ func resolveReplyTo(raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("--reply-to %s: %v", raw, err)
 		}
-		body, err := os.ReadFile(filepath.Join(dir, raw+".json"))
+		body, err := os.ReadFile(filepath.Join(dir, raw+".json")) // #nosec G304 -- raw matched inboxFileID (no path separators); a file in this node's own inbox
 		if err != nil {
 			return "", fmt.Errorf("--reply-to %s is an inbox file id, not a message_id, and no such message is in the inbox; pass the message_id that pilotctl inbox shows", raw)
 		}

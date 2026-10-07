@@ -323,7 +323,7 @@ func peerEchoedBefore(dir string, entries []os.DirEntry, peer string) bool {
 		if read += info.Size(); read > echoHistoryBytes {
 			break
 		}
-		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		body, err := os.ReadFile(filepath.Join(dir, e.Name())) // #nosec G304 -- a regular file listed in this node's own inbox directory
 		if err != nil {
 			continue
 		}
