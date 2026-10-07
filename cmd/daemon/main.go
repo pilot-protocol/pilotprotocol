@@ -105,6 +105,7 @@ func main() {
 	beaconRTTProbe := flag.Bool("beacon-rtt-probe", false, "probe beacon RTT before selection; override hash pick when >2× slower than best (ablation test, default off)")
 	noRxWatchdog := flag.Bool("no-rx-watchdog", false, "disable the inbound-path watchdog that soft-recovers (beacon+registry re-registration) and, on a persistent wedge, exits non-zero for supervisor respawn")
 	noPathWatch := flag.Bool("no-path-watch", false, "disable the per-peer path watchdog that probes inbound-silent peers and resets a dead peer path in place (prefer-direct sequence) without a daemon restart")
+	noAddrWatch := flag.Bool("no-addr-watch", false, "disable the own-address watcher that notices this host's IP address changing (or the public IP the beacon sees it at) and re-announces the node to the beacon, the registry and every tunnel peer at once")
 	// -transport and -proxy have literal defaults: their environment
 	// variables beat config.json (see flagSources.envOverConfig), and -help
 	// must never print an environment value — PILOT_PROXY can hold proxy
@@ -324,6 +325,7 @@ func main() {
 	installDefaultTransportProxy(proxyResolver, proxyRelay)
 	slog.Info("outbound network", "transport", *transportMode, "proxy", describeProxy(*proxySpec, *transportMode, proxyResolver),
 		"transport_from", transportSrc, "registry", *registryAddr, "registry_tls", *registryTLS)
+	warnIfPID1(slog.Default())
 
 	// Sandbox: validate all configured file paths are under the confinement
 	// root before the daemon touches the filesystem. Network paths are unaffected.
@@ -400,6 +402,7 @@ func main() {
 		BeaconRTTProbe:        *beaconRTTProbe,
 		DisableRxWatchdog:     *noRxWatchdog,
 		DisablePathWatch:      *noPathWatch,
+		DisableAddrWatch:      *noAddrWatch,
 		TransportMode:         *transportMode,
 		CompatBeaconURL:       *compatBeacon,
 		CompatTLSTrust:        *tlsTrust,

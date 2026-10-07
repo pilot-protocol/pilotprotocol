@@ -10,6 +10,14 @@ Detailed per-release notes are on the
 ## [Unreleased]
 
 ### Added
+- **`pilotctl send-message` can take its payload from stdin or a file**:
+  `--data -` and `--data-file <path>`. A payload passed as an argument is
+  capped by the OS — a 1 MB `--data` failed with "Argument list too long",
+  and on Linux a single argument stops at 128 KiB — which is why senders of
+  large bodies needed a separate stdin helper.
+  `--data -` now means stdin, so a message that is just `-` has to come from
+  `--data-file`. One message can carry up to the 64 MiB data-exchange frame
+  limit; a larger payload is refused before anything is sent.
 - **A client can ask the daemon whether a datagram was actually sent.** The
   IPC `SendTo` command is fire-and-forget: when the daemon could not send a
   datagram (no route to the node, port policy, ephemeral ports exhausted) it
@@ -215,6 +223,14 @@ Detailed per-release notes are on the
   (redacted) and the hosts it must allow. In a Linux container/VM without
   systemd the installer runs as root without `PILOT_ALLOW_ROOT` (hosted
   sandboxes run the agent as root); regular hosts still refuse root.
+- **The daemon warns when it is PID 1.** As the entrypoint of a container
+  started without an init, the daemon is handed every orphaned process, and
+  the servers its apps start (redis, postgres) stay as zombies after they
+  are stopped. The daemon does not reap them — that would also take the exit
+  status of the apps it supervises — and now logs one warning at startup, on
+  Linux, saying to run it under an init (`docker run --init`, tini as the
+  entrypoint, Kubernetes `shareProcessNamespace`, ECS `initProcessEnabled`).
+  README: Install.
 
 ### Removed
 - **Hosted control plane client.** The hosted control plane has been retired,
@@ -275,8 +291,132 @@ Detailed per-release notes are on the
     new binary. In every other case the daemon keeps running and
     `restart_error` says how to restart it. Every check is recorded in
     `~/.pilot/update-state.json`.
+- **`pilotctl appstore install` says whether the app started.** Install only
+  writes files and the daemon starts the app a moment later, so it reported
+  success for an app that then exited at every start (seen with
+  `io.pilot.sqlite` on an image without `tar`) and was suspended half a minute
+  later. With a daemon running, install now waits up to 20s (`--wait <dur>`
+  changes that) for the first start and reports one of three outcomes:
+  started; failed — the supervisor suspended the app, it exited at least
+  twice without opening its socket, or the supervisor refused it as older
+  than the version it runs — in which case install **exits non-zero**
+  (`app_start_failed`) with the last supervisor log line and where to look
+  next; or still starting, which is not an error, so an app that needs longer
+  than the wait is not a failed install. On an upgrade, what the replaced
+  instance logs before the daemon swaps it out (the end of its crash loop, or
+  its exit when it is stopped) is not counted against the new version. The
+  `--json` report gains `start_state`, `start_exits`, `start_detail` and
+  `start_waited_ms`; nothing existing changed. No wait with `--no-wait`, when
+  no daemon is running, or for a reinstall the supervisor does not act on
+  (same version and binary, or an older version, ordered as the supervisor
+  orders them, so `1.0.0-beta.1` is older than `1.0.0`); for an older
+  version install says the daemon starts it only when the daemon restarts.
+  `appstore upgrade` does not wait.
 
 ### Fixed
+- **A daemon stopping mid-poll no longer loses relayed handshakes.** The
+  registry empties a node's handshake inbox as it answers a poll, and
+  shutdown closed the registry client without waiting for a poll in flight,
+  so a restart during one dropped the requests and approvals it carried.
+  Shutdown now waits for it before stopping the handshake manager, so what it
+  brings back is still acted on and saved, and starts no new poll once it
+  has begun. The wait shares the 5s that shutdown already allows its
+  background goroutines.
+- **A full table of handshake windows lets go of one settled peer, not all
+  of them.** With 64 peers tracked, a new request evicted every peer whose
+  fast-poll window had closed, and those peers lost the hold-off that stops
+  an automatic handshake from reopening their window early. Now only the
+  one whose hold-off ends soonest makes room.
+- **Bytes after a known beacon notify kind are ignored** instead of the
+  whole notify being dropped, so a later beacon can extend the message.
+- **Stream segments fit one packet.** A full stream segment was 4096 bytes,
+  about 4.2 KB on the wire and three IP fragments on a 1500-byte path. NATs,
+  firewalls and some virtual networks drop fragments, so on those paths
+  handshakes, pings and messages under ~1.4 KB worked while every full
+  segment was lost: larger replies never arrived, `send-file` failed, and
+  `bench` reported a few kbit/s until its retransmissions gave up. Segments
+  are now at most 1152 bytes (`SendSegmentSize`), a 1231-byte datagram on the
+  relay path — within what fits IPv6's minimum MTU, so within any path that
+  carries IP. This is a sender-side change: receivers accept segments up to
+  the old size, so old and new nodes interoperate in both directions. With
+  non-first fragments dropped at the receiver, a 3 KB message, a 60 KB
+  message and 64 KB and 1 MB file transfers all failed before and all
+  succeed now.
+  - The peer's receive window is advertised in segments, not bytes, and is
+    now enforced as such. A sender of short segments used to put more of
+    them in flight than the peer had slots for.
+  - A short write no longer stalls its sender. Nagle's algorithm held a
+    short segment until everything before it was acknowledged, and the
+    writer was blocked until it had gone out. The ACK it waited for is
+    delayed by the peer when the full segments before it are an odd number
+    (5ms; 40ms up to v1.14.1), nothing could join a held write because its
+    writer could not write again, so a stream of short writes moved at one
+    write per round trip, and since a client's sends are handled in order on
+    its IPC connection, everything else that client asked for waited too.
+    With 1152-byte segments every 4 KB write ends in a short tail, so this
+    had to go. Now:
+    - the tail of a write of a segment or more leaves with it;
+    - a write shorter than a segment waits only for an earlier short
+      segment, which is what lets small writes coalesce;
+    - a held write does not block: it stays buffered, later writes join it,
+      and it is sent when that earlier segment is acknowledged, after 40ms
+      at the latest, or ahead of the FIN when the connection is closed.
+
+    This also removes the stall per file chunk that held transfers back. A
+    60 MB file between two nodes on one host took 4.8s and takes 1.2s; from
+    an upgraded node into v1.13.5 it takes 1.8s, where v1.13.5 to itself
+    takes 22.7s.
+  - A receiver acknowledges a lone segment at once for the first 32
+    segments of a connection, and again after each time its delayed-ACK
+    timer has had to fire. A peer that waits for an ACK before sending its
+    next small write no longer stalls for the timer each time; the first
+    exchange on a connection goes from 5.4ms to 0.3ms.
+  - The congestion window grows and backs off over the same number of bytes
+    as before.
+
+  Mixed versions were checked in both directions against v1.13.5, v1.14.1
+  and the previous main: messages up to 100 KB, files up to 60 MB, four
+  concurrent transfers, echo and pub/sub, on a clean network, under a stock
+  kernel's socket buffer limit, at 1% loss over a 30ms path, and through the
+  relay. Two things to know while a network is part upgraded:
+  - Only an upgraded sender stops fragmenting. A reply of more than a
+    packet from a node that is not upgraded is still lost on a path that
+    drops fragments.
+  - A node that is not upgraded and writes back what it reads piece by
+    piece (the echo service, so `pilotctl bench` against it) now reads
+    1152-byte pieces, each below its own 4096-byte segment size, and its
+    own Nagle rule sends one per round trip: 1 MB echoed over a 30ms path
+    takes about 35s. Its replies to requests, files and pub/sub are not
+    affected, and upgrading that node removes it (1.5–2s).
+- **A transfer no longer collapses after a burst of losses.** Three faults
+  in loss recovery, found at 2% packet loss on a 30ms path, where 2 of 5
+  5 MB transfers failed after several minutes:
+  - In fast recovery, segments the peer had already reported (SACK) were
+    left out of the amount in flight while the window was also grown by one
+    segment per duplicate ACK, counting each twice: the amount outstanding
+    doubled every round trip for as long as the first loss stayed
+    unrepaired.
+  - The peer holds at most 128 out-of-order segments and silently drops the
+    rest; the sender did not know and ran past it. It now keeps at most 128
+    segments unacknowledged.
+  - After a retransmission timeout, every further segment missing from that
+    window waited for a timeout of its own, and the timeout doubles each
+    time (1s, 2s, 4s … 10s). The next missing segment is now retransmitted
+    as soon as an ACK shows the previous one arrived.
+
+  Measured, 5 MB over a 30ms path, five runs each: at 2% loss, 9.7–12.4s
+  with 2 of 5 failing before, 10.3–11.8s with none failing after; at 0.5%
+  loss 9.4–10.5s before, 7.3–7.6s after; without loss 8.2–8.4s before,
+  7.6–7.7s after.
+- **A message larger than 256 KB is delivered instead of silently dropped.**
+  The daemon refused any single stream write bigger than its send buffer, and
+  an IPC send has no reply, so the client never knew: `send-message` printed
+  `"status":"ok"` for a 1 MB message that never left the node. A large write is
+  now fed through the buffer in pieces, blocking on the window like any other
+  write. The buffer's size cap is unchanged.
+- **`pilotctl send-message` fails when the receiver does not acknowledge the
+  message.** Every receiver answers a stored message with an ACK; with none,
+  the command used to exit 0.
 - **`-advertise-endpoint` survives a re-registration.** When the daemon
   re-registered (registry reconnect, transport watchdog recovery) it sent
   the tunnel socket's local address instead of the advertised endpoint, so
@@ -332,6 +472,92 @@ Detailed per-release notes are on the
   over its own limit no longer uses up the tokens other peers need
   (previously every SYN it had rejected still took a shared token).
   `-syn-whitelist` is unchanged.
+- **A trust handshake between two private nodes takes seconds, not two
+  minutes.** Neither side can reach the other before trust exists, so the
+  request and the answer are parked at the registry until each node polls —
+  once per keepalive interval (60s). Measured before: request visible on the
+  target after ~59s, approval back at the requester ~57s later. Now:
+  - a node that has sent a handshake request polls every 2s until it is
+    answered, for at most 2 minutes;
+  - `pilotctl pending`, `trust`, `approve` and `reject` poll first (at most
+    one such poll every 2s), so a relayed request is there as soon as
+    someone looks. Waiting for trust polls only while a request this node
+    sent that peer is unanswered, so checking a peer that is already trusted
+    — which pilotctl does before every send — costs nothing. The caller is
+    held at most 3s by a slow registry; the poll itself still completes and
+    delivers what it fetched;
+  - the beacon can tell a node that something is waiting for it (a two-byte
+    notify that carries nothing else; needs the matching registry/beacon
+    release), and the node polls at once — at most 3 polls in a burst and
+    one per 5s after that, whatever arrives.
+  An idle node still makes one poll per minute, as before. Nodes and
+  servers that are not updated keep working at the old pace for their part.
+- **Dial timeouts while other dials succeed no longer read as a wedged
+  transport.** The watchdog's `outbound-dial-wedged` check counted every
+  dial timeout, so a burst of parallel sends to one peer whose SYN limiter
+  dropped some of them (`dial_timeouts=32`) made a healthy node re-register
+  with the beacon and registry, and could escalate to a restart. A timeout
+  is no longer counted when another dial completed while it ran: that dial's
+  SYN-ACK shows the outbound path was working. Traffic merely received from
+  the peer does not count as evidence, because a node whose outbound path is
+  dead still receives its peers' keepalives.
+- **A node whose IP address changes recovers in about a second instead of
+  about half a minute.** When the host's address changed under a running
+  daemon (new DHCP lease, Wi-Fi to Ethernet, a VPN taking the default route, a
+  container moved to another address), nothing in the daemon noticed. Peers
+  kept sending to the old address until their own timeouts moved them to the
+  relay or the node's 25 s keepalive reached them, the node's own registry
+  connections stayed bound to the old address until a 30 s read timeout, and
+  the registry kept handing out the old endpoint for a minute or more. The
+  daemon now checks once a second which source address the kernel would use
+  toward the beacon (a route lookup; nothing is sent) and, when it changes,
+  re-registers with the beacon, sends one authenticated probe straight to
+  every tunnel peer so each learns the new address from it, and sends the
+  registry its new endpoint and LAN addresses over a fresh connection. Only
+  the endpoint is sent: the registry still has the node's visibility,
+  hostname and trust pairs, so they are not written again (the full restore
+  still runs if the registry has not answered for 5 minutes or its reply
+  shows it lost the node). The beacon registration is repeated 31 s later,
+  because the beacon accepts one endpoint update per node every 30 s and
+  drops the rest; a move within 30 s of the last keepalive registration
+  otherwise reached the beacon only with the next one, up to a minute later.
+  Measured in a three-node Docker lab, moving one node to a new address: peer
+  to moved node 32 s before, under 1 s after; moved node to peer 30 s before,
+  no failed send after; a node with no existing tunnel timed out after 30 s
+  before and connected directly in 0.2 s after. Peers need no update.
+  - An interface that drops and returns with the same address triggers
+    nothing, and neither does an unrelated interface appearing (a Docker
+    bridge, a VPN that does not take the route), nor a switch to another
+    beacon by the beacon-list refresh, which may be reached over another
+    route: the comparison starts over with the new beacon (a change still
+    waiting to be announced at that moment still runs). Recoveries are at
+    least 10 s apart, and the gap doubles up to 2 minutes while changes keep
+    coming, so a flapping interface cannot flood the registry; a change seen
+    during the gap runs when the gap ends, unless the address has gone back.
+    The gaps are measured on the wall clock, so time asleep counts toward
+    them.
+  - Behind NAT the local address does not change when the public one does.
+    The daemon also reads the address the beacon reports seeing it at (the
+    reply to its beacon registration, every keepalive interval, 60 s by
+    default) and runs the same recovery when that IP changes. A reply counts
+    only if it arrives within 2 s of a registration the node sent, and a new
+    IP only once two replies in a row agree on it; when one reply differs,
+    the node registers once more at once to check it. Because a NAT that maps
+    a node to several public IPs looks like a stream of changes, the gap
+    between these recoveries starts at 1 minute and grows to 1 hour. This
+    path has unit tests only; it was not exercised against a real NAT.
+  - A host waking from sleep on a new network no longer has its two
+    recoveries (wake and address change) abort each other's registry calls:
+    registry reconnects and re-registrations, the heartbeat's included, run
+    one at a time, and the wake or rx-watchdog recovery is skipped when a
+    full re-registration succeeded in the last 5 s.
+  - `-no-addr-watch` (config.json `no_addr_watch`) turns the watcher off.
+  - Publishes `tunnel.addr_changed` (`reason`: `local_address`,
+    `observed_endpoint` or `registry_retry`; `previous` and `current`: the
+    local address, or for `observed_endpoint` the IP the beacon sees;
+    `peers_notified`; `registry_ok`: whether the registry accepted the
+    re-registration). A relay-only or compat-mode node does not probe peers
+    directly.
 - **Proxy credential hints no longer send an operator who already set
   `proxy_cmd` off to set it.** When the daemon re-reads its credentials with
   a proxy command and the proxy still rejects them (407, or Meta Muse's

@@ -120,14 +120,19 @@ Usage:
   pilotctl appstore uninstall <id> --yes     remove an installed app from the install root
   pilotctl appstore verify <bundle-dir>      sha256-check a pre-install bundle against its manifest
   pilotctl appstore catalogue                list apps available for one-command install
-  pilotctl appstore install <app-id> [--version <v>] [--force [--reset-state]]
+  pilotctl appstore install <app-id> [--version <v>] [--force [--reset-state]] [--no-wait | --wait <dur>]
                                              install by catalogue ID (fetches + verifies + extracts).
                                              already installed: a no-op that points at upgrade
                                              (another --version needs --force: conflict otherwise).
                                              --force reinstalls in place and KEEPS the app's state
                                              (keys, data.db, secrets, cap-state, audit log);
-                                             --reset-state (implies --force) starts it empty
-  pilotctl appstore install <bundle-dir> --local [--force [--reset-state]]
+                                             --reset-state (implies --force) starts it empty.
+                                             with a daemon running, waits up to 20s (--wait <dur>)
+                                             for the app's first start and exits non-zero if it
+                                             crashed at start, was suspended, or was refused as
+                                             older than the version the daemon runs; an app still
+                                             starting by then is not an error. --no-wait returns at once
+  pilotctl appstore install <bundle-dir> --local [--force [--reset-state]] [--no-wait | --wait <dur>]
                                              sideload a local bundle (sandbox: fs.read/fs.write
                                              under $APP, audit.log; no net, no key.sign, no hooks)
   pilotctl appstore outdated                 list installed apps with a newer version in the catalogue
@@ -1082,6 +1087,18 @@ type installReport struct {
 	StateNotCarried []string `json:"state_not_carried,omitempty"`
 	// BackupDir is where the replaced install was kept.
 	BackupDir string `json:"backup_dir,omitempty"`
+	// StartState is what install saw of the app's first start, when it
+	// waited for it: "started", "failed" (install then exits non-zero) or
+	// "starting" (not ready by the end of the wait; not a failure). Absent
+	// when install did not wait: --no-wait, no daemon running, or a
+	// reinstall the supervisor does not act on.
+	StartState string `json:"start_state,omitempty"`
+	// StartExits counts the app's exits seen during the wait, StartDetail is
+	// the last supervisor.log line of the wait, StartWaitedMs how long
+	// install waited.
+	StartExits    int    `json:"start_exits,omitempty"`
+	StartDetail   string `json:"start_detail,omitempty"`
+	StartWaitedMs int64  `json:"start_waited_ms,omitempty"`
 	// BackupWarning is set when the backup is not where it was configured
 	// to go (or could not be completed); the same text goes to stderr.
 	BackupWarning string `json:"backup_warning,omitempty"`
@@ -1146,7 +1163,7 @@ func resolveAppDir(root, appID string) (string, error) {
 func cmdAppStoreInstall(args []string) {
 	if len(args) < 1 {
 		fatalHint("invalid_argument",
-			"usage: pilotctl appstore install <app-id-or-dir> [--force [--reset-state]] [--local] [--version <v>]",
+			"usage: pilotctl appstore install <app-id-or-dir> [--force [--reset-state]] [--local] [--version <v>] [--no-wait | --wait <duration>]",
 			"missing app id or bundle dir")
 	}
 	target := args[0]
@@ -1154,6 +1171,7 @@ func cmdAppStoreInstall(args []string) {
 	resetState := false
 	wantVersion := ""
 	allowLocal := false
+	startWait := appStartWait
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--force", "-f":
@@ -1179,9 +1197,27 @@ func cmdAppStoreInstall(args []string) {
 			// happens to also exist as a directory in the cwd) can't
 			// silently sideload an unsigned bundle.
 			allowLocal = true
+		case "--no-wait":
+			// Return as soon as the files are in place, without waiting to
+			// see the daemon start the app (appstore_startwait.go).
+			startWait = 0
+		case "--wait":
+			// How long to wait for that start instead of the default, for an
+			// app known to take longer to open its socket.
+			if i+1 >= len(args) {
+				fatalHint("invalid_argument", "usage: --wait <duration>, e.g. --wait 60s (0 is --no-wait)", "--wait needs a value")
+				return
+			}
+			d, err := time.ParseDuration(args[i+1])
+			if err != nil || d < 0 {
+				fatalHint("invalid_argument", "usage: --wait <duration>, e.g. --wait 60s (0 is --no-wait)", "invalid --wait %q", args[i+1])
+				return
+			}
+			startWait = d
+			i++
 		default:
 			fatalHint("invalid_argument",
-				"available flags: --force, --reset-state, --local, --version",
+				"available flags: --force, --reset-state, --local, --version, --no-wait, --wait",
 				"unknown install flag: %s", args[i])
 		}
 	}
@@ -1238,7 +1274,7 @@ func cmdAppStoreInstall(args []string) {
 		// The bundle was unpacked into a temporary directory for this
 		// install alone. It was never removed, so every install — failed or
 		// not — left a copy of the app behind in $TMPDIR.
-		removeUnpacked := func() { _ = os.RemoveAll(bundleDir) }
+		removeUnpacked := func() { _ = os.RemoveAll(bundleDir) } // #nosec G703 -- for a catalogue install bundleDir is the os.MkdirTemp directory fetchAndUnpackBundle created; never a caller-supplied path
 		defer removeUnpacked()
 		fatalCleanups = append(fatalCleanups, removeUnpacked)
 	}
@@ -1515,6 +1551,9 @@ func cmdAppStoreInstall(args []string) {
 	if testHookBeforeSwap != nil {
 		testHookBeforeSwap(finalDir)
 	}
+	// Supervisor events older than this belong to the install being replaced
+	// (later ones can too: see appstore_startwait.go).
+	swapAt := time.Now()
 	// 4. Swap. The live dir is renamed to <id>.previous and kept there
 	//    until the new dir verifies (exact manifest, pinned binary sha,
 	//    carried state); on any failure the previous install is restored.
@@ -1646,6 +1685,28 @@ func cmdAppStoreInstall(args []string) {
 		}
 	}
 
+	// Wait for the daemon to start the app and see how that went
+	// (appstore_startwait.go). Not when nothing will start it: no daemon, or
+	// a reinstall the supervisor does not act on (same version and binary,
+	// which it leaves running, or an older version by its ordering, which it
+	// refuses).
+	var start *appStartStatus
+	downgrade := oldManifest != nil && supervisorVersionCompare(m.AppVersion, oldManifest.AppVersion) < 0
+	supervisorActs := oldManifest == nil ||
+		(!downgrade && (m.AppVersion != oldManifest.AppVersion || m.Binary.SHA256 != oldManifest.Binary.SHA256))
+	if startWait > 0 && supervisorActs && daemonSocketReachable() {
+		if !jsonOutput {
+			fmt.Fprintf(os.Stderr, "installed %s v%s; waiting up to %s for the daemon to start it (--no-wait skips this)...\n", m.ID, m.AppVersion, startWait)
+		}
+		st := waitForAppStart(appStartTarget{
+			Dir:          finalDir,
+			Since:        swapAt,
+			Version:      m.AppVersion,
+			BinarySHA256: m.Binary.SHA256,
+		}, startWait)
+		start = &st
+	}
+
 	report := installReport{
 		AppID:           m.ID,
 		AppVersion:      m.AppVersion,
@@ -1659,8 +1720,25 @@ func cmdAppStoreInstall(args []string) {
 		BackupDir:       backupDir,
 		BackupWarning:   backupWarning,
 	}
+	if start != nil {
+		report.StartState = start.State
+		report.StartExits = start.Exits
+		report.StartDetail = start.LastEvent
+		report.StartWaitedMs = start.Waited.Milliseconds()
+	}
+	// failIfNotStarted ends the command non-zero when the app was seen
+	// failing to start. The files are installed either way, so the report
+	// above is printed first.
+	failIfNotStarted := func() {
+		if start == nil || start.State != appStartFailed {
+			return
+		}
+		what, hint := start.startFailure(m.ID)
+		fatalHint("app_start_failed", hint, "%s v%s is installed in %s but did not start: %s", m.ID, m.AppVersion, finalDir, what)
+	}
 	if jsonOutput {
 		_ = json.NewEncoder(os.Stdout).Encode(report)
+		failIfNotStarted()
 		return
 	}
 	fmt.Printf("installed %s v%s (manifest v%d) → %s\n",
@@ -1681,8 +1759,19 @@ func cmdAppStoreInstall(args []string) {
 		fmt.Println("      this is NOT an OS sandbox: a malicious binary that ignores its manifest can still")
 		fmt.Println("      misbehave at the syscall level. Only install paths from sources you trust.")
 	}
-	fmt.Println("note: the daemon rescans the install root periodically —")
-	fmt.Println("      this app will be picked up within ~30s (no daemon restart needed)")
+	failIfNotStarted()
+	switch {
+	case start != nil:
+		// Says what was seen, including that the daemon has not picked the
+		// app up yet; the rescan note below would contradict it.
+		fmt.Println(start.startNote(m.ID))
+	case downgrade:
+		fmt.Printf("note: v%s is older than the v%s it replaced; a running daemon does not switch an app to an older\n", m.AppVersion, oldManifest.AppVersion)
+		fmt.Println("      version, so it starts this one when the daemon next starts")
+	default:
+		fmt.Println("note: the daemon rescans the install root periodically —")
+		fmt.Println("      this app will be picked up within ~30s (no daemon restart needed)")
+	}
 
 	// Last step: if this catalogue app ships a product demo in its
 	// sha-verified metadata, print it and drop a SKILL.md so the agent can
@@ -2687,7 +2776,7 @@ func cmdAppStoreCall(args []string) {
 				}
 			}
 		}
-		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil {
+		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil { // #nosec G703 -- only a stat of a fixed name under the app dir the operator named; nothing is read or written
 			fatalHint("io_error",
 				"the app crashed repeatedly and was suspended: `pilotctl appstore audit "+appID+"` shows the exits, the app's own error output is in the daemon's log; `pilotctl appstore restart "+appID+"` retries it",
 				"app %s is suspended", appID)
@@ -2814,14 +2903,14 @@ const appSocketWait = 15 * time.Second
 func waitForAppSocket(appDir, sockPath string, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	for {
-		_, err := os.Stat(sockPath)
+		_, err := os.Stat(sockPath) // #nosec G703 -- only a stat of app.sock under the app dir the operator named; nothing is read or written
 		if err == nil {
 			return nil
 		}
-		if _, merr := os.Stat(filepath.Join(appDir, "manifest.json")); merr != nil {
+		if _, merr := os.Stat(filepath.Join(appDir, "manifest.json")); merr != nil { // #nosec G703 -- only a stat of a fixed name under the app dir; nothing is read or written
 			return err // not installed
 		}
-		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil {
+		if _, serr := os.Stat(filepath.Join(appDir, ".suspended")); serr == nil { // #nosec G703 -- only a stat of a fixed name under the app dir; nothing is read or written
 			return err
 		}
 		if time.Now().After(deadline) {

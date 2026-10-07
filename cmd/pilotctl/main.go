@@ -185,6 +185,10 @@ func classifyDaemonError(err error) string {
 	return ""
 }
 
+// fatalResults, when set, goes into fatalHint's JSON envelope as "results",
+// so a multi-message send that fails still says what became of each message.
+var fatalResults []map[string]interface{}
+
 // fatalHint is like fatalCode but adds an actionable hint telling the user what to do next.
 func fatalHint(code, hint, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
@@ -203,6 +207,9 @@ func fatalHint(code, hint, format string, args ...interface{}) {
 		// other exit). Additive: existing keys keep their shape and value.
 		if ns := nextStepsEnvelope(exitNextSteps); ns != nil {
 			env["next_steps"] = ns
+		}
+		if fatalResults != nil {
+			env["results"] = fatalResults
 		}
 		b, _ := json.Marshal(env)
 		fmt.Fprintln(os.Stderr, string(b))
@@ -895,7 +902,9 @@ var commandHelp = map[string]string{
 Send a message to a remote agent and optionally wait for the reply.
 
 Flags:
-  --data <text>         message payload (required)
+  --data <text>         message payload; "-" reads it from stdin
+  --data-file <path>    read the payload from a file (for payloads too large
+                        for a command-line argument)
   --type text|json|binary  payload encoding (default: text)
   --count <n>           send N times (default: 1)
   --reuse-conn          reuse the connection across --count sends (saves ~1 RTT)
@@ -912,6 +921,8 @@ Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
   pilotctl send-message my-peer --data "hello" --wait
   pilotctl send-message 0:0000.0000.400E --data "ping" --trace
+  pilotctl send-message my-peer --data-file report.json --type json
+  generate-report | pilotctl send-message my-peer --data -
 `,
 	"ping": `Usage: pilotctl ping <address|hostname> [flags]
 
@@ -1628,7 +1639,7 @@ Communication commands:
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
   pilotctl send-file <address|hostname> <filepath>
-  pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
+  pilotctl send-message <address|hostname> --data <text> | --data - | --data-file <path> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
   pilotctl publish <address|hostname> <topic> --data <message>
@@ -1675,7 +1686,9 @@ Agent tool discovery:
 App store (install + call local capability apps; full help: pilotctl appstore help):
   pilotctl appstore catalogue                         list apps available for one-command install
   pilotctl appstore view <id> [--all-changelog]       app detail page (description, methods, permissions)
-  pilotctl appstore install <app-id> [--force]        install by catalogue ID (fetch + verify + extract)
+  pilotctl appstore install <app-id> [--force] [--no-wait | --wait <dur>]
+                                                      install by catalogue ID (fetch + verify + extract)
+                                                      and wait up to 20s for the app's first start
   pilotctl appstore list                              list installed apps + their IPC methods
   pilotctl appstore call <id> <method> [json-args]    dispatch an IPC call into an app
   pilotctl appstore status|caps|audit|restart|uninstall <id>
@@ -2487,8 +2500,8 @@ func contextCatalog() map[string]interface{} {
 
 			// Messaging
 			"send-message": map[string]interface{}{
-				"args":        []string{"<address|hostname>", "--data <text>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]"},
-				"description": "Send a typed message to a node via data exchange (port 1001). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Default type: text",
+				"args":        []string{"<address|hostname>", "--data <text> | --data - | --data-file <path>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]"},
+				"description": "Send a typed message to a node via data exchange (port 1001). --data - reads the payload from stdin, --data-file from a file (up to 64 MiB; a command-line argument is capped by the OS). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Fails unless every message is acknowledged. Default type: text",
 				"returns":     "target, to, type, bytes, ack, reuse_conn",
 			},
 			"send-file": map[string]interface{}{
@@ -2572,7 +2585,7 @@ func contextCatalog() map[string]interface{} {
 			"subcommands": map[string]interface{}{
 				"catalogue":      map[string]interface{}{"args": []string{}, "description": "List apps available for one-command install (alias: catalog)"},
 				"view":           map[string]interface{}{"args": []string{"<id>", "[--all-changelog]"}, "description": "Detail page: description, vendor, changelog, size, source, methods, permissions (installed or not)"},
-				"install":        map[string]interface{}{"args": []string{"<app-id> [--force]", "| <bundle-dir> --local [--force]"}, "description": "Install by catalogue ID (fetch + verify + extract), or sideload a local bundle with --local"},
+				"install":        map[string]interface{}{"args": []string{"<app-id> [--force]", "| <bundle-dir> --local [--force]", "[--no-wait | --wait <dur>]"}, "description": "Install by catalogue ID (fetch + verify + extract), or sideload a local bundle with --local. With a daemon running, waits up to 20s (--wait <dur>) for the app's first start and exits non-zero (app_start_failed) if it crashed at start, was suspended, or was refused as older than the version the daemon runs; --no-wait returns at once"},
 				"list":           map[string]interface{}{"args": []string{}, "description": "List installed apps and the IPC methods each exposes"},
 				"call":           map[string]interface{}{"args": []string{"<id>", "<method>", "[json-args]", "[--timeout <dur>]"}, "description": "Dispatch an IPC call into an app (default timeout 120s; $PILOT_APPSTORE_CALL_TIMEOUT)"},
 				"status":         map[string]interface{}{"args": []string{"<id>"}, "description": "Deep-dive on one app's pinned state"},
@@ -4744,11 +4757,117 @@ func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename s
 	return result, nil
 }
 
+// messagePayload returns the body for send-message: --data, or the whole of
+// stdin for "--data -", or the contents of --data-file. A payload passed as an
+// argument is capped by the OS (ARG_MAX; 128 KiB per argument on Linux), which
+// is why callers with large bodies needed a separate stdin helper.
+func messagePayload(flags map[string]string, stdin io.Reader) (string, error) {
+	data, hasData := flags["data"]
+	file, hasFile := flags["data-file"]
+	switch {
+	case hasData && hasFile:
+		return "", fmt.Errorf("give --data or --data-file, not both")
+	case hasFile:
+		if file == "" || file == "true" {
+			return "", fmt.Errorf("--data-file needs a path")
+		}
+		b, err := os.ReadFile(file) // #nosec G304 -- the operator names the file to send
+		if err != nil {
+			return "", fmt.Errorf("read --data-file: %v", err)
+		}
+		data = string(b)
+	case data == "-":
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("read payload from stdin: %v", err)
+		}
+		data = string(b)
+	}
+	if data == "" {
+		if hasFile {
+			return "", fmt.Errorf("--data-file %s is empty", file)
+		}
+		return "", fmt.Errorf("--data is required")
+	}
+	// One message is one data-exchange frame. A receiver drops a frame over
+	// its limit at the header, which the sender would only see as a missing
+	// acknowledgement, and past 4 GiB the length prefix would wrap.
+	if limit := maxMessageBytes(); len(data) > limit {
+		return "", fmt.Errorf("message is %d bytes; one message can carry at most %d (use send-file for larger payloads)", len(data), limit)
+	}
+	return data, nil
+}
+
+// maxMessageBytes is the most one send-message payload can be: the frame
+// limit, less room for the frame and message-tag headers.
+func maxMessageBytes() int {
+	return int(dataexchange.MaxFrameSize) - 4096
+}
+
+// failIfUndelivered ends a multi-message send with an error when any message
+// failed to send, was not acknowledged, or was refused by the receiver:
+// reporting "ok" for those hid messages that never arrived. The error carries
+// every message's result, so a caller can tell which ones to send again.
+func failIfUndelivered(target string, results []map[string]interface{}) {
+	failed, allRefused, first := undelivered(results)
+	if failed == 0 {
+		return
+	}
+	code := "connection_failed"
+	if allRefused {
+		code = "internal" // as for a single message the receiver refuses
+	}
+	fatalResults = results
+	fatalHint(code, "the results list which messages were delivered; check `pilotctl peers` and the daemon log before sending the others again",
+		"%d of %d messages to %s were not delivered (first, %s)", failed, len(results), target, first)
+}
+
+// undelivered counts the send results that did not end in a stored message,
+// says whether all of those were refused by the receiver, and describes the
+// first of them.
+func undelivered(results []map[string]interface{}) (failed int, allRefused bool, first string) {
+	allRefused = true
+	for _, r := range results {
+		why, refused := "", false
+		_, acked := r["ack"].(string)
+		switch {
+		case r["error"] != nil:
+			why = fmt.Sprint(r["error"])
+		case !acked:
+			why = "not acknowledged"
+			if e, ok := r["ack_error"].(string); ok {
+				why += " (" + e + ")"
+			}
+		case refusal(r) != "":
+			why, refused = "receiver refused it: "+refusal(r), true
+		}
+		if why != "" {
+			failed++
+			allRefused = allRefused && refused
+			if first == "" {
+				first = fmt.Sprintf("message %v: %s", r["seq"], why)
+			}
+		}
+	}
+	return failed, failed > 0 && allRefused, first
+}
+
+// refusal returns the receiver's "ERR ..." answer in a send result: its ACK,
+// or with --trace the inner ACK that the timing reply carries.
+func refusal(r map[string]interface{}) string {
+	for _, k := range []string{"ack", "inner_ack"} {
+		if s, _ := r[k].(string); strings.HasPrefix(s, "ERR ") {
+			return s
+		}
+	}
+	return ""
+}
+
 func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
 	for name := range flags {
 		switch name {
-		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
+		case "data", "data-file", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
 		default:
 			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
 		}
@@ -4768,7 +4887,7 @@ func cmdSendMessage(args []string) {
 		defer timer.Stop()
 	}
 	if len(pos) != 1 {
-		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend]")
+		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> | --data - | --data-file <path> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend]")
 	}
 
 	sendCount := flagInt(flags, "count", 1)
@@ -4812,6 +4931,13 @@ func cmdSendMessage(args []string) {
 		}
 	}
 
+	// Read and check the payload first, so a missing file or an oversized
+	// message is reported before the daemon or the network is touched.
+	data, err := messagePayload(flags, os.Stdin)
+	if err != nil {
+		fatalCode("invalid_argument", "%v", err)
+	}
+
 	d := connectDriver()
 	tracef("connectDriver")
 	// d may be replaced by a fresh connection when a dial is retried.
@@ -4823,10 +4949,6 @@ func cmdSendMessage(args []string) {
 		fatalCode("not_found", "%v", err)
 	}
 
-	data := flagString(flags, "data", "")
-	if data == "" {
-		fatalCode("invalid_argument", "--data is required")
-	}
 	msgType := flagString(flags, "type", "text")
 
 	// First contact: the daemon holds no session with the peer yet, so this
@@ -4903,6 +5025,9 @@ func cmdSendMessage(args []string) {
 		if ack != nil {
 			r["ack"] = string(ack.Payload)
 		}
+		if ackErr != nil {
+			r["ack_error"] = ackErr.Error()
+		}
 		if traceTime {
 			r["total_ms"] = float64(time.Duration(ackRecvAtNs-sentAtNs).Microseconds()) / 1000.0
 			if ack != nil && ack.Type == dataexchange.TypeJSON {
@@ -4974,11 +5099,31 @@ func cmdSendMessage(args []string) {
 		defer cl.Close()
 		r := sendOne(cl, 0, false)
 		ackAt := time.Now()
+		// Every receiver answers a stored message with an ACK frame. No ACK
+		// means the message was not stored, or was never sent — the daemon
+		// drops a write it cannot buffer without telling the client — so
+		// "ok" here was reporting messages that never arrived. A send that
+		// failed outright was reported as "ok" with an error field; it is a
+		// failure too.
+		if e, failed := r["error"].(string); failed {
+			fatalHint("connection_failed",
+				"the message was not sent; check `pilotctl peers` and the daemon log, then send again",
+				"sending to %s failed: %s", target, e)
+		}
+		if _, acked := r["ack"]; !acked {
+			why := ""
+			if e, ok := r["ack_error"].(string); ok {
+				why = ": " + e
+			}
+			fatalHint("connection_failed",
+				"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
+				"%s did not acknowledge the message (%d bytes)%s", target, len(data), why)
+		}
 		// The receiver answers "ERR ..." when it could not store the
 		// message (disk full, inbox unwritable). That is a failed send, not
 		// a delivered one — same rule send-file applies.
-		if ackText, _ := r["ack"].(string); strings.HasPrefix(ackText, "ERR ") {
-			fatalCode("internal", "receiver rejected message: %s", ackText)
+		if rej := refusal(r); rej != "" {
+			fatalCode("internal", "receiver rejected message: %s", rej)
 		}
 		result := map[string]interface{}{
 			"target": target.String(),
@@ -5012,8 +5157,7 @@ func cmdSendMessage(args []string) {
 			// more on a new stream if nothing arrived by mid-window.
 			// --no-resend opts out for requests that are not safe to
 			// repeat.
-			_, sendFailed := r["error"]
-			if firstContact && !sendFailed && !flagBool(flags, "no-resend") {
+			if firstContact && !flagBool(flags, "no-resend") {
 				if after := resendDelay(waitDur); after > 0 {
 					cfg.resendAfter = after
 					cfg.resend = func() (time.Time, error) {
@@ -5084,6 +5228,7 @@ func cmdSendMessage(args []string) {
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
+		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
 			"target":     target.String(),
 			"to":         target.String(),
@@ -5104,6 +5249,7 @@ func cmdSendMessage(args []string) {
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
+		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
 			"target":     target.String(),
 			"to":         target.String(),

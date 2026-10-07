@@ -103,7 +103,9 @@ func TestFastRecoveryThirdDupAckSameEpisodeInflation(t *testing.T) {
 	// RFC 5681 §3.2 step 5: also inflate cwnd += SMSS.
 	c.ProcessAck(seqB, true)
 
-	if c.CongWin < congWinBefore+MaxSegmentSize {
+	// The inflation is one segment as sent: SendSegmentSize, which is what a
+	// duplicate ACK says has left the network.
+	if c.CongWin < congWinBefore+SendSegmentSize {
 		t.Errorf("3rd dup ACK (DupAckCount 2→3) same-episode fast recovery: "+
 			"CongWin=%d, want >=%d (%d+MSS=%d); "+
 			"RFC 5681 §3.2 step 5 requires cwnd += SMSS for every dup ACK while in "+
@@ -114,8 +116,8 @@ func TestFastRecoveryThirdDupAckSameEpisodeInflation(t *testing.T) {
 			"the +MSS inflation must fire regardless of newEpisode when already in fast "+
 			"recovery; fix: add 'else if InRecovery && FastRecovery { CongWin += MSS }' "+
 			"after the newEpisode block inside the DupAckCount==3 branch",
-			c.CongWin, congWinBefore+MaxSegmentSize,
-			congWinBefore, congWinBefore+MaxSegmentSize,
+			c.CongWin, congWinBefore+SendSegmentSize,
+			congWinBefore, congWinBefore+SendSegmentSize,
 			recoveryPoint)
 	}
 }

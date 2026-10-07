@@ -485,7 +485,9 @@ func TestHandshakeTrustPersistence(t *testing.T) {
 		}
 	}
 
-	// Verify trust store file exists
+	// Verify trust store file exists. The store is written just after the
+	// peer is marked trusted in memory, so give the write a moment.
+	waitForFile(trustPathA, 5*time.Second)
 	if _, err := os.Stat(trustPathA); err != nil {
 		t.Fatalf("trust store not created: %v", err)
 	}
@@ -614,11 +616,11 @@ func TestHandshakeTrustLoadVerify(t *testing.T) {
 		}
 	}
 
-	// Verify trust file was created and contains correct data
-	data, err := os.ReadFile(trustPath)
-	if err != nil {
-		t.Fatalf("read trust file: %v", err)
-	}
+	// Verify trust file was created and contains correct data. The
+	// handshake manager writes it from a goroutine after the in-memory state
+	// changes; the first write can hold only the pending request, so wait
+	// for one that lists the peer as trusted.
+	data := waitForTrustedInFile(t, trustPath, 5*time.Second)
 
 	var snap struct {
 		Trusted []struct {
@@ -752,3 +754,39 @@ func TestHandshakeTrustLoadFromDisk(t *testing.T) {
 
 var _ = driver.Connect // keep driver import
 var _ = os.Remove      // keep os import
+
+// waitForTrustedInFile returns the trust store's contents once it lists at
+// least one trusted peer, failing the test if that has not happened within
+// timeout.
+func waitForTrustedInFile(t *testing.T, path string, timeout time.Duration) []byte {
+	t.Helper()
+	var last []byte
+	var lastErr error
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		last, lastErr = os.ReadFile(path)
+		if lastErr != nil {
+			continue
+		}
+		var snap struct {
+			Trusted []json.RawMessage `json:"trusted"`
+		}
+		if json.Unmarshal(last, &snap) == nil && len(snap.Trusted) > 0 {
+			return last
+		}
+	}
+	if lastErr != nil {
+		t.Fatalf("read trust file: %v", lastErr)
+	}
+	t.Fatalf("trust file lists no trusted peer after %v: %s", timeout, last)
+	return nil
+}
+
+// waitForFile returns once path exists or the timeout has passed; the
+// caller's own check reports a missing file.
+func waitForFile(path string, timeout time.Duration) {
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+	}
+}
