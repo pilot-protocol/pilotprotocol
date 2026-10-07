@@ -5,6 +5,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,8 +16,8 @@ import (
 
 // dialTimeoutBurst runs dialWedgeThreshold concurrent dials to one peer that
 // never completes a handshake and returns the daemon once every dial has
-// spent its full retry budget. during, if set, runs one second into the
-// dials.
+// spent its full retry budget. before, if set, runs before the dials start;
+// during, if set, one second into them.
 func dialTimeoutBurst(t *testing.T, before, during func(d *Daemon, peerNode uint32)) *Daemon {
 	t.Helper()
 	d := New(Config{})
@@ -66,9 +67,7 @@ func TestRxWatchdogDialTimeoutsWhileAnotherDialSucceedsAreNotAWedge(t *testing.T
 
 	now := time.Now()
 	d := dialTimeoutBurst(t, nil, func(d *Daemon, peerNode uint32) {
-		// What a dial that completes does (dialConnectionLocked).
-		d.lastDialOKNano.Store(time.Now().UnixNano())
-		d.consecutiveDialTimeouts.Store(0)
+		completeDial(t, d, 0xCAFED00D)
 	})
 	if c := d.consecutiveDialTimeouts.Load(); c != 0 {
 		t.Errorf("consecutiveDialTimeouts = %d after timeouts during which another dial succeeded, want 0", c)
@@ -107,6 +106,54 @@ func TestRxWatchdogPeerKeepalivesDoNotHideAWedge(t *testing.T) {
 	}
 }
 
+// TestRxWatchdogDialSuccessBeforeTheBurstDoesNotHideIt: only a dial that
+// completes while a timed-out dial ran says the outbound path worked during
+// it. One that completed earlier says nothing about the dials after it.
+func TestRxWatchdogDialSuccessBeforeTheBurstDoesNotHideIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long retry-budget test")
+	}
+	t.Parallel()
+
+	d := dialTimeoutBurst(t, func(d *Daemon, peerNode uint32) {
+		completeDial(t, d, 0xCAFED00E)
+	}, nil)
+	if c := d.consecutiveDialTimeouts.Load(); c != dialWedgeThreshold {
+		t.Fatalf("consecutiveDialTimeouts = %d after timeouts that all started after the last success, want %d", c, dialWedgeThreshold)
+	}
+}
+
+// completeDial dials a second, answering peer and completes the handshake
+// the way the network would: its SYN is answered with a SYN-ACK.
+func completeDial(t *testing.T, d *Daemon, peer uint32) {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	d.AddTunnelPeer(peer, pc.LocalAddr().(*net.UDPAddr))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.DialConnectionContext(context.Background(), protocol.Addr{Network: 0, Node: peer}, 1001)
+		done <- err
+	}()
+	var syn *protocol.Packet
+	for deadline := time.Now().Add(5 * time.Second); syn == nil && time.Now().Before(deadline); {
+		if p := recvPacket(t, pc, time.Second); p != nil && p.Flags&protocol.FlagSYN != 0 {
+			syn = p
+		}
+	}
+	if syn == nil {
+		t.Fatal("no SYN reached the answering peer")
+	}
+	d.handleStreamPacket(streamPacket(protocol.FlagSYN|protocol.FlagACK, peer, d.NodeID(), syn.DstPort, syn.SrcPort, 999, syn.Seq+1))
+	if err := <-done; err != nil {
+		t.Fatalf("dial to the answering peer: %v", err)
+	}
+}
+
 // TestRxWatchdogDialTimeoutsToSilentPeerStillCount keeps the partial-wedge
 // detector (2026-07-15) intact: with no dial succeeding meanwhile, every
 // timeout counts and the watchdog recovers even though rx is trickling.
@@ -117,9 +164,7 @@ func TestRxWatchdogDialTimeoutsToSilentPeerStillCount(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	d := dialTimeoutBurst(t, func(d *Daemon, peerNode uint32) {
-		d.tunnels.kx.SetLastInboundDecryptForTest(peerNode, time.Now().Add(-time.Minute))
-	}, nil)
+	d := dialTimeoutBurst(t, nil, nil)
 	if c := d.consecutiveDialTimeouts.Load(); c != dialWedgeThreshold {
 		t.Fatalf("consecutiveDialTimeouts = %d after timeouts to a silent peer, want %d", c, dialWedgeThreshold)
 	}
