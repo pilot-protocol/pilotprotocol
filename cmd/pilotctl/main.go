@@ -1397,7 +1397,10 @@ Flags:
 
 Send a single unreliable datagram to a remote node on the given port.
 Unlike send-message (which uses the reliable data-exchange stream), datagrams
-are fire-and-forget — no ACK, no retry, no ordering guarantee.
+have no ACK, no retry and no ordering guarantee. The local daemon does say
+whether it sent the datagram: if it could not (no route to the node, port
+policy, payload too large) the command fails with its reason. "confirmed":
+false means the daemon is too old to say, and the datagram was sent anyway.
 
 Use for: real-time telemetry, heartbeats, anything where freshness > reliability.
 `,
@@ -4498,8 +4501,16 @@ func cmdDgram(args []string) {
 		fatalCode("invalid_argument", "--data is required")
 	}
 
-	if err := d.SendTo(target, port, []byte(data)); err != nil {
-		fatalCode("connection_failed", "sendto: %v", err)
+	// The daemon says whether it sent the datagram. The fire-and-forget
+	// send reported success even when the daemon could not send it (no
+	// route to the node, port policy, ephemeral ports exhausted).
+	confirmed, err := d.SendToConfirmed(target, port, []byte(data))
+	if err != nil {
+		if errors.Is(err, driver.ErrConfirmTimeout) {
+			fatalHint("timeout", "the datagram may or may not have been sent; datagrams are unreliable, so send it again if it matters", "%v", err)
+		}
+		// The driver's error already names the step ("daemon: sendto: ...").
+		fatalCode("connection_failed", "%v", err)
 	}
 
 	if jsonOutput {
@@ -4507,9 +4518,14 @@ func cmdDgram(args []string) {
 			"target": target.String(),
 			"port":   port,
 			"bytes":  len(data),
+			// false: the daemon predates confirmed sends and could not
+			// say; the datagram was sent the old way.
+			"confirmed": confirmed,
 		})
-	} else {
+	} else if confirmed {
 		fmt.Printf("sent %d byte(s) to %s port %d\n", len(data), target, port)
+	} else {
+		fmt.Printf("sent %d byte(s) to %s port %d (the daemon is too old to confirm it was sent)\n", len(data), target, port)
 	}
 }
 
