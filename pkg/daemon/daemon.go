@@ -4288,10 +4288,7 @@ const QuickACKBudget = 32
 var ErrSendBufFull = errors.New("send buffer full")
 
 func (d *Daemon) SendData(conn *Connection, data []byte) error {
-	conn.Mu.Lock()
-	st := conn.State
-	conn.Mu.Unlock()
-	if st != StateEstablished {
+	if !connEstablished(conn) {
 		return fmt.Errorf("connection not established")
 	}
 
@@ -4299,6 +4296,10 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 	// below must not interleave with another writer's bytes.
 	conn.WriteMu.Lock()
 	defer conn.WriteMu.Unlock()
+	// The connection may have been closed while this writer queued.
+	if !connEstablished(conn) {
+		return fmt.Errorf("connection not established")
+	}
 
 	// If Nagle is disabled (NoDelay), send everything immediately in segments
 	if conn.NoDelay {
@@ -4320,11 +4321,46 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 	// than a held tail and one piece of this write.
 	for len(data) > nagleWritePiece {
 		if err := d.sendDataPiece(conn, data[:nagleWritePiece], tailNow); err != nil {
-			return err
+			if err := d.drainAfterSendError(conn, err, tailNow); err != nil {
+				return err
+			}
 		}
 		data = data[nagleWritePiece:]
+		// Closed while this write waited on the window: send no more of
+		// it, nothing may follow the FIN.
+		if !connEstablished(conn) {
+			return protocol.ErrConnClosed
+		}
 	}
 	return d.sendDataPiece(conn, data, tailNow)
+}
+
+// connEstablished reports whether conn is still open for sending.
+func connEstablished(conn *Connection) bool {
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	return conn.State == StateEstablished
+}
+
+// drainAfterSendError finishes flushing a piece of a large write after a
+// send error, so the rest of the write can follow it.
+//
+// A tunnel send error does not lose the segment: it was given its sequence
+// number and tracked before the send, and the retransmit loop resends it.
+// Stopping the write there instead dropped the pieces not yet buffered — they
+// never got sequence numbers — and the connection's next write landed in
+// their place in the stream. Every failed attempt still commits a segment, so
+// this ends (or blocks on the window like any write). It gives up only when
+// the connection is gone.
+func (d *Daemon) drainAfterSendError(conn *Connection, err error, tailNow bool) error {
+	for err != nil {
+		if errors.Is(err, protocol.ErrConnClosed) || errors.Is(err, ErrSendBufFull) || !connEstablished(conn) {
+			return err
+		}
+		slog.Debug("stream send failed; the segment will be retransmitted", "conn_id", conn.ID, "err", err)
+		_, err = d.flushNagle(conn, tailNow, false)
+	}
+	return nil
 }
 
 // nagleWritePiece is how much of one large write SendData buffers at a time:

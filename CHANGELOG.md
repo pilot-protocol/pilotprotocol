@@ -15,6 +15,9 @@ Detailed per-release notes are on the
   capped by the OS — a 1 MB `--data` failed with "Argument list too long",
   and on Linux a single argument stops at 128 KiB — which is why senders of
   large bodies needed a separate stdin helper.
+  `--data -` now means stdin, so a message that is just `-` has to come from
+  `--data-file`. One message can carry up to the 64 MiB data-exchange frame
+  limit; a larger payload is refused before anything is sent.
 - **A client can ask the daemon whether a datagram was actually sent.** The
   IPC `SendTo` command is fire-and-forget: when the daemon could not send a
   datagram (no route to the node, port policy, ephemeral ports exhausted) it

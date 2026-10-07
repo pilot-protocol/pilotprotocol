@@ -86,20 +86,25 @@ func TestUndeliveredMessages(t *testing.T) {
 		{"seq": 3, "ack": "ERR inbox not writable"},
 		{"seq": 4, "ack": "ACK TEXT 5 bytes"},
 	}
-	failed, first := undelivered(results)
-	if failed != 3 {
-		t.Errorf("failed = %d, want 3", failed)
+	failed, allRefused, first := undelivered(results)
+	if failed != 3 || allRefused {
+		t.Errorf("failed = %d, allRefused = %v, want 3 and false", failed, allRefused)
 	}
 	if first != "message 1: write: connection closed" {
 		t.Errorf("first = %q", first)
 	}
-	if failed, _ := undelivered(results[4:]); failed != 0 {
+	if failed, _, _ := undelivered(results[4:]); failed != 0 {
 		t.Errorf("an acknowledged message counted as undelivered")
 	}
-	if _, first := undelivered(results[2:3]); !strings.Contains(first, "not acknowledged (EOF)") {
+	if _, _, first := undelivered(results[2:3]); !strings.Contains(first, "not acknowledged (EOF)") {
 		t.Errorf("first = %q, want the ACK read error", first)
 	}
-	if _, first := undelivered(results[3:4]); !strings.Contains(first, "ERR inbox not writable") {
-		t.Errorf("first = %q, want the receiver's refusal", first)
+	if _, allRefused, first := undelivered(results[3:4]); !allRefused || !strings.Contains(first, "ERR inbox not writable") {
+		t.Errorf("first = %q, allRefused = %v, want the receiver's refusal", first, allRefused)
+	}
+	// With --trace the ACK is timing JSON and a refusal is in inner_ack.
+	traced := []map[string]interface{}{{"seq": 0, "ack": `{"received_at_ns":1}`, "inner_ack": "ERR disk full"}}
+	if failed, allRefused, _ := undelivered(traced); failed != 1 || !allRefused {
+		t.Errorf("a refusal reported in inner_ack counted as delivered")
 	}
 }

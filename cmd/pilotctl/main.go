@@ -185,6 +185,10 @@ func classifyDaemonError(err error) string {
 	return ""
 }
 
+// fatalResults, when set, goes into fatalHint's JSON envelope as "results",
+// so a multi-message send that fails still says what became of each message.
+var fatalResults []map[string]interface{}
+
 // fatalHint is like fatalCode but adds an actionable hint telling the user what to do next.
 func fatalHint(code, hint, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
@@ -203,6 +207,9 @@ func fatalHint(code, hint, format string, args ...interface{}) {
 		// other exit). Additive: existing keys keep their shape and value.
 		if ns := nextStepsEnvelope(exitNextSteps); ns != nil {
 			env["next_steps"] = ns
+		}
+		if fatalResults != nil {
+			env["results"] = fatalResults
 		}
 		b, _ := json.Marshal(env)
 		fmt.Fprintln(os.Stderr, string(b))
@@ -1632,7 +1639,7 @@ Communication commands:
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
   pilotctl send-file <address|hostname> <filepath>
-  pilotctl send-message <address|hostname> --data <text> | --data-file <path> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
+  pilotctl send-message <address|hostname> --data <text> | --data - | --data-file <path> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
   pilotctl publish <address|hostname> <topic> --data <message>
@@ -2491,8 +2498,8 @@ func contextCatalog() map[string]interface{} {
 
 			// Messaging
 			"send-message": map[string]interface{}{
-				"args":        []string{"<address|hostname>", "--data <text>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]"},
-				"description": "Send a typed message to a node via data exchange (port 1001). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Default type: text",
+				"args":        []string{"<address|hostname>", "--data <text> | --data - | --data-file <path>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]"},
+				"description": "Send a typed message to a node via data exchange (port 1001). --data - reads the payload from stdin, --data-file from a file (up to 64 MiB; a command-line argument is capped by the OS). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Fails unless every message is acknowledged. Default type: text",
 				"returns":     "target, to, type, bytes, ack, reuse_conn",
 			},
 			"send-file": map[string]interface{}{
@@ -4797,19 +4804,30 @@ func maxMessageBytes() int {
 
 // failIfUndelivered ends a multi-message send with an error when any message
 // failed to send, was not acknowledged, or was refused by the receiver:
-// reporting "ok" for those hid messages that never arrived.
+// reporting "ok" for those hid messages that never arrived. The error carries
+// every message's result, so a caller can tell which ones to send again.
 func failIfUndelivered(target string, results []map[string]interface{}) {
-	if failed, first := undelivered(results); failed > 0 {
-		fatalHint("connection_failed", first, "%d of %d messages to %s were not delivered", failed, len(results), target)
+	failed, allRefused, first := undelivered(results)
+	if failed == 0 {
+		return
 	}
+	code := "connection_failed"
+	if allRefused {
+		code = "internal" // as for a single message the receiver refuses
+	}
+	fatalResults = results
+	fatalHint(code, "the results list which messages were delivered; check `pilotctl peers` and the daemon log before sending the others again",
+		"%d of %d messages to %s were not delivered (first, %s)", failed, len(results), target, first)
 }
 
 // undelivered counts the send results that did not end in a stored message,
-// and describes the first of them.
-func undelivered(results []map[string]interface{}) (failed int, first string) {
+// says whether all of those were refused by the receiver, and describes the
+// first of them.
+func undelivered(results []map[string]interface{}) (failed int, allRefused bool, first string) {
+	allRefused = true
 	for _, r := range results {
-		why := ""
-		ackText, acked := r["ack"].(string)
+		why, refused := "", false
+		_, acked := r["ack"].(string)
 		switch {
 		case r["error"] != nil:
 			why = fmt.Sprint(r["error"])
@@ -4818,17 +4836,29 @@ func undelivered(results []map[string]interface{}) (failed int, first string) {
 			if e, ok := r["ack_error"].(string); ok {
 				why += " (" + e + ")"
 			}
-		case strings.HasPrefix(ackText, "ERR "):
-			why = "receiver rejected it: " + ackText
+		case refusal(r) != "":
+			why, refused = "receiver refused it: "+refusal(r), true
 		}
 		if why != "" {
 			failed++
+			allRefused = allRefused && refused
 			if first == "" {
 				first = fmt.Sprintf("message %v: %s", r["seq"], why)
 			}
 		}
 	}
-	return failed, first
+	return failed, failed > 0 && allRefused, first
+}
+
+// refusal returns the receiver's "ERR ..." answer in a send result: its ACK,
+// or with --trace the inner ACK that the timing reply carries.
+func refusal(r map[string]interface{}) string {
+	for _, k := range []string{"ack", "inner_ack"} {
+		if s, _ := r[k].(string); strings.HasPrefix(s, "ERR ") {
+			return s
+		}
+	}
+	return ""
 }
 
 func cmdSendMessage(args []string) {
@@ -5090,8 +5120,8 @@ func cmdSendMessage(args []string) {
 		// The receiver answers "ERR ..." when it could not store the
 		// message (disk full, inbox unwritable). That is a failed send, not
 		// a delivered one — same rule send-file applies.
-		if ackText, _ := r["ack"].(string); strings.HasPrefix(ackText, "ERR ") {
-			fatalCode("internal", "receiver rejected message: %s", ackText)
+		if rej := refusal(r); rej != "" {
+			fatalCode("internal", "receiver rejected message: %s", rej)
 		}
 		result := map[string]interface{}{
 			"target": target.String(),
