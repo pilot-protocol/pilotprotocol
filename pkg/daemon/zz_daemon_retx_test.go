@@ -93,18 +93,71 @@ func TestRetransmitUnackedWithinRTOWindowReturns(t *testing.T) {
 	}
 }
 
-func TestRetransmitUnackedAllSackedSkipsAll(t *testing.T) {
+// SACKed segments sent less than an RTO ago are not resent: the receiver
+// holds them and the cumulative ACK has had no time to pass them.
+func TestRetransmitUnackedRecentlySackedWaits(t *testing.T) {
 	t.Parallel()
 	d := &Daemon{ports: NewPortManager()}
 	conn, captured := newDaemonRetxConn(t)
 	conn.Unacked = []*retxEntry{
-		{seq: 1000, data: []byte("a"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true},
-		{seq: 1001, data: []byte("b"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true},
+		{seq: 1000, data: []byte("a"), sentAt: time.Now(), sacked: true},
+		{seq: 1001, data: []byte("b"), sentAt: time.Now(), sacked: true},
 	}
 	d.retransmitUnacked(conn)
 
 	if captured.Len() != 0 {
-		t.Errorf("all-sacked: expected no packets, got %d", captured.Len())
+		t.Errorf("recently sacked: expected no packets, got %d", captured.Len())
+	}
+}
+
+// The oldest unacknowledged segment is marked SACKed and has gone an RTO
+// since it was sent: the receiver has it parked, not delivered (a receiver
+// whose application stopped reading does this). It used to be skipped
+// forever, and the transfer stood still until the application gave up.
+// RFC 2018 §5.1: forget the SACK marks and resend from the cumulative ACK.
+func TestRetransmitUnackedResendsAStaleSackedHead(t *testing.T) {
+	t.Parallel()
+	d := &Daemon{ports: NewPortManager()}
+	conn, captured := newDaemonRetxConn(t)
+	conn.Unacked = []*retxEntry{
+		{seq: 1000, data: []byte("a"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true, attempts: 1},
+		{seq: 1001, data: []byte("b"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true, attempts: 1},
+	}
+	d.retransmitUnacked(conn)
+
+	if captured.Len() != 1 {
+		t.Fatalf("stale sacked head: expected one retransmission, got %d", captured.Len())
+	}
+	if p := captured.Last(); p.Seq != 1000 || string(p.Payload) != "a" {
+		t.Errorf("resent seq=%d payload=%q, want the oldest segment (1000, \"a\")", p.Seq, p.Payload)
+	}
+	for _, e := range conn.Unacked {
+		if e.sacked {
+			t.Errorf("segment %d still marked SACKed after the timeout", e.seq)
+		}
+	}
+	if conn.Unacked[0].attempts != 2 {
+		t.Errorf("attempts = %d, want 2", conn.Unacked[0].attempts)
+	}
+}
+
+// Ordinary SACK recovery is unchanged: when a segment before the SACKed
+// ones is missing, only it is resent and the SACK marks stay.
+func TestRetransmitUnackedKeepsSackMarksBehindAHole(t *testing.T) {
+	t.Parallel()
+	d := &Daemon{ports: NewPortManager()}
+	conn, captured := newDaemonRetxConn(t)
+	conn.Unacked = []*retxEntry{
+		{seq: 1000, data: []byte("a"), sentAt: time.Now().Add(-1 * time.Hour), attempts: 1},
+		{seq: 1001, data: []byte("b"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true, attempts: 1},
+	}
+	d.retransmitUnacked(conn)
+
+	if captured.Len() != 1 || captured.Last().Seq != 1000 {
+		t.Fatalf("expected the hole (seq 1000) resent once, got %d packets", captured.Len())
+	}
+	if !conn.Unacked[1].sacked {
+		t.Error("the SACKed segment behind the hole lost its mark")
 	}
 }
 
@@ -403,5 +456,45 @@ func TestSendSegmentRetxStopClosedAbortsZeroWinProbe(t *testing.T) {
 	// SendSeq must not have advanced (we never sent).
 	if conn.SendSeq != 500 {
 		t.Errorf("SendSeq = %d, want 500 (unchanged)", conn.SendSeq)
+	}
+}
+
+// The same at close: data all SACKed and the FIN sentinel outstanding. The
+// data is resent, not the FIN.
+func TestRetransmitUnackedResendsStaleSackedDataBeforeTheFIN(t *testing.T) {
+	t.Parallel()
+	d := &Daemon{ports: NewPortManager()}
+	conn, captured := newDaemonRetxConn(t)
+	conn.State = StateFinWait
+	conn.Unacked = []*retxEntry{
+		{seq: 1000, data: []byte("a"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true, attempts: 1},
+		{seq: 1001, isFIN: true, sentAt: time.Now().Add(-1 * time.Hour), attempts: 1},
+	}
+	d.retransmitUnacked(conn)
+
+	if captured.Len() != 1 {
+		t.Fatalf("expected one retransmission, got %d", captured.Len())
+	}
+	if p := captured.Last(); p.Seq != 1000 || p.HasFlag(protocol.FlagFIN) {
+		t.Errorf("resent seq=%d flags=%d, want the data segment 1000", p.Seq, p.Flags)
+	}
+}
+
+// A parked head is resent even when a segment behind it is not SACKed: a
+// receiver whose reorder buffer is full cannot SACK the rest, and waiting
+// for every segment to be SACKed left the head stuck until the connection
+// was reset.
+func TestRetransmitUnackedResendsAStaleSackedHeadWithUnsackedSegmentsBehind(t *testing.T) {
+	t.Parallel()
+	d := &Daemon{ports: NewPortManager()}
+	conn, captured := newDaemonRetxConn(t)
+	conn.Unacked = []*retxEntry{
+		{seq: 1000, data: []byte("a"), sentAt: time.Now().Add(-1 * time.Hour), sacked: true, attempts: 1},
+		{seq: 1001, data: []byte("b"), sentAt: time.Now(), attempts: 1},
+	}
+	d.retransmitUnacked(conn)
+
+	if captured.Len() != 1 || captured.Last().Seq != 1000 {
+		t.Fatalf("expected the parked head (seq 1000) resent, got %d packets", captured.Len())
 	}
 }

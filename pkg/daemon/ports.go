@@ -1469,10 +1469,32 @@ func (c *Connection) DeliverInOrder(seq uint32, data []byte) uint32 {
 			c.OOOBuf = append(c.OOOBuf, &recvSegment{seq: seg.seq, data: seg.data})
 		}
 	}
+	c.dropOOOBefore(c.ExpectedSeq)
 	expectedSeq := c.ExpectedSeq
 	c.RecvMu.Unlock()
 
 	return expectedSeq
+}
+
+// dropOOOBefore removes reorder-buffer entries that start before expected:
+// the stream has moved past them. A segment re-buffered above at
+// ExpectedSeq and then delivered when the sender resent it left its parked
+// copy here for the life of the connection. That kept the buffer non-empty
+// (every segment ACKed at once, with a stale SACK block), held one of its
+// MaxOOOBuf slots, and once the sequence space wrapped, 4 GiB later, the
+// stale bytes were delivered as the continuation of whatever segment ended
+// at their sequence number. Caller holds RecvMu.
+func (c *Connection) dropOOOBefore(expected uint32) {
+	kept := c.OOOBuf[:0]
+	for _, seg := range c.OOOBuf {
+		if seqAfterOrEqual(seg.seq, expected) {
+			kept = append(kept, seg)
+		}
+	}
+	for i := len(kept); i < len(c.OOOBuf); i++ {
+		c.OOOBuf[i] = nil
+	}
+	c.OOOBuf = kept
 }
 
 // CloseRecvBuf safely closes RecvBuf exactly once. Sets RecvClosed first so

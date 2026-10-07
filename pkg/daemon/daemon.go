@@ -4842,15 +4842,17 @@ func (d *Daemon) retxLoop(conn *Connection) {
 	}
 }
 
-// unackedHasData returns true if conn.Unacked contains any non-FIN,
-// non-SACKed entry. Used by retxLoop to decide whether the FinWait
-// state still has work to do (real DATA still in flight) or just
-// the FIN sentinel (no useful retx left).
+// unackedHasData returns true if conn.Unacked contains any data entry,
+// SACKed or not. Used by retxLoop to decide whether the FinWait state
+// still has work to do (data not yet cumulatively acknowledged) or just
+// the FIN sentinel (no useful retx left). SACKed data counts: the
+// receiver may be holding it in its reorder buffer without delivering it,
+// and only the timeout in retransmitUnacked gets it delivered.
 func (d *Daemon) unackedHasData(conn *Connection) bool {
 	conn.RetxMu.Lock()
 	defer conn.RetxMu.Unlock()
 	for _, e := range conn.Unacked {
-		if e.isFIN || e.sacked {
+		if e.isFIN {
 			continue
 		}
 		return true
@@ -4871,6 +4873,25 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 	// Only retransmit one segment per RTO period (like real TCP).
 	if !conn.LastRetxTime.IsZero() && now.Sub(conn.LastRetxTime) < conn.RTO {
 		return
+	}
+
+	// RFC 2018 §5.1: a SACK is advice, not an acknowledgement. The oldest
+	// unacknowledged segment marked SACKed means the receiver does not hold
+	// it where it counts: a receiver that holds the segment at its
+	// cumulative ACK delivers it and moves the ACK on. A receiver whose
+	// application stopped reading parks that segment in its reorder buffer
+	// when delivery times out, keeps SACKing it, and only delivers it when
+	// it arrives again (v1.15.0 and later do this). Skipping SACKed
+	// segments, as the loop below does, then never resent it: the transfer
+	// stood still until the application gave up — about one in ten bulk
+	// transfers into a v1.15.0 node over the relay. Once the head has gone
+	// an RTO since it was last sent, forget the marks so the timeout
+	// resends from the cumulative ACK (Linux's SACK-reneging check does the
+	// same); a receiver that really holds the data says so in its next ACK.
+	if first := conn.Unacked[0]; first.sacked && now.Sub(first.sentAt) > conn.RTO {
+		for _, e := range conn.Unacked {
+			e.sacked = false
+		}
 	}
 
 	// Find the first non-SACKed unacked segment that has timed out
