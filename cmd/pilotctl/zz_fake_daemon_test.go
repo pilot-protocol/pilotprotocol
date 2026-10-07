@@ -57,6 +57,8 @@ const (
 	tdCmdSubmitBadgeOK     byte = 0x30
 	tdCmdEnrollRecovery    byte = 0x31
 	tdCmdEnrollRecoveryOK  byte = 0x32
+	tdCmdSendToConfirm     byte = 0x39
+	tdCmdSendToOK          byte = 0x3A
 )
 
 // shortSock returns a /tmp/ps-XXX.sock path short enough for macOS's

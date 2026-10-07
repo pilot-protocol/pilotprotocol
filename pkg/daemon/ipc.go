@@ -1097,6 +1097,12 @@ func (s *IPCServer) handleSendTo(conn *ipcConn, reqID uint64, payload []byte) {
 // outcome. CmdSendToOK (no body) means the datagram was handed to the
 // tunnel — datagrams are unreliable, so it says nothing about delivery.
 // CmdError carries the reason the daemon could not send it.
+//
+// Every error reply here must start with "sendto: ". The IPC carries no
+// request IDs, and that prefix is how the driver recognises a confirmed
+// send's answer among other requests' replies (common/driver
+// isConfirmAnswer); an error without it would leave the driver waiting
+// for an answer that already came.
 func (s *IPCServer) handleSendToConfirm(conn *ipcConn, reqID uint64, payload []byte) {
 	if len(payload) < protocol.AddrSize+2 {
 		s.sendError(conn, reqID, "sendto: missing header")

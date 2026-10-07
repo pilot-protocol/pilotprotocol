@@ -4498,7 +4498,14 @@ func cmdDgram(args []string) {
 		fatalCode("invalid_argument", "--data is required")
 	}
 
-	if err := d.SendTo(target, port, []byte(data)); err != nil {
+	// The daemon says whether it sent the datagram. The fire-and-forget
+	// send reported success even when the daemon could not send it (no
+	// route to the node, port policy, ephemeral ports exhausted).
+	confirmed, err := d.SendToConfirmed(target, port, []byte(data))
+	if err != nil {
+		if errors.Is(err, driver.ErrConfirmTimeout) {
+			fatalHint("timeout", "the datagram may or may not have been sent; datagrams are unreliable, so send it again if it matters", "sendto: %v", err)
+		}
 		fatalCode("connection_failed", "sendto: %v", err)
 	}
 
@@ -4507,9 +4514,14 @@ func cmdDgram(args []string) {
 			"target": target.String(),
 			"port":   port,
 			"bytes":  len(data),
+			// false: the daemon predates confirmed sends and could not
+			// say; the datagram was sent the old way.
+			"confirmed": confirmed,
 		})
-	} else {
+	} else if confirmed {
 		fmt.Printf("sent %d byte(s) to %s port %d\n", len(data), target, port)
+	} else {
+		fmt.Printf("sent %d byte(s) to %s port %d (the daemon is too old to confirm it was sent)\n", len(data), target, port)
 	}
 }
 

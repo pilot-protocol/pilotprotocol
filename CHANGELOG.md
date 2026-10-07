@@ -27,8 +27,11 @@ Detailed per-release notes are on the
   and replies OK once it is handed to the tunnel, or with the error. The
   daemon lists `dgram_confirm` in the `info` reply's `features`. The
   existing `SendTo` command is unchanged and still never replies, so
-  current clients and SDKs are unaffected; `pilotctl dgram` switches to the
-  confirmed send once the driver release that carries it is picked up.
+  current clients and SDKs are unaffected. The driver's `SendToConfirmed`
+  (common v0.6.1) uses it, and so does `pilotctl dgram`: a datagram the
+  daemon refuses fails the command with the reason, an answer that does not
+  come in time says the outcome is unknown, and against an older daemon it
+  sends the old way and reports `"confirmed": false`.
 - **`pilotctl send-message --wait` can match the reply by message ID.** The
   wait takes the oldest new message from the peer, so two concurrent
   requests to one peer, or anything else the peer sends in the window, can
