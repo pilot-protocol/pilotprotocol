@@ -23,8 +23,9 @@ import (
 //     polls every handshakeFastPollInterval until the peer answers, becomes
 //     trusted, or handshakeFastPollWindow has passed.
 //   - On demand: a local client asking for pending requests or the trust
-//     list, approving, rejecting or waiting for trust triggers one poll
-//     first, at most one per handshakeOnDemandGap.
+//     list, approving or rejecting triggers one poll first, at most one per
+//     handshakeOnDemandGap. Waiting for trust does too, but only while a
+//     request this node sent that peer is unanswered.
 //   - Poke: the beacon can tell this node that something is waiting for it
 //     at the registry (beaconMsgNotify). A poke triggers one poll, from a
 //     small token bucket, and never sooner than handshakeOnDemandGap after
@@ -150,13 +151,20 @@ func (s *handshakePollSched) requestSent(peer uint32, explicit bool) {
 	case !tracked && len(s.waiting) >= handshakeMaxWaiting:
 		s.pruneLocked(now)
 		if len(s.waiting) >= handshakeMaxWaiting {
-			// Still full of peers whose window has closed and that are
-			// only kept for their rearm time. Let those go rather than
-			// refuse a new request its fast polling.
+			// Still full, partly of peers whose window has closed and that
+			// are only kept for their rearm time. Let the one whose rearm
+			// ends soonest go rather than refuse a new request its fast
+			// polling; the others keep their hold-off.
+			var oldest uint32
+			var oldestRearm time.Time
+			found := false
 			for p, w := range s.waiting {
-				if !now.Before(w.until) {
-					delete(s.waiting, p)
+				if !now.Before(w.until) && (!found || w.rearm.Before(oldestRearm)) {
+					oldest, oldestRearm, found = p, w.rearm, true
 				}
+			}
+			if found {
+				delete(s.waiting, oldest)
 			}
 		}
 		if len(s.waiting) >= handshakeMaxWaiting {
@@ -285,6 +293,27 @@ func (s *handshakePollSched) end() {
 	s.nudge()
 }
 
+// waitIdle waits up to timeout for a poll in flight to finish, and reports
+// whether none is running when it returns. Shutdown calls it before closing
+// the registry client: the registry empties the node's handshake inbox as it
+// answers, so a poll cut off mid-reply would lose what it carried.
+func (s *handshakePollSched) waitIdle(timeout time.Duration) bool {
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+	if running == nil {
+		return true
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-running:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
 // sinceLastPoll is how long ago the most recent poll started.
 func (s *handshakePollSched) sinceLastPoll() time.Duration {
 	s.mu.Lock()
@@ -357,6 +386,11 @@ func (s *handshakePollSched) pokeWait() (due bool, wait time.Duration) {
 // would be handshakes lost.
 func (d *Daemon) pollHandshakes(minGap, wait time.Duration) {
 	s := d.hsPoll
+	if d.stopping() {
+		// No new poll once shutdown has begun: the registry client is about
+		// to be closed, and a poll cut off by that loses what it fetched.
+		return
+	}
 	if d.reg() == nil {
 		// Nothing to poll; do not leave a poke owed (the loop would keep
 		// re-arming its timer for a poll that cannot run).

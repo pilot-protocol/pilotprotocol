@@ -381,6 +381,14 @@ func TestSettledPeersDoNotCrowdOutANewRequest(t *testing.T) {
 	if !s.waitingOn(1000) {
 		t.Fatalf("with %d answered peers tracked, a new request got no fast polling", handshakeMaxWaiting)
 	}
+	// Only one settled peer made room; the rest keep their hold-off, so an
+	// automatic handshake to them still cannot reopen a window early.
+	s.mu.Lock()
+	kept := len(s.waiting)
+	s.mu.Unlock()
+	if kept != handshakeMaxWaiting {
+		t.Fatalf("%d peers tracked after making room for one, want %d", kept, handshakeMaxWaiting)
+	}
 
 	// Still a cap on requests that are genuinely outstanding.
 	s = newHandshakePollSched()
@@ -425,12 +433,56 @@ func TestBeaconNotifyOfUnknownKindIsDropped(t *testing.T) {
 
 	tm.handleBeaconMessage([]byte{beaconMsgNotify}, beacon)
 	tm.handleBeaconMessage([]byte{beaconMsgNotify, 0x02}, beacon)
-	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake, 0x00}, beacon)
 	if calls != 0 {
 		t.Fatalf("a malformed or unknown notify ran the handler %d times", calls)
 	}
 	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake}, beacon)
 	if calls != 1 {
 		t.Fatalf("a handshake notify ran the handler %d times, want 1", calls)
+	}
+	// A later beacon may add bytes after the kind; this daemon still acts on
+	// the kind it knows.
+	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake, 0x00, 0x07}, beacon)
+	if calls != 2 {
+		t.Fatalf("a handshake notify with trailing bytes ran the handler %d times in total, want 2", calls)
+	}
+}
+
+// Shutdown waits for a poll in flight before closing the registry client
+// (a poll cut off mid-reply loses what the registry already took out of the
+// inbox), and starts no new poll once it has begun.
+func TestShutdownWaitsForThePollInFlight(t *testing.T) {
+	t.Parallel()
+	reg, rc := startTestRegistry(t)
+	t.Cleanup(func() { reg.Close() })
+	t.Cleanup(func() { rc.Close() })
+	d := New(Config{KeepaliveInterval: time.Hour})
+	d.regConn.Store(rc)
+
+	release := make(chan struct{})
+	var finished atomic.Int32
+	d.hsPoll.run = func() {
+		<-release
+		finished.Add(1)
+	}
+	d.pollHandshakes(0, 0)
+	if d.hsPoll.waitIdle(50 * time.Millisecond) {
+		t.Fatal("waitIdle reported idle with a poll in flight")
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(release)
+	}()
+	if !d.hsPoll.waitIdle(2 * time.Second) {
+		t.Fatal("waitIdle gave up although the poll finished")
+	}
+	if finished.Load() != 1 {
+		t.Fatal("the poll did not run to completion")
+	}
+
+	close(d.stopCh)
+	d.pollHandshakes(0, 0)
+	if got := d.RelayedHandshakePolls(); got != 1 {
+		t.Fatalf("registry polls = %d after shutdown began, want 1 (none new)", got)
 	}
 }

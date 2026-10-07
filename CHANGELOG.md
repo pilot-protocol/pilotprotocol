@@ -285,6 +285,12 @@ Detailed per-release notes are on the
     `~/.pilot/update-state.json`.
 
 ### Fixed
+- **A daemon stopping mid-poll no longer loses relayed handshakes.** The
+  registry empties a node's handshake inbox as it answers a poll, and
+  shutdown closed the registry client without waiting for a poll in flight,
+  so a restart during one dropped the requests and approvals it carried.
+  Shutdown now waits up to 5s for it, and starts no new poll once it has
+  begun.
 - **Stream segments fit one packet.** A full stream segment was 4096 bytes,
   about 4.2 KB on the wire and three IP fragments on a 1500-byte path. NATs,
   firewalls and some virtual networks drop fragments, so on those paths

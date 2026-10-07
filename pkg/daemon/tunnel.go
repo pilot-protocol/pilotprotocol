@@ -2332,8 +2332,10 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 			slog.Debug("dropping notify from non-beacon source", "from", from)
 			return
 		}
-		if len(data) != 2 || data[1] != beaconNotifyHandshake {
+		if len(data) < 2 || data[1] != beaconNotifyHandshake {
 			// A kind this daemon does not know is not a reason to poll.
+			// Bytes after a known kind are ignored, so a later beacon can
+			// add to the message without older daemons dropping it.
 			slog.Debug("dropping beacon notify of unknown kind", "len", len(data))
 			return
 		}

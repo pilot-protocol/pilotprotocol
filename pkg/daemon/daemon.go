@@ -1713,6 +1713,11 @@ func (d *Daemon) doStop() {
 	// (including persisted deny/grudge lists). The 5-minute heartbeat TTL
 	// reaps truly-dead nodes; users who explicitly want to leave call
 	// `pilotctl deregister` via IPC (CmdDeregister) which is unaffected.
+	// A relayed-handshake poll in flight finishes first: closing the client
+	// would cut it off after the registry had already emptied the inbox.
+	if !d.hsPoll.waitIdle(5 * time.Second) {
+		slog.Warn("relayed-handshake poll still running at shutdown; closing the registry client anyway")
+	}
 	if d.reg() != nil {
 		d.reg().Close()
 	}
@@ -6565,10 +6570,8 @@ func (d *Daemon) lookupPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 }
 
 // pollRelayedHandshakes checks the registry for handshake requests and
-// responses relayed to this node and processes them.
-//
-// timeout > 0 bounds the registry call (a local client is waiting on it);
-// 0 leaves it unbounded, as the background loop always ran it.
+// responses relayed to this node and processes them. It runs on the poll
+// goroutine started by pollHandshakes.
 func (d *Daemon) pollRelayedHandshakes() {
 	rc, nodeID := d.reg(), d.NodeID()
 	if rc == nil {
