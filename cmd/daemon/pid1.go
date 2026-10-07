@@ -25,7 +25,8 @@ func pid1Warning(goos string, pid int) string {
 	}
 	return "the daemon is PID 1: processes that its apps start and leave behind (database servers that daemonize) " +
 		"will not be reaped and stay as zombies after they exit. Run the daemon under an init process: " +
-		"`docker run --init`, or tini as the container's entrypoint"
+		"`docker run --init`, tini as the container's entrypoint, Kubernetes `shareProcessNamespace: true`, " +
+		"or ECS `initProcessEnabled`"
 }
 
 // warnIfPID1 logs pid1Warning for this process.

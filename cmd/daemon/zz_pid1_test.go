@@ -20,7 +20,7 @@ func TestPID1WarningOnlyForLinuxPID1(t *testing.T) {
 	}{
 		{"linux", 1, true},
 		{"linux", 2, false},
-		{"linux", 7, false}, // what `docker run --init` gives the daemon
+		{"linux", 7, false}, // under `docker run --init`: any PID other than 1
 		{"linux", 0, false},
 		{"darwin", 1, false},
 		{"windows", 1, false},
