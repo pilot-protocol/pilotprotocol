@@ -104,6 +104,9 @@ type handshakePollSched struct {
 	// meanwhile waits for that one instead of starting another.
 	running chan struct{}
 
+	// closed is set by shutdown: no poll starts after it.
+	closed bool
+
 	// run performs one poll. It is d.pollRelayedHandshakes; tests replace it.
 	run func()
 
@@ -274,6 +277,9 @@ func (s *handshakePollSched) begin(minGap time.Duration) (done chan struct{}, st
 	if s.running != nil {
 		return s.running, false
 	}
+	if s.closed {
+		return nil, false
+	}
 	if !s.claimLocked(minGap) {
 		return nil, false
 	}
@@ -293,18 +299,22 @@ func (s *handshakePollSched) end() {
 	s.nudge()
 }
 
-// waitIdle waits up to timeout for a poll in flight to finish, and reports
-// whether none is running when it returns. Shutdown calls it before closing
-// the registry client: the registry empties the node's handshake inbox as it
-// answers, so a poll cut off mid-reply would lose what it carried.
-func (s *handshakePollSched) waitIdle(timeout time.Duration) bool {
+// shutdown stops any further poll from starting and waits until deadline
+// for the one in flight to finish, reporting whether none is running when it
+// returns. The daemon calls it before stopping the handshake manager and
+// closing the registry client: the registry empties the node's handshake
+// inbox as it answers, so a poll whose reply is cut off, or processed by a
+// stopped manager, loses what it carried. Setting closed under the same lock
+// that begin takes means no poll can slip in after the check.
+func (s *handshakePollSched) shutdown(deadline time.Time) bool {
 	s.mu.Lock()
+	s.closed = true
 	running := s.running
 	s.mu.Unlock()
 	if running == nil {
 		return true
 	}
-	t := time.NewTimer(timeout)
+	t := time.NewTimer(time.Until(deadline))
 	defer t.Stop()
 	select {
 	case <-running:

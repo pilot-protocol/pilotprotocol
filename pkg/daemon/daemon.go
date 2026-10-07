@@ -1634,6 +1634,10 @@ func (d *Daemon) Stop() error {
 }
 
 func (d *Daemon) doStop() {
+	// The background goroutines and a relayed-handshake poll in flight
+	// share one deadline.
+	drainDeadline := time.Now().Add(5 * time.Second)
+
 	// Wait for all daemon-scoped background goroutines to notice
 	// stopCh and exit before tearing down shared infrastructure.
 	// Use a 5-second timeout to prevent a hung goroutine (e.g.
@@ -1646,7 +1650,7 @@ func (d *Daemon) doStop() {
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(time.Until(drainDeadline)):
 		slog.Warn("timed out waiting for background goroutines to exit", "leaked", true)
 	}
 
@@ -1702,6 +1706,13 @@ func (d *Daemon) doStop() {
 		slog.Info("closed active connections", "count", len(conns))
 	}
 
+	// A relayed-handshake poll in flight finishes first, while the handshake
+	// manager can still act on and save what it brings back, and no new one
+	// starts: the registry empties the inbox as it answers.
+	if !d.hsPoll.shutdown(drainDeadline) {
+		slog.Warn("relayed-handshake poll still running at shutdown; stopping without its results")
+	}
+
 	// Wait for background handshake RPCs to drain
 	if d.handshakes != nil {
 		d.handshakes.Stop()
@@ -1713,11 +1724,6 @@ func (d *Daemon) doStop() {
 	// (including persisted deny/grudge lists). The 5-minute heartbeat TTL
 	// reaps truly-dead nodes; users who explicitly want to leave call
 	// `pilotctl deregister` via IPC (CmdDeregister) which is unaffected.
-	// A relayed-handshake poll in flight finishes first: closing the client
-	// would cut it off after the registry had already emptied the inbox.
-	if !d.hsPoll.waitIdle(5 * time.Second) {
-		slog.Warn("relayed-handshake poll still running at shutdown; closing the registry client anyway")
-	}
 	if d.reg() != nil {
 		d.reg().Close()
 	}

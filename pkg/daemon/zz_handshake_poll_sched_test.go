@@ -390,6 +390,24 @@ func TestSettledPeersDoNotCrowdOutANewRequest(t *testing.T) {
 		t.Fatalf("%d peers tracked after making room for one, want %d", kept, handshakeMaxWaiting)
 	}
 
+	// The one let go is the peer whose hold-off ends soonest.
+	clock := time.Now()
+	s = newHandshakePollSched()
+	s.now = func() time.Time { return clock }
+	for peer := uint32(1); peer <= handshakeMaxWaiting; peer++ {
+		s.requestSent(peer, true)
+		s.answered(peer)
+		clock = clock.Add(time.Second)
+	}
+	s.requestSent(1000, true)
+	s.mu.Lock()
+	_, firstKept := s.waiting[1]
+	_, lastKept := s.waiting[handshakeMaxWaiting]
+	s.mu.Unlock()
+	if firstKept || !lastKept {
+		t.Fatalf("made room by letting go of the wrong peer (earliest kept: %v, latest kept: %v)", firstKept, lastKept)
+	}
+
 	// Still a cap on requests that are genuinely outstanding.
 	s = newHandshakePollSched()
 	for peer := uint32(1); peer <= handshakeMaxWaiting; peer++ {
@@ -448,9 +466,12 @@ func TestBeaconNotifyOfUnknownKindIsDropped(t *testing.T) {
 	}
 }
 
-// Shutdown waits for a poll in flight before closing the registry client
-// (a poll cut off mid-reply loses what the registry already took out of the
-// inbox), and starts no new poll once it has begun.
+// Shutdown waits for a poll in flight before stopping the handshake manager
+// and closing the registry client — the registry has already taken what the
+// poll carries out of the inbox, so the manager must still be there to act on
+// it and save it — and starts no new poll once it has begun. In review, the
+// wait came after the manager had stopped, so the poll's results were lost
+// anyway.
 func TestShutdownWaitsForThePollInFlight(t *testing.T) {
 	t.Parallel()
 	reg, rc := startTestRegistry(t)
@@ -458,31 +479,65 @@ func TestShutdownWaitsForThePollInFlight(t *testing.T) {
 	t.Cleanup(func() { rc.Close() })
 	d := New(Config{KeepaliveInterval: time.Hour})
 	d.regConn.Store(rc)
+	hs := &stopRecordingHandshakes{fakeHandshakeService: &fakeHandshakeService{}}
+	d.RegisterHandshakeService(hs)
 
 	release := make(chan struct{})
-	var finished atomic.Int32
+	var runs atomic.Int32
+	var managerStoppedFirst atomic.Bool
 	d.hsPoll.run = func() {
+		runs.Add(1)
 		<-release
-		finished.Add(1)
+		managerStoppedFirst.Store(hs.stopped.Load())
 	}
 	d.pollHandshakes(0, 0)
-	if d.hsPoll.waitIdle(50 * time.Millisecond) {
-		t.Fatal("waitIdle reported idle with a poll in flight")
-	}
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		close(release)
-	}()
-	if !d.hsPoll.waitIdle(2 * time.Second) {
-		t.Fatal("waitIdle gave up although the poll finished")
-	}
-	if finished.Load() != 1 {
-		t.Fatal("the poll did not run to completion")
-	}
 
-	close(d.stopCh)
-	d.pollHandshakes(0, 0)
-	if got := d.RelayedHandshakePolls(); got != 1 {
-		t.Fatalf("registry polls = %d after shutdown began, want 1 (none new)", got)
+	stopped := make(chan struct{})
+	go func() {
+		_ = d.Stop()
+		close(stopped)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned with a poll in flight")
+	default:
+	}
+	d.pollHandshakes(0, 0) // asked for after shutdown began
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return after the poll finished")
+	}
+	if managerStoppedFirst.Load() {
+		t.Fatal("the handshake manager was stopped before the poll in flight finished")
+	}
+	if !hs.stopped.Load() {
+		t.Fatal("Stop did not stop the handshake manager")
+	}
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("%d polls ran, want 1: none may start once shutdown has begun", n)
+	}
+}
+
+// stopRecordingHandshakes records, race-free, when the daemon stops it.
+type stopRecordingHandshakes struct {
+	*fakeHandshakeService
+	stopped atomic.Bool
+}
+
+func (s *stopRecordingHandshakes) Stop() { s.stopped.Store(true) }
+
+// Once shutdown has run, no poll starts, even for a trigger that got past the
+// daemon's stopping check before shutdown began.
+func TestNoPollStartsAfterShutdown(t *testing.T) {
+	t.Parallel()
+	s := newHandshakePollSched()
+	if !s.shutdown(time.Now()) {
+		t.Fatal("shutdown with no poll in flight reported one running")
+	}
+	if done, start := s.begin(0); start || done != nil {
+		t.Fatalf("begin after shutdown = (%v, %v), want no poll", done, start)
 	}
 }
