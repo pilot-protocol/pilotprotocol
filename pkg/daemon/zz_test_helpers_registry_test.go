@@ -25,6 +25,38 @@ import (
 // info/wire tests, so we keep it here in a dedicated _test.go.
 func startFakeRegistry(t *testing.T, respond func(req map[string]interface{}) map[string]interface{}) (*registry.Client, func()) {
 	t.Helper()
+	addr, stop := serveFakeRegistry(t, respond)
+	client, err := registry.Dial(addr)
+	if err != nil {
+		stop()
+		t.Fatalf("dial fake registry: %v", err)
+	}
+
+	// Configure a no-op test signer. After PILOT-128 the registry client
+	// refuses to send any signed request when no signer is set. The fake
+	// registry doesn't verify signatures, so any non-empty string suffices.
+	// Tests that need the no-signer error path should call client.SetSigner(nil).
+	client.SetSigner(func(challenge string) string {
+		return "test-sig:" + challenge
+	})
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			client.Close()
+			stop()
+		})
+	}
+	return client, cleanup
+}
+
+// serveFakeRegistry is the server half of startFakeRegistry, for tests that
+// need the address itself (a daemon that dials its own registry connections,
+// such as forceReconnectRegistry). It accepts any number of connections.
+// The returned stop closes the listener and waits for every connection
+// handler to return.
+func serveFakeRegistry(t *testing.T, respond func(req map[string]interface{}) map[string]interface{}) (string, func()) {
+	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -32,9 +64,9 @@ func startFakeRegistry(t *testing.T, respond func(req map[string]interface{}) ma
 
 	var (
 		wg     sync.WaitGroup
-		quit   = make(chan struct{})
-		quitMu sync.Mutex
+		mu     sync.Mutex
 		closed bool
+		conns  []net.Conn
 	)
 
 	wg.Add(1)
@@ -45,6 +77,16 @@ func startFakeRegistry(t *testing.T, respond func(req map[string]interface{}) ma
 			if err != nil {
 				return
 			}
+			// Server-side conns are closed by stop, so a client the test
+			// never closes cannot keep a handler (and stop) waiting.
+			mu.Lock()
+			if closed {
+				mu.Unlock()
+				conn.Close()
+				return
+			}
+			conns = append(conns, conn)
+			mu.Unlock()
 			wg.Add(1)
 			go func(c net.Conn) {
 				defer wg.Done()
@@ -84,32 +126,19 @@ func startFakeRegistry(t *testing.T, respond func(req map[string]interface{}) ma
 		}
 	}()
 
-	client, err := registry.Dial(lis.Addr().String())
-	if err != nil {
-		lis.Close()
-		t.Fatalf("dial fake registry: %v", err)
-	}
-
-	// Configure a no-op test signer. After PILOT-128 the registry client
-	// refuses to send any signed request when no signer is set. The fake
-	// registry doesn't verify signatures, so any non-empty string suffices.
-	// Tests that need the no-signer error path should call client.SetSigner(nil).
-	client.SetSigner(func(challenge string) string {
-		return "test-sig:" + challenge
-	})
-
-	cleanup := func() {
-		quitMu.Lock()
+	stop := func() {
+		mu.Lock()
 		if closed {
-			quitMu.Unlock()
+			mu.Unlock()
 			return
 		}
 		closed = true
-		close(quit)
-		quitMu.Unlock()
-		client.Close()
 		lis.Close()
+		for _, c := range conns {
+			c.Close()
+		}
+		mu.Unlock()
 		wg.Wait()
 	}
-	return client, cleanup
+	return lis.Addr().String(), stop
 }

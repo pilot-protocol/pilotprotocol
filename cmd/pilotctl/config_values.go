@@ -40,6 +40,7 @@ var configValueKinds = map[string]string{
 	"motd_feed_url":          "String",
 	"motd_interval":          "Duration",
 	"networks":               "String",
+	"no_addr_watch":          "Bool",
 	"no_dataexchange":        "Bool",
 	"no_echo":                "Bool",
 	"no_eventstream":         "Bool",
