@@ -690,18 +690,46 @@ func TestAwaitReplyHoldEndsTheGracePeriodAfterArrival(t *testing.T) {
 	watch.addID("our-request")
 	watch.markTagged()
 	const left = 50 * time.Millisecond
-	arrived := time.Now().Add(-(untaggedReplyGrace - left))
+	ackAt := time.Now().Add(-(untaggedReplyGrace - left))
 	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{
-		"from": replyPeer, "data": "the answer", "received_at": arrived.Format(time.RFC3339Nano),
+		"from": replyPeer, "data": "the answer", "received_at": ackAt.Add(time.Millisecond).Format(time.RFC3339Nano),
 	})
 
 	start := time.Now()
-	out, err := awaitReply(watch, start, replyWait{wait: 5 * time.Second})
+	out, err := awaitReply(watch, ackAt, replyWait{wait: 5 * time.Second})
 	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
 		t.Fatalf("awaitReply = %+v, %v; want the untagged answer", out, err)
 	}
-	if el := time.Since(start); el < left-10*time.Millisecond || el >= replyPollInterval-50*time.Millisecond {
+	if el := time.Since(start); el < left-20*time.Millisecond || el >= replyPollInterval-50*time.Millisecond {
 		t.Fatalf("answer taken %s after the first poll, want about %s", el, left)
+	}
+}
+
+// An untagged message that arrived before our request was acknowledged (a
+// slow first-contact dial, a large payload, a lost-ack retry) is held for
+// the whole grace period from the acknowledgement, not from its arrival. In
+// review it was taken at the first poll, ahead of our tagged reply.
+func TestAwaitReplyHoldStartsNoEarlierThanTheAck(t *testing.T) {
+	dir := tempInbox(t)
+	storeEchoHistory(t, dir, replyPeer)
+	watch := newInboxWatch(replyPeer)
+	watch.addID("our-request")
+	watch.markTagged()
+	ackAt := time.Now()
+	writeInboxRecord(t, dir, "TEXT-20260924-100005.000-000001.json", map[string]any{
+		"from": replyPeer, "data": "something else", "received_at": ackAt.Add(-untaggedReplyGrace).Format(time.RFC3339Nano),
+	})
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		if err := putInboxRecord(dir, "TEXT-20260924-100006.000-000002.json", map[string]any{
+			"from": replyPeer, "data": "the answer", "reply_to": "our-request",
+		}); err != nil {
+			t.Error(err)
+		}
+	}()
+	out, err := awaitReply(watch, ackAt, replyWait{wait: 5 * time.Second})
+	if err != nil || out.reply == nil || out.reply["data"] != "the answer" {
+		t.Fatalf("awaitReply = %+v, %v; want the tagged answer, not the earlier untagged message", out, err)
 	}
 }
 

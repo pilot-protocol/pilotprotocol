@@ -202,6 +202,7 @@ type inboxWatch struct {
 	peerEchoes bool                   // the peer named another request in reply_to
 	held       map[string]interface{} // untagged message held back (see untaggedReply)
 	heldSince  time.Time
+	holdFrom   time.Time // our request's acknowledgement; no hold starts earlier
 }
 
 // untaggedReplyGrace is how long an untagged message from a peer known to
@@ -316,8 +317,8 @@ func peerEchoedBefore(dir string, entries []os.DirEntry, peer string) bool {
 	fromPeer := 0
 	for _, e := range files {
 		info, err := e.Info()
-		if err != nil || info.Size() > echoHistoryRecordBytes {
-			continue
+		if err != nil || !info.Mode().IsRegular() || info.Size() > echoHistoryRecordBytes {
+			continue // a FIFO or device would block the read
 		}
 		if read += info.Size(); read > echoHistoryBytes {
 			break
@@ -481,6 +482,11 @@ func (w *inboxWatch) untaggedReply(msg map[string]interface{}, now time.Time) ma
 				w.heldSince = at
 			}
 		}
+		// A message that arrived before our request was acknowledged is the
+		// least likely to be its reply: its hold starts at the ack.
+		if w.heldSince.Before(w.holdFrom) {
+			w.heldSince = w.holdFrom
+		}
 	}
 	w.held = msg
 	if w.peerEchoes || now.Sub(w.heldSince) < untaggedReplyGrace {
@@ -546,6 +552,7 @@ func awaitReply(w *inboxWatch, ackAt time.Time, cfg replyWait) (replyOutcome, er
 		err   error
 	}
 	var out replyOutcome
+	w.holdFrom = ackAt
 	deadline := ackAt.Add(cfg.wait)
 	var resendCh chan resendResult // non-nil while the re-send is in flight
 	lastObserve := time.Time{}
