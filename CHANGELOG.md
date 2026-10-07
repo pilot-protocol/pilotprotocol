@@ -349,6 +349,18 @@ Detailed per-release notes are on the
   `appstore upgrade` does not wait.
 
 ### Fixed
+- **A bulk transfer no longer hangs when the receiver's application falls
+  behind.** When a receiver's application stops reading for a second, the
+  receiver parks the next in-order segment in its reorder buffer and keeps
+  SACKing it, delivering it only when that segment arrives again (v1.15.0 and
+  later receivers). Senders since v1.16.0 never resend a SACKed segment, so
+  once everything outstanding was SACKed nothing moved until the application
+  timed out: about one bulk transfer in ten into a v1.15.0 node over the
+  relay stalled for the full 120 s of `pilotctl bench`. Following RFC 2018
+  §5.1, a sender now forgets its SACK marks when everything outstanding is
+  SACKed and the cumulative ACK has not moved for a retransmission timeout,
+  and resends from the cumulative ACK. A connection closing with only SACKed
+  data left keeps retransmitting it too, instead of giving up on it.
 - **A daemon stopping mid-poll no longer loses relayed handshakes.** The
   registry empties a node's handshake inbox as it answers a poll, and
   shutdown closed the registry client without waiting for a poll in flight,
