@@ -120,18 +120,19 @@ Usage:
   pilotctl appstore uninstall <id> --yes     remove an installed app from the install root
   pilotctl appstore verify <bundle-dir>      sha256-check a pre-install bundle against its manifest
   pilotctl appstore catalogue                list apps available for one-command install
-  pilotctl appstore install <app-id> [--version <v>] [--force [--reset-state]]
+  pilotctl appstore install <app-id> [--version <v>] [--force [--reset-state]] [--no-wait | --wait <dur>]
                                              install by catalogue ID (fetches + verifies + extracts).
                                              already installed: a no-op that points at upgrade
                                              (another --version needs --force: conflict otherwise).
                                              --force reinstalls in place and KEEPS the app's state
                                              (keys, data.db, secrets, cap-state, audit log);
                                              --reset-state (implies --force) starts it empty.
-                                             with a daemon running, waits up to 20s for the app's
-                                             first start and exits non-zero if it crashed at start
-                                             or was suspended; an app still starting by then is
-                                             not an error. --no-wait returns at once
-  pilotctl appstore install <bundle-dir> --local [--force [--reset-state]]
+                                             with a daemon running, waits up to 20s (--wait <dur>)
+                                             for the app's first start and exits non-zero if it
+                                             crashed at start, was suspended, or was refused as
+                                             older than the version the daemon runs; an app still
+                                             starting by then is not an error. --no-wait returns at once
+  pilotctl appstore install <bundle-dir> --local [--force [--reset-state]] [--no-wait | --wait <dur>]
                                              sideload a local bundle (sandbox: fs.read/fs.write
                                              under $APP, audit.log; no net, no key.sign, no hooks)
   pilotctl appstore outdated                 list installed apps with a newer version in the catalogue
@@ -1162,7 +1163,7 @@ func resolveAppDir(root, appID string) (string, error) {
 func cmdAppStoreInstall(args []string) {
 	if len(args) < 1 {
 		fatalHint("invalid_argument",
-			"usage: pilotctl appstore install <app-id-or-dir> [--force [--reset-state]] [--local] [--version <v>] [--no-wait]",
+			"usage: pilotctl appstore install <app-id-or-dir> [--force [--reset-state]] [--local] [--version <v>] [--no-wait | --wait <duration>]",
 			"missing app id or bundle dir")
 	}
 	target := args[0]
@@ -1170,7 +1171,7 @@ func cmdAppStoreInstall(args []string) {
 	resetState := false
 	wantVersion := ""
 	allowLocal := false
-	noWait := false
+	startWait := appStartWait
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--force", "-f":
@@ -1199,10 +1200,24 @@ func cmdAppStoreInstall(args []string) {
 		case "--no-wait":
 			// Return as soon as the files are in place, without waiting to
 			// see the daemon start the app (appstore_startwait.go).
-			noWait = true
+			startWait = 0
+		case "--wait":
+			// How long to wait for that start instead of the default, for an
+			// app known to take longer to open its socket.
+			if i+1 >= len(args) {
+				fatalHint("invalid_argument", "usage: --wait <duration>, e.g. --wait 60s (0 is --no-wait)", "--wait needs a value")
+				return
+			}
+			d, err := time.ParseDuration(args[i+1])
+			if err != nil || d < 0 {
+				fatalHint("invalid_argument", "usage: --wait <duration>, e.g. --wait 60s (0 is --no-wait)", "invalid --wait %q", args[i+1])
+				return
+			}
+			startWait = d
+			i++
 		default:
 			fatalHint("invalid_argument",
-				"available flags: --force, --reset-state, --local, --version, --no-wait",
+				"available flags: --force, --reset-state, --local, --version, --no-wait, --wait",
 				"unknown install flag: %s", args[i])
 		}
 	}
@@ -1536,7 +1551,8 @@ func cmdAppStoreInstall(args []string) {
 	if testHookBeforeSwap != nil {
 		testHookBeforeSwap(finalDir)
 	}
-	// Supervisor events older than this belong to the install being replaced.
+	// Supervisor events older than this belong to the install being replaced
+	// (later ones can too: see appstore_startwait.go).
 	swapAt := time.Now()
 	// 4. Swap. The live dir is renamed to <id>.previous and kept there
 	//    until the new dir verifies (exact manifest, pinned binary sha,
@@ -1672,16 +1688,22 @@ func cmdAppStoreInstall(args []string) {
 	// Wait for the daemon to start the app and see how that went
 	// (appstore_startwait.go). Not when nothing will start it: no daemon, or
 	// a reinstall the supervisor does not act on (same version and binary,
-	// which it leaves running, or an older version, which it refuses).
+	// which it leaves running, or an older version by its ordering, which it
+	// refuses).
 	var start *appStartStatus
+	downgrade := oldManifest != nil && supervisorVersionCompare(m.AppVersion, oldManifest.AppVersion) < 0
 	supervisorActs := oldManifest == nil ||
-		(semverCompare(m.AppVersion, oldManifest.AppVersion) >= 0 &&
-			(m.AppVersion != oldManifest.AppVersion || m.Binary.SHA256 != oldManifest.Binary.SHA256))
-	if !noWait && supervisorActs && daemonSocketReachable() {
+		(!downgrade && (m.AppVersion != oldManifest.AppVersion || m.Binary.SHA256 != oldManifest.Binary.SHA256))
+	if startWait > 0 && supervisorActs && daemonSocketReachable() {
 		if !jsonOutput {
-			fmt.Fprintf(os.Stderr, "installed %s v%s; waiting up to %s for the daemon to start it (--no-wait skips this)...\n", m.ID, m.AppVersion, appStartWait)
+			fmt.Fprintf(os.Stderr, "installed %s v%s; waiting up to %s for the daemon to start it (--no-wait skips this)...\n", m.ID, m.AppVersion, startWait)
 		}
-		st := waitForAppStart(finalDir, swapAt, replacing, appStartWait)
+		st := waitForAppStart(appStartTarget{
+			Dir:          finalDir,
+			Since:        swapAt,
+			Version:      m.AppVersion,
+			BinarySHA256: m.Binary.SHA256,
+		}, startWait)
 		start = &st
 	}
 
@@ -1738,10 +1760,15 @@ func cmdAppStoreInstall(args []string) {
 		fmt.Println("      misbehave at the syscall level. Only install paths from sources you trust.")
 	}
 	failIfNotStarted()
-	if start != nil {
+	switch {
+	case start != nil:
+		// Says what was seen, including that the daemon has not picked the
+		// app up yet; the rescan note below would contradict it.
 		fmt.Println(start.startNote(m.ID))
-	}
-	if start == nil || !start.Picked {
+	case downgrade:
+		fmt.Printf("note: v%s is older than the v%s it replaced; a running daemon does not switch an app to an older\n", m.AppVersion, oldManifest.AppVersion)
+		fmt.Println("      version, so it starts this one when the daemon next starts")
+	default:
 		fmt.Println("note: the daemon rescans the install root periodically —")
 		fmt.Println("      this app will be picked up within ~30s (no daemon restart needed)")
 	}

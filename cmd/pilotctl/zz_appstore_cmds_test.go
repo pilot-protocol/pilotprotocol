@@ -506,8 +506,11 @@ func TestCmdAppStoreVerifyHappyPath(t *testing.T) {
 }
 
 func TestCmdAppStoreInstallHappyPath(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("PILOT_APPSTORE_ROOT", root)
+	// isolateAppStoreTest points PILOT_SOCKET at a path nothing listens on:
+	// with a daemon running on this machine, install would otherwise wait
+	// for it to start an app it never sees. It also keeps telemetry and the
+	// catalogue off the network.
+	root := isolateAppStoreTest(t)
 	bundleDir, _ := makeBundle(t, "io.test.install")
 
 	prev := jsonOutput
@@ -538,8 +541,7 @@ func TestCmdAppStoreInstallHappyPath(t *testing.T) {
 }
 
 func TestCmdAppStoreInstallRefusesDuplicate(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("PILOT_APPSTORE_ROOT", root)
+	isolateAppStoreTest(t) // no daemon: see TestCmdAppStoreInstallHappyPath
 	bundleDir, _ := makeBundle(t, "io.test.dup")
 	prev := jsonOutput
 	defer func() { jsonOutput = prev }()
@@ -701,8 +703,7 @@ func TestCmdAppStoreCapsNoCapsManifest(t *testing.T) {
 // it doesn't actually connect (no daemon needed). Both "help" and
 // "list" with no apps should exit cleanly.
 func TestCmdAppStoreInstallTextMode(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("PILOT_APPSTORE_ROOT", root)
+	isolateAppStoreTest(t) // no daemon: see TestCmdAppStoreInstallHappyPath
 	bundleDir, _ := makeBundle(t, "io.test.install.text")
 	prev := jsonOutput
 	defer func() { jsonOutput = prev }()
