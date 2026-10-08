@@ -161,6 +161,44 @@ func TestRetransmitUnackedKeepsSackMarksBehindAHole(t *testing.T) {
 	}
 }
 
+// The ACK a resent parked head brings covers the segments behind it too.
+// Those were sent once, seconds earlier, and the receiver held them while its
+// application stalled. Sampling the oldest of them measured the stall, not
+// the path: in a probe RTO went from 437ms to 4.52s. Karn's algorithm as
+// Linux applies it: an ACK that newly acknowledges any retransmitted segment
+// gives no RTT sample.
+func TestAckAfterParkedHeadRecoveryTakesNoRTTSample(t *testing.T) {
+	t.Parallel()
+	d := &Daemon{ports: NewPortManager()}
+	conn, captured := newDaemonRetxConn(t)
+	const segs = 8
+	sent := time.Now().Add(-3 * time.Second)
+	for i := 0; i < segs; i++ {
+		conn.Unacked = append(conn.Unacked, &retxEntry{seq: 1000 + uint32(i*SendSegmentSize), data: make([]byte, SendSegmentSize),
+			sentAt: sent, origSentAt: sent, attempts: 1, sacked: true})
+	}
+	conn.LastAck = 1000
+	conn.SendSeq = 1000 + segs*SendSegmentSize
+	conn.SRTT = 300 * time.Millisecond
+	conn.RTTVAR = 34 * time.Millisecond
+	conn.RTO = 436 * time.Millisecond
+
+	d.retransmitUnacked(conn)
+	if captured.Len() != 1 || conn.Unacked[0].attempts != 2 {
+		t.Fatalf("parked head not resent (%d packets, head attempts %d): the test did not set up its case", captured.Len(), conn.Unacked[0].attempts)
+	}
+	srtt, rto := conn.SRTT, conn.RTO
+
+	// The receiver delivers the resent head and everything it held behind it.
+	conn.ProcessAck(1000+segs*SendSegmentSize, true)
+	if len(conn.Unacked) != 0 {
+		t.Fatalf("%d segments left unacknowledged, want none", len(conn.Unacked))
+	}
+	if conn.SRTT != srtt || conn.RTO != rto {
+		t.Fatalf("ACK of a resent head moved SRTT %v -> %v and RTO %v -> %v: it gave an RTT sample", srtt, conn.SRTT, rto, conn.RTO)
+	}
+}
+
 func TestRetransmitUnackedFirstNonSackedNotTimedOutBreaks(t *testing.T) {
 	t.Parallel()
 	d := &Daemon{ports: NewPortManager()}
