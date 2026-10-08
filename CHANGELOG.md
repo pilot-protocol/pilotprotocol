@@ -402,8 +402,11 @@ Detailed per-release notes are on the
   broker while `pilotctl publish` reported success; one-shot sends and any
   client that closes right after writing were exposed the same way. A
   receiver now handles the FIN only once the data before it has arrived,
-  and asks for what is missing meanwhile. A closing sender also holds its
-  FIN until its data is acknowledged (5 s at most, without blocking the
+  and asks for what is missing meanwhile. If the sender stops resending it
+  (a daemon stopped or restarted with a segment lost), the receiver closes
+  the stream without it 15 s after it last heard from the sender, rather
+  than waiting about two minutes for keepalive. A closing sender also holds
+  its FIN until its data is acknowledged (5 s at most, without blocking the
   caller), so the end of a write survives loss on receivers that have not
   upgraded too.
 - **A send error no longer strands the end of a stream write.** When the

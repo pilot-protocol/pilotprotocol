@@ -288,9 +288,12 @@ type Connection struct {
 	State        ConnState
 	LastActivity time.Time // updated on send/recv
 	// heldFIN is this side's FIN while it waits for the data before it to
-	// be acknowledged (Daemon.sendFINAfterData). Whoever takes it sends it:
-	// that goroutine, or shutdown. Guarded by Mu.
-	heldFIN *protocol.Packet
+	// be acknowledged; finLingerTimer sends it after Daemon.finLinger
+	// regardless. Whoever takes it sends it (Daemon.releaseHeldFIN): the ACK
+	// that acknowledges the last data, the timer, the reaper or shutdown.
+	// Guarded by Mu.
+	heldFIN        *protocol.Packet
+	finLingerTimer *time.Timer
 	// Reliable delivery
 	SendSeq uint32
 	RecvAck uint32
@@ -342,9 +345,13 @@ type Connection struct {
 	OOOBuf      []*recvSegment // out-of-order buffer
 	// finPending is set when the peer's FIN arrived ahead of data it sent
 	// before it; finSeq is the FIN's sequence number. The FIN is handled
-	// once delivery reaches finSeq (see Daemon.acceptFIN). Guarded by RecvMu.
-	finPending bool
-	finSeq     uint32
+	// once delivery reaches finSeq (see Daemon.acceptFIN), or by
+	// finHoldTimer once nothing has come from the peer since finHeard for
+	// Daemon.finHoldIdle (Daemon.expireHeldFIN). Guarded by RecvMu.
+	finPending   bool
+	finSeq       uint32
+	finHeard     time.Time
+	finHoldTimer *time.Timer
 	// Delayed ACK
 	AckMu       sync.Mutex  // protects PendingACKs, ACKTimer and QuickACKs
 	PendingACKs int         // count of unacked received segments

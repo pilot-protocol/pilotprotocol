@@ -47,6 +47,10 @@ func TestEarlyFINIsHeldUntilTheDataBeforeItArrives(t *testing.T) {
 	conn := finTestConn(t, d, peerNode)
 
 	d.handleStreamPacket(finTestData(peerNode, d.NodeID(), 1000, "abcde"))
+	// Drain what the first segment caused, so the packets checked below are
+	// the FIN's.
+	for readPacket(t, peerConn, 150*time.Millisecond) != nil {
+	}
 	// [1005,1010) is lost; the FIN at 1010 arrives first.
 	d.handleStreamPacket(streamPacket(protocol.FlagFIN, peerNode, d.NodeID(), 443, 55555, 1010, 0))
 
@@ -62,17 +66,12 @@ func TestEarlyFINIsHeldUntilTheDataBeforeItArrives(t *testing.T) {
 	if closed {
 		t.Fatal("the receive side was closed with data still missing")
 	}
-	for {
-		pkt := readPacket(t, peerConn, 300*time.Millisecond)
-		if pkt == nil {
-			t.Fatal("no ACK asking for the missing data")
-		}
-		if pkt.HasFlag(protocol.FlagFIN) {
-			t.Fatal("a FIN-ACK went out with data still missing: the sender would drop it")
-		}
-		if pkt.Ack == 1005 {
-			break // the ACK that asks for [1005,1010)
-		}
+	pkt := readPacket(t, peerConn, 300*time.Millisecond)
+	if pkt == nil {
+		t.Fatal("no ACK in reply to the early FIN")
+	}
+	if pkt.HasFlag(protocol.FlagFIN) || pkt.Ack != 1005 {
+		t.Fatalf("reply to the early FIN: flags=%d ack=%d, want a plain ACK asking for 1005 (a FIN-ACK makes the sender drop the missing data)", pkt.Flags, pkt.Ack)
 	}
 
 	d.handleStreamPacket(finTestData(peerNode, d.NodeID(), 1005, "fghij"))
@@ -183,6 +182,107 @@ func TestStopSendsAFINThatWasWaitingForData(t *testing.T) {
 	pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	if n, _, err := pc.ReadFromUDP(make([]byte, 65535)); err == nil {
 		t.Fatalf("a second packet (%d bytes) after the FIN: it must go out once", n)
+	}
+}
+
+// The held FIN goes out from the ACK path as soon as the data before it is
+// acknowledged, not on a poll or at the linger.
+func TestHeldFINGoesOutWithTheACKOfTheLastData(t *testing.T) {
+	t.Parallel()
+	const peer = 0xD9D90005
+	d, pc, conn := newSendDataFixture(t, peer)
+	d.setNodeID_testhelper(0x22222222)
+	conn.NoDelay = true
+	if err := d.SendData(conn, []byte("payload")); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	data := readOneSegment(t, pc, 2*time.Second)
+	d.CloseConnection(conn)
+	conn.Mu.Lock()
+	held := conn.heldFIN != nil
+	conn.Mu.Unlock()
+	if !held {
+		t.Fatal("the FIN went out with the data unacknowledged; nothing to test")
+	}
+	start := time.Now()
+	ack := streamPacket(protocol.FlagACK, peer, d.NodeID(), 80, 2000, 1, data.Seq+uint32(len(data.Payload)))
+	ack.Window = 64
+	d.handleStreamPacket(ack)
+	fin := readOneSegment(t, pc, 2*time.Second)
+	if fin.Flags&protocol.FlagFIN == 0 || fin.Seq != data.Seq+uint32(len(data.Payload)) {
+		t.Fatalf("after the ACK: flags %#x seq %d, want the FIN at %d", fin.Flags, fin.Seq, data.Seq+uint32(len(data.Payload)))
+	}
+	if waited := time.Since(start); waited > 500*time.Millisecond {
+		t.Fatalf("FIN sent %s after the ACK, want it at once", waited)
+	}
+}
+
+// A FIN held for data the peer never resends (it was stopped or restarted
+// with a segment lost) is handled once nothing has come from the peer for
+// finHoldIdle: the reader gets EOF instead of waiting for keepalive to give
+// up two minutes later. Data still arriving holds it longer.
+func TestHeldPeerFINIsHandledOnceThePeerFallsSilent(t *testing.T) {
+	t.Parallel()
+	d, peerNode, peerConn := setupDaemonWithPeer(t, Config{Public: true})
+	d.setNodeID_testhelper(0xABCD00F3)
+	d.finHoldIdle = 400 * time.Millisecond
+	conn := finTestConn(t, d, peerNode)
+
+	d.handleStreamPacket(finTestData(peerNode, d.NodeID(), 1000, "abcde"))
+	start := time.Now()
+	d.handleStreamPacket(streamPacket(protocol.FlagFIN, peerNode, d.NodeID(), 443, 55555, 1020, 0))
+	// The peer is still there for a while: an out-of-order segment after
+	// 250 ms restarts the wait.
+	time.Sleep(250 * time.Millisecond)
+	d.handleStreamPacket(finTestData(peerNode, d.NodeID(), 1010, "klmno"))
+
+	var finack *protocol.Packet
+	for finack == nil {
+		pkt := readPacket(t, peerConn, 2*time.Second)
+		if pkt == nil {
+			t.Fatal("the held FIN was never handled after the peer fell silent")
+		}
+		if pkt.HasFlag(protocol.FlagFIN) {
+			finack = pkt
+		}
+	}
+	if waited := time.Since(start); waited < 600*time.Millisecond {
+		t.Fatalf("FIN handled %s after it arrived, want the wait restarted by the data at 250 ms (>= 650 ms)", waited)
+	}
+	if finack.Ack != 1021 {
+		t.Fatalf("FIN-ACK ack=%d, want 1021", finack.Ack)
+	}
+	var got []byte
+	for b := range conn.RecvBuf {
+		got = append(got, b...)
+	}
+	if string(got) != "abcde" {
+		t.Fatalf("reader got %q before EOF, want the in-order data only", got)
+	}
+}
+
+// Shutdown can catch a close half done: the FIN held, the state still
+// ESTABLISHED. It sends that FIN, at its reserved sequence number, and no
+// second one after it, which a receiver would hold for good.
+func TestStopSendsOnlyTheHeldFINOfAHalfDoneClose(t *testing.T) {
+	t.Parallel()
+	d, pc, conn := newSendDataFixture(t, 0xD9D90006)
+	conn.Mu.Lock()
+	conn.heldFIN = &protocol.Packet{
+		Version: protocol.Version, Flags: protocol.FlagFIN, Protocol: protocol.ProtoStream,
+		Src: conn.LocalAddr, Dst: conn.RemoteAddr, SrcPort: conn.LocalPort, DstPort: conn.RemotePort,
+		Seq: 1000,
+	}
+	conn.SendSeq = 1001 // reserved, as CloseConnection does
+	conn.Mu.Unlock()
+	d.Stop()
+	fin := readOneSegment(t, pc, 2*time.Second)
+	if fin.Flags&protocol.FlagFIN == 0 || fin.Seq != 1000 {
+		t.Fatalf("at stop: flags %#x seq %d, want the held FIN at 1000", fin.Flags, fin.Seq)
+	}
+	pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, err := pc.ReadFromUDP(make([]byte, 65535)); err == nil {
+		t.Fatalf("a second packet (%d bytes) after the held FIN", n)
 	}
 }
 
@@ -297,17 +397,23 @@ func runWriteThenClose(t *testing.T, linger time.Duration) (got, want []byte) {
 	}
 	A.CloseConnection(cA)
 
+	var mu sync.Mutex
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for b := range cB.RecvBuf {
+			mu.Lock()
 			got = append(got, b...)
+			mu.Unlock()
 		}
 	}()
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
-		t.Fatalf("reader still open after 15s with %d of %d bytes", len(got), len(want))
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		t.Fatalf("reader still open after 15s with %d of %d bytes", n, len(want))
 	}
 	return got, want
 }
