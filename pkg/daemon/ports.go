@@ -317,6 +317,11 @@ type Connection struct {
 	// Nagle algorithm (write coalescing)
 	NagleBuf []byte     // pending small write data
 	NagleMu  sync.Mutex // protects NagleBuf and tailFlusher
+	// WriteMu is held by SendData for the whole of one write, so two
+	// writers on a connection cannot interleave: a write larger than
+	// nagleWritePiece goes through the buffer piece by piece, and without it
+	// another writer's bytes could land between pieces. Taken before SendMu.
+	WriteMu sync.Mutex
 	// SendMu is held from taking bytes out of NagleBuf until they are handed
 	// to sendSegment, so segments leave in the order the bytes were written
 	// whichever goroutine sends them. Taken before NagleMu.
@@ -1464,10 +1469,32 @@ func (c *Connection) DeliverInOrder(seq uint32, data []byte) uint32 {
 			c.OOOBuf = append(c.OOOBuf, &recvSegment{seq: seg.seq, data: seg.data})
 		}
 	}
+	c.dropOOOBefore(c.ExpectedSeq)
 	expectedSeq := c.ExpectedSeq
 	c.RecvMu.Unlock()
 
 	return expectedSeq
+}
+
+// dropOOOBefore removes reorder-buffer entries that start before expected:
+// the stream has moved past them. A segment re-buffered above at
+// ExpectedSeq and then delivered when the sender resent it left its parked
+// copy here for the life of the connection. That kept the buffer non-empty
+// (every segment ACKed at once, with a stale SACK block), held one of its
+// MaxOOOBuf slots, and once the sequence space wrapped, 4 GiB later, the
+// stale bytes were delivered as the continuation of whatever segment ended
+// at their sequence number. Caller holds RecvMu.
+func (c *Connection) dropOOOBefore(expected uint32) {
+	kept := c.OOOBuf[:0]
+	for _, seg := range c.OOOBuf {
+		if seqAfterOrEqual(seg.seq, expected) {
+			kept = append(kept, seg)
+		}
+	}
+	for i := len(kept); i < len(c.OOOBuf); i++ {
+		c.OOOBuf[i] = nil
+	}
+	c.OOOBuf = kept
 }
 
 // CloseRecvBuf safely closes RecvBuf exactly once. Sets RecvClosed first so

@@ -381,6 +381,32 @@ func TestSettledPeersDoNotCrowdOutANewRequest(t *testing.T) {
 	if !s.waitingOn(1000) {
 		t.Fatalf("with %d answered peers tracked, a new request got no fast polling", handshakeMaxWaiting)
 	}
+	// Only one settled peer made room; the rest keep their hold-off, so an
+	// automatic handshake to them still cannot reopen a window early.
+	s.mu.Lock()
+	kept := len(s.waiting)
+	s.mu.Unlock()
+	if kept != handshakeMaxWaiting {
+		t.Fatalf("%d peers tracked after making room for one, want %d", kept, handshakeMaxWaiting)
+	}
+
+	// The one let go is the peer whose hold-off ends soonest.
+	clock := time.Now()
+	s = newHandshakePollSched()
+	s.now = func() time.Time { return clock }
+	for peer := uint32(1); peer <= handshakeMaxWaiting; peer++ {
+		s.requestSent(peer, true)
+		s.answered(peer)
+		clock = clock.Add(time.Second)
+	}
+	s.requestSent(1000, true)
+	s.mu.Lock()
+	_, firstKept := s.waiting[1]
+	_, lastKept := s.waiting[handshakeMaxWaiting]
+	s.mu.Unlock()
+	if firstKept || !lastKept {
+		t.Fatalf("made room by letting go of the wrong peer (earliest kept: %v, latest kept: %v)", firstKept, lastKept)
+	}
 
 	// Still a cap on requests that are genuinely outstanding.
 	s = newHandshakePollSched()
@@ -425,12 +451,93 @@ func TestBeaconNotifyOfUnknownKindIsDropped(t *testing.T) {
 
 	tm.handleBeaconMessage([]byte{beaconMsgNotify}, beacon)
 	tm.handleBeaconMessage([]byte{beaconMsgNotify, 0x02}, beacon)
-	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake, 0x00}, beacon)
 	if calls != 0 {
 		t.Fatalf("a malformed or unknown notify ran the handler %d times", calls)
 	}
 	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake}, beacon)
 	if calls != 1 {
 		t.Fatalf("a handshake notify ran the handler %d times, want 1", calls)
+	}
+	// A later beacon may add bytes after the kind; this daemon still acts on
+	// the kind it knows.
+	tm.handleBeaconMessage([]byte{beaconMsgNotify, beaconNotifyHandshake, 0x00, 0x07}, beacon)
+	if calls != 2 {
+		t.Fatalf("a handshake notify with trailing bytes ran the handler %d times in total, want 2", calls)
+	}
+}
+
+// Shutdown waits for a poll in flight before stopping the handshake manager
+// and closing the registry client — the registry has already taken what the
+// poll carries out of the inbox, so the manager must still be there to act on
+// it and save it — and starts no new poll once it has begun. In review, the
+// wait came after the manager had stopped, so the poll's results were lost
+// anyway.
+func TestShutdownWaitsForThePollInFlight(t *testing.T) {
+	t.Parallel()
+	reg, rc := startTestRegistry(t)
+	t.Cleanup(func() { reg.Close() })
+	t.Cleanup(func() { rc.Close() })
+	d := New(Config{KeepaliveInterval: time.Hour})
+	d.regConn.Store(rc)
+	hs := &stopRecordingHandshakes{fakeHandshakeService: &fakeHandshakeService{}}
+	d.RegisterHandshakeService(hs)
+
+	release := make(chan struct{})
+	var runs atomic.Int32
+	var managerStoppedFirst atomic.Bool
+	d.hsPoll.run = func() {
+		runs.Add(1)
+		<-release
+		managerStoppedFirst.Store(hs.stopped.Load())
+	}
+	d.pollHandshakes(0, 0)
+
+	stopped := make(chan struct{})
+	go func() {
+		_ = d.Stop()
+		close(stopped)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned with a poll in flight")
+	default:
+	}
+	d.pollHandshakes(0, 0) // asked for after shutdown began
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop did not return after the poll finished")
+	}
+	if managerStoppedFirst.Load() {
+		t.Fatal("the handshake manager was stopped before the poll in flight finished")
+	}
+	if !hs.stopped.Load() {
+		t.Fatal("Stop did not stop the handshake manager")
+	}
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("%d polls ran, want 1: none may start once shutdown has begun", n)
+	}
+}
+
+// stopRecordingHandshakes records, race-free, when the daemon stops it.
+type stopRecordingHandshakes struct {
+	*fakeHandshakeService
+	stopped atomic.Bool
+}
+
+func (s *stopRecordingHandshakes) Stop() { s.stopped.Store(true) }
+
+// Once shutdown has run, no poll starts, even for a trigger that got past the
+// daemon's stopping check before shutdown began.
+func TestNoPollStartsAfterShutdown(t *testing.T) {
+	t.Parallel()
+	s := newHandshakePollSched()
+	if !s.shutdown(time.Now()) {
+		t.Fatal("shutdown with no poll in flight reported one running")
+	}
+	if done, start := s.begin(0); start || done != nil {
+		t.Fatalf("begin after shutdown = (%v, %v), want no poll", done, start)
 	}
 }

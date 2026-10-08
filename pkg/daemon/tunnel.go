@@ -101,6 +101,15 @@ type TunnelManager struct {
 	readWg    sync.WaitGroup // tracks readLoop goroutine for clean shutdown
 	closeOnce sync.Once
 
+	// Where the beacon sees this socket, from its discover replies (see
+	// noteDiscoverReply; read by the address watcher). lastDiscoverNano is
+	// when RegisterWithBeacon last sent a discover; obsLatest and obsPrev
+	// are the two latest replies that answered one, under obsMu.
+	lastDiscoverNano atomic.Int64
+	obsMu            sync.Mutex
+	obsLatest        beaconObservation
+	obsPrev          beaconObservation
+
 	// Encryption config
 	encrypt bool             // if true, attempt encrypted tunnels
 	privKey *ecdh.PrivateKey // our X25519 private key
@@ -818,6 +827,11 @@ func (tm *TunnelManager) RelayPeerIDs() []uint32 {
 // using the real nodeID, so the beacon knows our endpoint for punch coordination.
 // Thin shim over routing.Manager.RegisterWithBeacon.
 func (tm *TunnelManager) RegisterWithBeacon() {
+	// Stamped before the send: on loopback the reply can be read before
+	// Send returns, and it must find the window open.
+	if tm.routing.BeaconAddr() != nil {
+		tm.lastDiscoverNano.Store(time.Now().UnixNano())
+	}
 	if err := tm.routing.RegisterWithBeacon(); err != nil {
 		slog.Warn("beacon registration failed", "error", err)
 		return
@@ -1108,7 +1122,18 @@ func (tm *TunnelManager) SendPathProbe(peerNodeID uint32) error {
 	if pc == nil || !pc.Ready {
 		return fmt.Errorf("path probe: no ready session for peer %d", peerNodeID)
 	}
-	probe := &protocol.Packet{
+	plaintext, err := tm.newPathProbePacket(peerNodeID).Marshal()
+	if err != nil {
+		return fmt.Errorf("path probe marshal: %w", err)
+	}
+	frame := tm.encryptFrame(pc, plaintext)
+	return tm.writeFrame(peerNodeID, addr, frame)
+}
+
+// newPathProbePacket builds the pong-soliciting probe described on
+// SendPathProbe.
+func (tm *TunnelManager) newPathProbePacket(peerNodeID uint32) *protocol.Packet {
+	return &protocol.Packet{
 		Version:  protocol.Version,
 		Protocol: protocol.ProtoControl,
 		SrcPort:  protocol.PortPing,
@@ -1117,12 +1142,94 @@ func (tm *TunnelManager) SendPathProbe(peerNodeID uint32) error {
 		Dst:      protocol.Addr{Node: peerNodeID},
 		Payload:  pathProbePayload,
 	}
-	plaintext, err := probe.Marshal()
-	if err != nil {
-		return fmt.Errorf("path probe marshal: %w", err)
+}
+
+// SendDirectPathProbe sends the same probe as SendPathProbe, but straight to
+// the peer's stored direct endpoint even when the peer is relay-flagged (see
+// SendDirectProbe). The address watcher uses it after our own address changed:
+// the peer overwrites its entry for us from the source of any authenticated
+// direct frame (handleEncrypted), so one probe moves the peer to our new
+// address, and its pong proves the new path in both directions. A copy sent
+// through the relay would teach the peer nothing, since relayed frames arrive
+// from the beacon.
+func (tm *TunnelManager) SendDirectPathProbe(peerNodeID uint32) error {
+	return tm.SendDirectProbe(peerNodeID, tm.newPathProbePacket(peerNodeID))
+}
+
+// discoverReplyWindow is how soon after this node's latest discover a
+// discover reply must arrive to be taken as the beacon's answer to it.
+const discoverReplyWindow = 2 * time.Second
+
+// beaconObservation is one discover reply: where the beacon saw this socket.
+type beaconObservation struct {
+	endpoint *net.UDPAddr
+	beacon   string    // the beacon that replied, so replies from two beacons are never compared
+	at       time.Time // when it arrived
+}
+
+// noteDiscoverReply records a discover reply that came from the beacon's
+// address, if it arrived within discoverReplyWindow of a discover this node
+// sent. The beacon replies to every discover and sends none unasked, so a
+// reply outside that window is a stray or a forgery: the source address is
+// all that marks it as the beacon's, and UDP does not authenticate it.
+// Reports whether the reply was kept.
+func (tm *TunnelManager) noteDiscoverReply(ep, beacon *net.UDPAddr, now time.Time) bool {
+	sent := tm.lastDiscoverNano.Load()
+	if ep == nil || beacon == nil || sent == 0 {
+		return false
 	}
-	frame := tm.encryptFrame(pc, plaintext)
-	return tm.writeFrame(peerNodeID, addr, frame)
+	if age := now.Sub(time.Unix(0, sent)); age < 0 || age > discoverReplyWindow {
+		slog.Debug("ignoring unsolicited beacon discover reply", "observed", ep, "since_discover", age)
+		return false
+	}
+	tm.obsMu.Lock()
+	tm.obsPrev, tm.obsLatest = tm.obsLatest, beaconObservation{endpoint: ep, beacon: beacon.String(), at: now}
+	tm.obsMu.Unlock()
+	return true
+}
+
+// beaconObservations returns the latest two kept discover replies, newest
+// first; a zero value stands for one that has not arrived.
+func (tm *TunnelManager) beaconObservations() (latest, prev beaconObservation) {
+	tm.obsMu.Lock()
+	defer tm.obsMu.Unlock()
+	return tm.obsLatest, tm.obsPrev
+}
+
+// ObservedEndpoint returns the endpoint the latest kept discover reply
+// reported seeing us at, or nil if none has arrived yet.
+func (tm *TunnelManager) ObservedEndpoint() *net.UDPAddr {
+	latest, _ := tm.beaconObservations()
+	return latest.endpoint
+}
+
+// forgetObservedEndpoints drops the stored discover replies, so the next
+// ones read arrived afterwards.
+func (tm *TunnelManager) forgetObservedEndpoints() {
+	tm.obsMu.Lock()
+	tm.obsLatest, tm.obsPrev = beaconObservation{}, beaconObservation{}
+	tm.obsMu.Unlock()
+}
+
+// BeaconUDPAddr returns the beacon endpoint the tunnel currently uses, or
+// nil when none is configured. Thin shim over routing.Manager.BeaconAddr.
+func (tm *TunnelManager) BeaconUDPAddr() *net.UDPAddr {
+	return tm.routing.BeaconAddr()
+}
+
+// parseDiscoverReply decodes [iplen(1)][IP(4 or 16)][port(2)], the body of a
+// BeaconMsgDiscoverReply. Returns nil for a malformed body.
+func parseDiscoverReply(body []byte) *net.UDPAddr {
+	if len(body) < 1 {
+		return nil
+	}
+	ipLen := int(body[0])
+	if (ipLen != 4 && ipLen != 16) || len(body) < 1+ipLen+2 {
+		return nil
+	}
+	ip := make(net.IP, ipLen)
+	copy(ip, body[1:1+ipLen])
+	return &net.UDPAddr{IP: ip, Port: int(binary.BigEndian.Uint16(body[1+ipLen:]))}
 }
 
 // getPeerPubKey returns the cached Ed25519 public key for a peer,
@@ -2311,6 +2418,16 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 	switch data[0] {
 	case protocol.BeaconMsgDiscoverReply:
 		slog.Debug("beacon discover reply on tunnel socket", "from", from)
+		// Remember where the beacon sees us. A node behind NAT cannot see
+		// its public address change locally; this reply is the only place
+		// it shows up (addrwatch.go compares successive values). Only a
+		// reply from the beacon's address to a discover we just sent
+		// counts, so a third party cannot feed us one at will.
+		if fromBeacon {
+			if ep := parseDiscoverReply(data[1:]); ep != nil {
+				tm.noteDiscoverReply(ep, tm.routing.BeaconAddr(), time.Now())
+			}
+		}
 	case protocol.BeaconMsgPunchCommand:
 		if !fromBeacon {
 			slog.Warn("dropping punch command from non-beacon source", "from", from)
@@ -2332,8 +2449,12 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 			slog.Debug("dropping notify from non-beacon source", "from", from)
 			return
 		}
-		if len(data) != 2 || data[1] != beaconNotifyHandshake {
+		if len(data) < 2 || data[1] != beaconNotifyHandshake {
 			// A kind this daemon does not know is not a reason to poll.
+			// Bytes after a known kind are ignored, so a later beacon can
+			// add to the message without daemons from this one on dropping
+			// it. (v1.16.0 requires exactly two bytes: a beacon cannot
+			// extend the message while v1.16.0 nodes remain.)
 			slog.Debug("dropping beacon notify of unknown kind", "len", len(data))
 			return
 		}
@@ -2345,7 +2466,7 @@ func (tm *TunnelManager) handleBeaconMessage(data []byte, from *net.UDPAddr) {
 	}
 }
 
-// beaconMsgNotify is a beacon → node message, [0x0A][kind(1)], telling the
+// beaconMsgNotify is a beacon → node message, [0x0A][kind(1)][...], telling the
 // node that the registry is holding something for it. kind 0x01 is a relayed
 // trust-handshake request or answer; the node polls for it. It carries no
 // node ID, address or payload. Daemons that predate it log it as an unknown

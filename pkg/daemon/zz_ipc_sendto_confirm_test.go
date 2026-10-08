@@ -80,14 +80,17 @@ func TestIPCSendToConfirmRepliesWithOutcome(t *testing.T) {
 	if err := writeIPCRequest(connection, CmdSendToConfirm, sendToPayload(protocol.BroadcastAddr(1), 5000, "x")); err != nil {
 		t.Fatal(err)
 	}
-	if frame := reply(); frame[0] != CmdError || !strings.Contains(string(frame[3:]), "sendto: broadcast address requires admin token") {
+	if frame := reply(); frame[0] != CmdError || !strings.HasPrefix(string(frame[3:]), "sendto: broadcast address requires admin token") {
 		t.Fatalf("failed send reply = %x %q, want CmdError naming the cause", frame[0], frame[1:])
 	}
 	if err := writeIPCRequest(connection, CmdSendToConfirm, []byte{0x01}); err != nil {
 		t.Fatal(err)
 	}
-	if frame := reply(); frame[0] != CmdError {
-		t.Fatalf("truncated request reply = %x, want CmdError", frame)
+	// Every error reply starts with "sendto: ": with no request IDs on the
+	// IPC, that prefix is how the driver tells a confirmed send's answer
+	// from any other request's (common/driver isConfirmAnswer).
+	if frame := reply(); frame[0] != CmdError || !strings.HasPrefix(string(frame[3:]), "sendto: ") {
+		t.Fatalf("truncated request reply = %x %q, want CmdError starting with \"sendto: \"", frame[0], frame[1:])
 	}
 
 	// Legacy CmdSendTo: still no reply, even when the send fails.

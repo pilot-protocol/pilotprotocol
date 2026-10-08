@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -185,6 +186,10 @@ func classifyDaemonError(err error) string {
 	return ""
 }
 
+// fatalResults, when set, goes into fatalHint's JSON envelope as "results",
+// so a multi-message send that fails still says what became of each message.
+var fatalResults []map[string]interface{}
+
 // fatalHint is like fatalCode but adds an actionable hint telling the user what to do next.
 func fatalHint(code, hint, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
@@ -203,6 +208,9 @@ func fatalHint(code, hint, format string, args ...interface{}) {
 		// other exit). Additive: existing keys keep their shape and value.
 		if ns := nextStepsEnvelope(exitNextSteps); ns != nil {
 			env["next_steps"] = ns
+		}
+		if fatalResults != nil {
+			env["results"] = fatalResults
 		}
 		b, _ := json.Marshal(env)
 		fmt.Fprintln(os.Stderr, string(b))
@@ -895,23 +903,43 @@ var commandHelp = map[string]string{
 Send a message to a remote agent and optionally wait for the reply.
 
 Flags:
-  --data <text>         message payload (required)
+  --data <text>         message payload; "-" reads it from stdin
+  --data-file <path>    read the payload from a file (for payloads too large
+                        for a command-line argument)
   --type text|json|binary  payload encoding (default: text)
   --count <n>           send N times (default: 1)
   --reuse-conn          reuse the connection across --count sends (saves ~1 RTT)
   --wait [<dur>]        wait for a reply in the inbox (default timeout: 30s,
                         counted from the receiver's acknowledgement)
-  --no-resend           on first contact, never send the request a second
-                        time (by default a request with no reply by mid-wait
-                        is re-sent once on a new stream)
+  --no-resend           never send the request a second time (by default it
+                        is re-sent once on a new stream when, on first
+                        contact, no reply came by mid-wait, or when its
+                        acknowledgement was lost; a receiver from v1.13.10
+                        on keeps one copy of a repeat, but one through
+                        v1.13.9 can store it twice if the ack of its
+                        untagged copy is lost)
   --timeout <dur>       total wall time, including connect, handshake and reply
   --trace               print per-step timing breakdown to stderr
   --no-auto-handshake   skip automatic trust handshake with known agents
+  --reply-to <id>       mark this message as the answer to a received message:
+                        <id> is that message's message_id, shown by
+                        pilotctl inbox (an inbox id such as
+                        TEXT-20260924-100005.000-000001 is looked up), and
+                        the sender's --wait matches the reply on it
+
+Every message is sent with a new message ID (message_id in the --json result).
+--wait takes the message from the peer whose reply_to is that ID, and never one
+whose reply_to names another message. A reply without reply_to is matched by
+sender and arrival time, as before. From a peer known to echo IDs (one of its
+earlier messages in the inbox carries a reply_to) such a reply is held back
+until 0.75s after it arrived, in case the reply naming the ID follows.
 
 Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
   pilotctl send-message my-peer --data "hello" --wait
   pilotctl send-message 0:0000.0000.400E --data "ping" --trace
+  pilotctl send-message my-peer --data-file report.json --type json
+  generate-report | pilotctl send-message my-peer --data -
 `,
 	"ping": `Usage: pilotctl ping <address|hostname> [flags]
 
@@ -1024,6 +1052,11 @@ Agent patterns:
   pilotctl --json inbox --latest                     # newest reply, full body
   pilotctl --json inbox --from list-agents --limit 3 # last 3 from one peer
   pilotctl inbox --clear --before 24h                # keep today, purge older
+  pilotctl send-message <from> --data "..." --reply-to <message_id>
+                                                     # answer one message
+
+A message sent with an ID shows it as message_id (the id field is the inbox
+file name, not the ID), and an answer shows the ID it names as reply_to.
 
 Tip: send-message --wait already returns the matching reply inline; the
 inbox is for replies that arrive later or that you want to re-read.
@@ -1364,7 +1397,10 @@ Flags:
 
 Send a single unreliable datagram to a remote node on the given port.
 Unlike send-message (which uses the reliable data-exchange stream), datagrams
-are fire-and-forget — no ACK, no retry, no ordering guarantee.
+have no ACK, no retry and no ordering guarantee. The local daemon does say
+whether it sent the datagram: if it could not (no route to the node, port
+policy, payload too large) the command fails with its reason. "confirmed":
+false means the daemon is too old to say, and the datagram was sent anyway.
 
 Use for: real-time telemetry, heartbeats, anything where freshness > reliability.
 `,
@@ -1628,7 +1664,7 @@ Communication commands:
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
   pilotctl send-file <address|hostname> <filepath>
-  pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
+  pilotctl send-message <address|hostname> --data <text> | --data - | --data-file <path> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
   pilotctl publish <address|hostname> <topic> --data <message>
@@ -1675,7 +1711,9 @@ Agent tool discovery:
 App store (install + call local capability apps; full help: pilotctl appstore help):
   pilotctl appstore catalogue                         list apps available for one-command install
   pilotctl appstore view <id> [--all-changelog]       app detail page (description, methods, permissions)
-  pilotctl appstore install <app-id> [--force]        install by catalogue ID (fetch + verify + extract)
+  pilotctl appstore install <app-id> [--force] [--no-wait | --wait <dur>]
+                                                      install by catalogue ID (fetch + verify + extract)
+                                                      and wait up to 20s for the app's first start
   pilotctl appstore list                              list installed apps + their IPC methods
   pilotctl appstore call <id> <method> [json-args]    dispatch an IPC call into an app
   pilotctl appstore status|caps|audit|restart|uninstall <id>
@@ -2487,9 +2525,9 @@ func contextCatalog() map[string]interface{} {
 
 			// Messaging
 			"send-message": map[string]interface{}{
-				"args":        []string{"<address|hostname>", "--data <text>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]"},
-				"description": "Send a typed message to a node via data exchange (port 1001). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Default type: text",
-				"returns":     "target, to, type, bytes, ack, reuse_conn",
+				"args":        []string{"<address|hostname>", "--data <text> | --data - | --data-file <path>", "[--type text|json|binary]", "[--count <n>]", "[--reuse-conn]", "[--wait <dur>]", "[--timeout <dur>]", "[--reply-to <message_id>]"},
+				"description": "Send a typed message to a node via data exchange (port 1001). --data - reads the payload from stdin, --data-file from a file (up to 64 MiB; a command-line argument is capped by the OS). --count N sends N messages; --reuse-conn shares one connection across all N (env: PILOT_SENDMSG_REUSE_CONN=1). Fails unless every message is acknowledged. Default type: text. Every message carries a new message_id; --wait returns the reply whose reply_to names it, or else the next message from the peer without reply_to (held until 0.75s after it arrived if the peer is known to echo IDs); --reply-to <message_id> answers a received message",
+				"returns":     "target, to, type, bytes, ack, reuse_conn, message_id, tagged, reply_to, reply",
 			},
 			"send-file": map[string]interface{}{
 				"args":        []string{"<address|hostname>", "<filepath>"},
@@ -2499,7 +2537,7 @@ func contextCatalog() map[string]interface{} {
 			"inbox": map[string]interface{}{
 				"args":        []string{"[read <id>]", "[--latest]", "[--limit <n>]", "[--from <peer>]", "[--since <dur>]", "[--full]", "[--clear [--before <dur>]]"},
 				"description": "List received messages newest-first (~/.pilot/inbox/). Default limit 10 with previews; --latest for the newest full body; read <id> for one message",
-				"returns":     "messages [{id, from, received_at, type, bytes, preview|data}], total, shown, dir",
+				"returns":     "messages [{id, from, received_at, type, bytes, message_id?, reply_to?, preview|data}], total, shown, dir",
 			},
 			"received": map[string]interface{}{
 				"args":        []string{"[--limit <n>]", "[--since <dur|rfc3339>]", "[--clear [--before <dur>]]"},
@@ -2572,7 +2610,7 @@ func contextCatalog() map[string]interface{} {
 			"subcommands": map[string]interface{}{
 				"catalogue":      map[string]interface{}{"args": []string{}, "description": "List apps available for one-command install (alias: catalog)"},
 				"view":           map[string]interface{}{"args": []string{"<id>", "[--all-changelog]"}, "description": "Detail page: description, vendor, changelog, size, source, methods, permissions (installed or not)"},
-				"install":        map[string]interface{}{"args": []string{"<app-id> [--force]", "| <bundle-dir> --local [--force]"}, "description": "Install by catalogue ID (fetch + verify + extract), or sideload a local bundle with --local"},
+				"install":        map[string]interface{}{"args": []string{"<app-id> [--force]", "| <bundle-dir> --local [--force]", "[--no-wait | --wait <dur>]"}, "description": "Install by catalogue ID (fetch + verify + extract), or sideload a local bundle with --local. With a daemon running, waits up to 20s (--wait <dur>) for the app's first start and exits non-zero (app_start_failed) if it crashed at start, was suspended, or was refused as older than the version the daemon runs; --no-wait returns at once"},
 				"list":           map[string]interface{}{"args": []string{}, "description": "List installed apps and the IPC methods each exposes"},
 				"call":           map[string]interface{}{"args": []string{"<id>", "<method>", "[json-args]", "[--timeout <dur>]"}, "description": "Dispatch an IPC call into an app (default timeout 120s; $PILOT_APPSTORE_CALL_TIMEOUT)"},
 				"status":         map[string]interface{}{"args": []string{"<id>"}, "description": "Deep-dive on one app's pinned state"},
@@ -4463,8 +4501,16 @@ func cmdDgram(args []string) {
 		fatalCode("invalid_argument", "--data is required")
 	}
 
-	if err := d.SendTo(target, port, []byte(data)); err != nil {
-		fatalCode("connection_failed", "sendto: %v", err)
+	// The daemon says whether it sent the datagram. The fire-and-forget
+	// send reported success even when the daemon could not send it (no
+	// route to the node, port policy, ephemeral ports exhausted).
+	confirmed, err := d.SendToConfirmed(target, port, []byte(data))
+	if err != nil {
+		if errors.Is(err, driver.ErrConfirmTimeout) {
+			fatalHint("timeout", "the datagram may or may not have been sent; datagrams are unreliable, so send it again if it matters", "%v", err)
+		}
+		// The driver's error already names the step ("daemon: sendto: ...").
+		fatalCode("connection_failed", "%v", err)
 	}
 
 	if jsonOutput {
@@ -4472,9 +4518,14 @@ func cmdDgram(args []string) {
 			"target": target.String(),
 			"port":   port,
 			"bytes":  len(data),
+			// false: the daemon predates confirmed sends and could not
+			// say; the datagram was sent the old way.
+			"confirmed": confirmed,
 		})
-	} else {
+	} else if confirmed {
 		fmt.Printf("sent %d byte(s) to %s port %d\n", len(data), target, port)
+	} else {
+		fmt.Printf("sent %d byte(s) to %s port %d (the daemon is too old to confirm it was sent)\n", len(data), target, port)
 	}
 }
 
@@ -4744,11 +4795,117 @@ func streamSendFile(d *driver.Driver, target protocol.Addr, filePath, filename s
 	return result, nil
 }
 
+// messagePayload returns the body for send-message: --data, or the whole of
+// stdin for "--data -", or the contents of --data-file. A payload passed as an
+// argument is capped by the OS (ARG_MAX; 128 KiB per argument on Linux), which
+// is why callers with large bodies needed a separate stdin helper.
+func messagePayload(flags map[string]string, stdin io.Reader) (string, error) {
+	data, hasData := flags["data"]
+	file, hasFile := flags["data-file"]
+	switch {
+	case hasData && hasFile:
+		return "", fmt.Errorf("give --data or --data-file, not both")
+	case hasFile:
+		if file == "" || file == "true" {
+			return "", fmt.Errorf("--data-file needs a path")
+		}
+		b, err := os.ReadFile(file) // #nosec G304 -- the operator names the file to send
+		if err != nil {
+			return "", fmt.Errorf("read --data-file: %v", err)
+		}
+		data = string(b)
+	case data == "-":
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("read payload from stdin: %v", err)
+		}
+		data = string(b)
+	}
+	if data == "" {
+		if hasFile {
+			return "", fmt.Errorf("--data-file %s is empty", file)
+		}
+		return "", fmt.Errorf("--data is required")
+	}
+	// One message is one data-exchange frame. A receiver drops a frame over
+	// its limit at the header, which the sender would only see as a missing
+	// acknowledgement, and past 4 GiB the length prefix would wrap.
+	if limit := maxMessageBytes(); len(data) > limit {
+		return "", fmt.Errorf("message is %d bytes; one message can carry at most %d (use send-file for larger payloads)", len(data), limit)
+	}
+	return data, nil
+}
+
+// maxMessageBytes is the most one send-message payload can be: the frame
+// limit, less room for the frame and message-tag headers.
+func maxMessageBytes() int {
+	return int(dataexchange.MaxFrameSize) - 4096
+}
+
+// failIfUndelivered ends a multi-message send with an error when any message
+// failed to send, was not acknowledged, or was refused by the receiver:
+// reporting "ok" for those hid messages that never arrived. The error carries
+// every message's result, so a caller can tell which ones to send again.
+func failIfUndelivered(target string, results []map[string]interface{}) {
+	failed, allRefused, first := undelivered(results)
+	if failed == 0 {
+		return
+	}
+	code := "connection_failed"
+	if allRefused {
+		code = "internal" // as for a single message the receiver refuses
+	}
+	fatalResults = results
+	fatalHint(code, "the results list which messages were delivered; check `pilotctl peers` and the daemon log before sending the others again",
+		"%d of %d messages to %s were not delivered (first, %s)", failed, len(results), target, first)
+}
+
+// undelivered counts the send results that did not end in a stored message,
+// says whether all of those were refused by the receiver, and describes the
+// first of them.
+func undelivered(results []map[string]interface{}) (failed int, allRefused bool, first string) {
+	allRefused = true
+	for _, r := range results {
+		why, refused := "", false
+		_, acked := r["ack"].(string)
+		switch {
+		case r["error"] != nil:
+			why = fmt.Sprint(r["error"])
+		case !acked:
+			why = "not acknowledged"
+			if e, ok := r["ack_error"].(string); ok {
+				why += " (" + e + ")"
+			}
+		case refusal(r) != "":
+			why, refused = "receiver refused it: "+refusal(r), true
+		}
+		if why != "" {
+			failed++
+			allRefused = allRefused && refused
+			if first == "" {
+				first = fmt.Sprintf("message %v: %s", r["seq"], why)
+			}
+		}
+	}
+	return failed, failed > 0 && allRefused, first
+}
+
+// refusal returns the receiver's "ERR ..." answer in a send result: its ACK,
+// or with --trace the inner ACK that the timing reply carries.
+func refusal(r map[string]interface{}) string {
+	for _, k := range []string{"ack", "inner_ack"} {
+		if s, _ := r[k].(string); strings.HasPrefix(s, "ERR ") {
+			return s
+		}
+	}
+	return ""
+}
+
 func cmdSendMessage(args []string) {
 	flags, pos := parseFlags(args)
 	for name := range flags {
 		switch name {
-		case "data", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake":
+		case "data", "data-file", "type", "count", "reuse-conn", "wait", "timeout", "no-resend", "trace", "no-auto-handshake", "reply-to":
 		default:
 			fatalCode("invalid_argument", "send-message: unknown flag --%s", name)
 		}
@@ -4768,7 +4925,18 @@ func cmdSendMessage(args []string) {
 		defer timer.Stop()
 	}
 	if len(pos) != 1 {
-		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend]")
+		fatalCode("invalid_argument", "usage: pilotctl send-message <address|hostname> --data <text> | --data - | --data-file <path> [--type text|json|binary] [--trace] [--count <n>] [--reuse-conn] [--wait <dur>] [--timeout <dur>] [--no-resend] [--reply-to <message-id>]")
+	}
+	// --reply-to marks this message as the answer to a message received
+	// earlier: the value is that message's message_id (see `pilotctl inbox`),
+	// and the sender's --wait matches on it.
+	var replyTo string
+	if raw, given := flags["reply-to"]; given {
+		id, err := resolveReplyTo(raw)
+		if err != nil {
+			fatalCode("invalid_argument", "%v", err)
+		}
+		replyTo = id
 	}
 
 	sendCount := flagInt(flags, "count", 1)
@@ -4788,6 +4956,9 @@ func cmdSendMessage(args []string) {
 			}
 		}
 	}
+	// --no-resend: the request is never sent a second time, neither on
+	// first contact nor after a lost ack, for requests not safe to repeat.
+	noResend := flagBool(flags, "no-resend")
 
 	// --reuse-conn (or PILOT_SENDMSG_REUSE_CONN=1): when --count > 1, dial once
 	// and reuse the same data-exchange connection for all N sends. Default false
@@ -4812,6 +4983,13 @@ func cmdSendMessage(args []string) {
 		}
 	}
 
+	// Read and check the payload first, so a missing file or an oversized
+	// message is reported before the daemon or the network is touched.
+	data, err := messagePayload(flags, os.Stdin)
+	if err != nil {
+		fatalCode("invalid_argument", "%v", err)
+	}
+
 	d := connectDriver()
 	tracef("connectDriver")
 	// d may be replaced by a fresh connection when a dial is retried.
@@ -4823,10 +5001,6 @@ func cmdSendMessage(args []string) {
 		fatalCode("not_found", "%v", err)
 	}
 
-	data := flagString(flags, "data", "")
-	if data == "" {
-		fatalCode("invalid_argument", "--data is required")
-	}
 	msgType := flagString(flags, "type", "text")
 
 	// First contact: the daemon holds no session with the peer yet, so this
@@ -4866,43 +5040,109 @@ func cmdSendMessage(args []string) {
 		}
 		return c
 	}
+	// redial dials like dialOnce but returns the error: when sendOne's
+	// retry after a lost ack cannot connect, the first attempt stands.
+	redial := func() (*dataexchange.Client, error) { return dataexchange.Dial(d, target) }
+
+	// Set below when --wait is given. Declared here so sendOne can register
+	// each request's message ID with it before the request leaves.
+	var watch *inboxWatch
 
 	// sendOne sends one message on cl and returns timing/ack metadata.
 	// reused=true is recorded when the connection was dialled on a prior call.
-	sendOne := func(cl *dataexchange.Client, seq int, reused bool) map[string]interface{} {
-		var sentAtNs int64
-		var sendErr error
-		if traceTime {
-			sentAtNs, sendErr = cl.SendTrace(innerType, []byte(data))
-		} else {
-			sendStart := time.Now()
-			switch msgType {
-			case "text":
-				sendErr = cl.SendText(data)
-			case "json":
-				sendErr = cl.SendJSON([]byte(data))
-			case "binary":
-				sendErr = cl.SendBinary([]byte(data))
+	// redial opens a new connection to the same receiver, for the one retry
+	// after a lost ack (below).
+	//
+	// Every send carries a new message ID, so the receiver can tell a
+	// re-delivery from a new message and a reply can name the request it
+	// answers (reply_to). Client.Send delivers the message without the ID to
+	// a receiver too old to know it: such a receiver stores nothing for the
+	// tagged frame, says so, and gets the plain frame on the same connection.
+	sendOne := func(cl *dataexchange.Client, seq int, reused bool, redial func() (*dataexchange.Client, error)) map[string]interface{} {
+		messageID := dataexchange.NewMessageID()
+		if watch != nil {
+			watch.addID(messageID)
+		}
+		sentAtNs := time.Now().UnixNano()
+		frame := messageFrame(innerType, []byte(data), messageID, replyTo, traceTime, sentAtNs)
+		res, sendErr := cl.Send(frame)
+		retried := false
+		if res == nil && isAckReadError(sendErr) && !noResend && !traceTime {
+			// The frame was written but no ack came back, so whether it was
+			// stored is unknown. A receiver through v1.13.9 never stores the
+			// tagged form, and the untagged copy only follows its answer to
+			// that, so with the first ack lost the message is lost too.
+			// Send the same frame once more on a new connection: a receiver
+			// from v1.13.10 on recognises the repeat by its ID and keeps one
+			// copy, and an older one answers the tagged frame again and gets
+			// the untagged copy. The one case that stores the message twice
+			// is a receiver through v1.13.9 that stored the untagged copy
+			// and lost its ack; --no-resend opts out of the retry. A --trace
+			// message is never sent again: receivers do not suppress
+			// repeated trace frames, so every receiver would store it twice.
+			//
+			// This runs before the send is judged: a message whose retry is
+			// acknowledged is delivered, and the ack error reported for one
+			// that is not is the retry's.
+			slog.Debug("send-message ACK read failed; sending again on a new connection", "err", sendErr)
+			if c2, err := redial(); err == nil {
+				retried = true
+				res2, err2 := c2.Send(frame)
+				switch {
+				case res2 != nil, isAckReadError(err2):
+					res, sendErr = res2, err2
+				default:
+					// The retry was not written: the first attempt, written
+					// but unacknowledged, is what happened to the message.
+					sendErr = fmt.Errorf("%w; sending again failed: %v", sendErr, err2)
+				}
+				_ = c2.Close()
 			}
-			sentAtNs = sendStart.UnixNano()
 		}
-		if sendErr != nil {
-			return map[string]interface{}{"seq": seq, "error": sendErr.Error()}
-		}
-
-		ack, ackErr := cl.Recv()
 		ackRecvAtNs := time.Now().UnixNano()
-		if ackErr != nil {
-			slog.Debug("send-message ACK read failed", "err", ackErr)
+		var ack *dataexchange.Frame
+		var ackErr error
+		switch {
+		case res != nil:
+			// Delivered, or answered "ERR ..." (ErrRejected): either way the
+			// receiver's answer is the ack.
+			ack = res.Ack
+		case isAckReadError(sendErr):
+			// The message was written; only the ack did not come back.
+			slog.Debug("send-message ACK read failed", "err", sendErr)
+			ackErr = sendErr
+		default:
+			return map[string]interface{}{"seq": seq, "error": sendErr.Error(), "message_id": messageID}
+		}
+		if res != nil && res.Tagged && watch != nil {
+			watch.markTagged()
 		}
 
 		r := map[string]interface{}{
 			"seq":    seq,
 			"bytes":  len(data),
 			"reused": reused,
+			// message_id is the ID this message was sent with.
+			"message_id": messageID,
+		}
+		if res != nil {
+			// tagged says whether the receiver got the ID: false for a
+			// receiver too old to know message IDs, which can then not be
+			// asked to echo it. Without an ack it is not known, and left out.
+			r["tagged"] = res.Tagged
+		}
+		if retried {
+			// The first ack was lost and the message was sent once more.
+			r["retried"] = true
+		}
+		if replyTo != "" {
+			r["reply_to"] = replyTo
 		}
 		if ack != nil {
 			r["ack"] = string(ack.Payload)
+		}
+		if ackErr != nil {
+			r["ack_error"] = ackErr.Error()
 		}
 		if traceTime {
 			r["total_ms"] = float64(time.Duration(ackRecvAtNs-sentAtNs).Microseconds()) / 1000.0
@@ -4936,7 +5176,6 @@ func cmdSendMessage(args []string) {
 	agentHint := target.String()
 	// Snapshot the inbox before the send so --wait only takes a reply that
 	// arrives after it (never one already sitting there).
-	var watch *inboxWatch
 	if waitDur > 0 {
 		watch = newInboxWatch(agentHint)
 	}
@@ -4973,13 +5212,33 @@ func cmdSendMessage(args []string) {
 		}
 		tracef("dataexchange.Dial")
 		defer cl.Close()
-		r := sendOne(cl, 0, false)
+		r := sendOne(cl, 0, false, redial)
 		ackAt := time.Now()
+		// Every receiver answers a stored message with an ACK frame. No ACK
+		// means the message was not stored, or was never sent — the daemon
+		// drops a write it cannot buffer without telling the client — so
+		// "ok" here was reporting messages that never arrived. A send that
+		// failed outright was reported as "ok" with an error field; it is a
+		// failure too.
+		if e, failed := r["error"].(string); failed {
+			fatalHint("connection_failed",
+				"the message was not sent; check `pilotctl peers` and the daemon log, then send again",
+				"sending to %s failed: %s", target, e)
+		}
+		if _, acked := r["ack"]; !acked {
+			why := ""
+			if e, ok := r["ack_error"].(string); ok {
+				why = ": " + e
+			}
+			fatalHint("connection_failed",
+				"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
+				"%s did not acknowledge the message (%d bytes)%s", target, len(data), why)
+		}
 		// The receiver answers "ERR ..." when it could not store the
 		// message (disk full, inbox unwritable). That is a failed send, not
 		// a delivered one — same rule send-file applies.
-		if ackText, _ := r["ack"].(string); strings.HasPrefix(ackText, "ERR ") {
-			fatalCode("internal", "receiver rejected message: %s", ackText)
+		if rej := refusal(r); rej != "" {
+			fatalCode("internal", "receiver rejected message: %s", rej)
 		}
 		result := map[string]interface{}{
 			"target": target.String(),
@@ -5013,8 +5272,7 @@ func cmdSendMessage(args []string) {
 			// more on a new stream if nothing arrived by mid-window.
 			// --no-resend opts out for requests that are not safe to
 			// repeat.
-			_, sendFailed := r["error"]
-			if firstContact && !sendFailed && !flagBool(flags, "no-resend") {
+			if firstContact && !noResend {
 				if after := resendDelay(waitDur); after > 0 {
 					cfg.resendAfter = after
 					cfg.resend = func() (time.Time, error) {
@@ -5028,7 +5286,7 @@ func cmdSendMessage(args []string) {
 							return time.Time{}, err
 						}
 						defer c.Close()
-						rr := sendOne(c, 1, false)
+						rr := sendOne(c, 1, false, func() (*dataexchange.Client, error) { return dataexchange.Dial(rd, target) })
 						if e, failed := rr["error"].(string); failed {
 							return time.Time{}, errors.New(e)
 						}
@@ -5079,12 +5337,13 @@ func cmdSendMessage(args []string) {
 		defer cl.Close()
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
-			result := sendOne(cl, i, i > 0)
+			result := sendOne(cl, i, i > 0, redial)
 			results = append(results, result)
 			if i < sendCount-1 {
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
+		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
 			"target":     target.String(),
 			"to":         target.String(),
@@ -5098,13 +5357,14 @@ func cmdSendMessage(args []string) {
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
 			cl := dialOnce()
-			result := sendOne(cl, i, false)
+			result := sendOne(cl, i, false, redial)
 			results = append(results, result)
 			cl.Close()
 			if i < sendCount-1 {
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
+		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
 			"target":     target.String(),
 			"to":         target.String(),
@@ -5115,6 +5375,72 @@ func cmdSendMessage(args []string) {
 	}
 	tracef("outputOK")
 	maybePromptPilotReview()
+}
+
+// messageFrame builds the data-exchange frame for one send-message. With
+// trace it is the TypeTrace wrapper (inner type, send time, payload) the
+// receiver answers with a timing ACK; the message ID and reply-to ride
+// outside it either way.
+func messageFrame(innerType uint32, data []byte, messageID, replyTo string, trace bool, sentAtNs int64) *dataexchange.Frame {
+	f := &dataexchange.Frame{Type: innerType, Payload: data, MessageID: messageID, ReplyTo: replyTo}
+	if trace {
+		buf := make([]byte, 12+len(data))
+		binary.BigEndian.PutUint32(buf[0:4], innerType)
+		binary.BigEndian.PutUint64(buf[4:12], uint64(sentAtNs)) // #nosec G115 -- a wall-clock nanosecond count is positive
+		copy(buf[12:], data)
+		f.Type, f.Payload = dataexchange.TypeTrace, buf
+	}
+	return f
+}
+
+// inboxFileID matches the id `pilotctl inbox` lists for a message: its file
+// name without .json, {TYPE}-{date}-{time.ms}-{seq}. It is not the message's
+// message_id, though it passes as one.
+var inboxFileID = regexp.MustCompile(`^[A-Z_]+-[0-9]{8}-[0-9]{6}\.[0-9]{3}-[0-9]+$`)
+
+// resolveReplyTo turns a --reply-to value into the message ID to send as
+// reply_to. The sender's --wait only takes a reply whose reply_to is its
+// own message ID, and never one that names another, so a wrong value costs
+// the sender a timeout: catch the two easy mistakes here. A bare
+// --reply-to parses as "true". An inbox file id is what the inbox listing
+// shows first; it is mapped to the message_id stored in that record.
+func resolveReplyTo(raw string) (string, error) {
+	if raw == "true" {
+		return "", errors.New("--reply-to needs a value: the message_id of the message you are answering (pilotctl inbox shows it)")
+	}
+	// The file name itself, as ls shows it, is the same mistake.
+	if name := strings.TrimSuffix(raw, ".json"); name != raw && inboxFileID.MatchString(name) {
+		raw = name
+	}
+	if inboxFileID.MatchString(raw) {
+		dir, err := inboxDirPath()
+		if err != nil {
+			return "", fmt.Errorf("--reply-to %s: %v", raw, err)
+		}
+		body, err := os.ReadFile(filepath.Join(dir, raw+".json")) // #nosec G304 -- raw matched inboxFileID (no path separators); a file in this node's own inbox
+		if err != nil {
+			return "", fmt.Errorf("--reply-to %s is an inbox file id, not a message_id, and no such message is in the inbox; pass the message_id that pilotctl inbox shows", raw)
+		}
+		var rec map[string]interface{}
+		if err := json.Unmarshal(body, &rec); err != nil {
+			return "", fmt.Errorf("--reply-to %s: parse inbox record: %v", raw, err)
+		}
+		id, _ := rec["message_id"].(string)
+		if !dataexchange.ValidMessageID(id) {
+			return "", fmt.Errorf("--reply-to %s: that message carries no message_id (its sender predates message IDs), so a reply cannot name it; send without --reply-to", raw)
+		}
+		return id, nil
+	}
+	if !dataexchange.ValidMessageID(raw) {
+		return "", fmt.Errorf("--reply-to must be a message ID: 1-%d characters of A-Z a-z 0-9 . _ : -", dataexchange.MaxMessageIDLen)
+	}
+	return raw, nil
+}
+
+// isAckReadError reports whether a Client.Send error means the frame was
+// written and only the receiver's acknowledgement could not be read.
+func isAckReadError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "dataexchange: read ack:")
 }
 
 // maybePromptPilotReview occasionally prints a Pilot review nudge to stderr
@@ -7027,9 +7353,30 @@ func cmdInboxRead(dir, id string) {
 	ts, _ := m["received_at"].(string)
 	msgType, _ := m["type"].(string)
 	bytes, _ := m["bytes"].(float64)
-	fmt.Printf("ID:    %s\nFrom:  %s\nWhen:  %s\nType:  %s\nBytes: %d\n\n", m["id"], from, ts, msgType, int(bytes))
+	// Labels padded to the longest, "Message ID:", so the values line up.
+	fmt.Printf("ID:         %s\nFrom:       %s\nWhen:       %s\nType:       %s\nBytes:      %d\n", m["id"], from, ts, msgType, int(bytes))
+	if id, _ := m["message_id"].(string); id != "" {
+		fmt.Printf("Message ID: %s\n", id)
+	}
+	if id, _ := m["reply_to"].(string); id != "" {
+		fmt.Printf("Reply to:   %s\n", id)
+	}
+	fmt.Println()
 	body, _ := m["data"].(string)
 	fmt.Println(body)
+}
+
+// inboxCorrelation is the listing's line for a record's message_id and
+// reply_to, or "" when it has neither (a sender that predates message IDs).
+func inboxCorrelation(msg map[string]interface{}) string {
+	var parts []string
+	if id, _ := msg["message_id"].(string); id != "" {
+		parts = append(parts, "message_id "+id)
+	}
+	if id, _ := msg["reply_to"].(string); id != "" {
+		parts = append(parts, "reply_to "+id)
+	}
+	return strings.Join(parts, " · ")
 }
 
 // Messages are saved to ~/.pilot/inbox/ by the daemon's built-in service.
@@ -7173,6 +7520,15 @@ func cmdInbox(args []string) {
 				"type":        im.msg["type"],
 				"bytes":       im.msg["bytes"],
 			}
+			// The ID a reply names (send-message --reply-to) is message_id,
+			// not id. message_id and reply_to are listed when the record
+			// has them, so an agent can answer a message or see what an
+			// answer answers without reading each record.
+			for _, key := range []string{"message_id", "reply_to"} {
+				if v, _ := im.msg[key].(string); v != "" {
+					m[key] = v
+				}
+			}
 			if body, _ := im.msg["data"].(string); full {
 				m["data"] = body
 			} else {
@@ -7207,6 +7563,9 @@ func cmdInbox(args []string) {
 		}
 		fmt.Printf("  %s\n", sAccent(im.id))
 		fmt.Printf("  %s\n", sDim(fmt.Sprintf("%s · %s · %s · %s", from, msgType, age, formatBytes(uint64(bytes)))))
+		if ids := inboxCorrelation(im.msg); ids != "" {
+			fmt.Printf("  %s\n", sDim(ids))
+		}
 		body, _ := im.msg["data"].(string)
 		if full {
 			fmt.Printf("  %s\n\n", body)
