@@ -390,7 +390,9 @@ Detailed per-release notes are on the
   the next address move (it waited up to 80 s, now 10 s); stopping the
   daemon no longer waits up to 47 s for a recovery redialling a registry
   that refuses connections; and the heartbeat no longer repeats the registry
-  reconnect and full re-registration a recovery has just done.
+  reconnect and full re-registration a recovery has just done. A recovery
+  whose re-registration failed, or that restored the node's visibility,
+  hostname or trust pairs only in part, does not count as done.
 - **A bulk transfer no longer hangs when the receiver's application falls
   behind.** When a receiver's application stops reading for a second, the
   receiver parks the next in-order segment in its reorder buffer and keeps
