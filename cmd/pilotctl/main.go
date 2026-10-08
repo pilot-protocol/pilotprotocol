@@ -2635,7 +2635,7 @@ func contextCatalog() map[string]interface{} {
 				"audit":          map[string]interface{}{"args": []string{"<id>", "[--tail <n>]", "[--event <name>]", "[--since <dur>]"}, "description": "Show the supervisor lifecycle log (spawn/exit/suspend/verify-fail)"},
 				"actions":        map[string]interface{}{"args": []string{"[--tail <n>]", "[--event <name>]"}, "description": "Show the pilotctl-side install/uninstall action log (survives app removal)"},
 				"restart":        map[string]interface{}{"args": []string{"<id>"}, "description": "Clear crash-loop suspension and respawn the app"},
-				"uninstall":      map[string]interface{}{"args": []string{"<id>", "--yes"}, "description": "Remove an installed app from the install root"},
+				"uninstall":      map[string]interface{}{"args": []string{"<id>", "--yes"}, "description": "Stop and remove an installed app; its state (keys, data) is kept in the app backups"},
 				"verify":         map[string]interface{}{"args": []string{"<bundle-dir>"}, "description": "sha256-check a pre-install bundle against its manifest"},
 				"gen-key":        map[string]interface{}{"args": []string{"<key-file>"}, "description": "Generate a fresh ed25519 publisher keypair (publisher tooling)"},
 				"sign":           map[string]interface{}{"args": []string{"--key <key-file>", "<manifest>"}, "description": "Sign (or re-sign) a manifest's store.signature (publisher tooling)"},

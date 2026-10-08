@@ -117,7 +117,7 @@ Usage:
                                              event names: supervise-start, supervise-stop,
                                                           spawn, exit, suspend, verify-fail, spawn-fail
                                              duration: Go syntax (e.g. 10m, 1h, 24h)
-  pilotctl appstore uninstall <id> --yes     remove an installed app from the install root
+  pilotctl appstore uninstall <id> --yes     stop and remove an installed app; its state (keys, data) is kept in the app backups
   pilotctl appstore verify <bundle-dir>      sha256-check a pre-install bundle against its manifest
   pilotctl appstore catalogue                list apps available for one-command install
   pilotctl appstore install <app-id> [--version <v>] [--force [--reset-state]] [--no-wait | --wait <dur>]
@@ -750,8 +750,9 @@ func shortHex(h string) string {
 
 // ── uninstall ──────────────────────────────────────────────────────────
 
-// cmdAppStoreUninstall removes an installed app's directory tree from the
-// install root. Destructive — requires --yes to confirm. Does NOT
+// cmdAppStoreUninstall stops an installed app and moves its directory out of
+// the install root into the app backups, keeping its state (keys, data);
+// nothing is deleted. Requires --yes to confirm. Does NOT
 // coordinate with the daemon's supervisor, so until the daemon is
 // restarted the supervisor will keep failing the binary sha256 check on
 // every respawn (visible in the audit log as "verify-fail" lines, capped
@@ -776,7 +777,7 @@ func cmdAppStoreUninstall(args []string) {
 	}
 	if !confirmed {
 		fatalHint("invalid_argument",
-			"uninstall is destructive — pass --yes to confirm",
+			"uninstall stops the app and removes it; its state (keys, data) is kept in the app backups — pass --yes to confirm",
 			"refusing to uninstall %q without --yes", appID)
 	}
 
@@ -816,12 +817,13 @@ func cmdAppStoreUninstall(args []string) {
 	// binary sha256 + app_version into the uninstall audit record.
 	// The per-app supervisor.log is going away with the dir; the
 	// pilotctl-audit log at the install-root level is what survives.
-	var snapSHA, snapVer string
+	var snapSHA, snapVer, snapBin string
 	mfPath := filepath.Join(dir, "manifest.json")
 	if raw, err := os.ReadFile(mfPath); err == nil {
 		if m, perr := manifest.Parse(raw); perr == nil {
 			snapSHA = m.Binary.SHA256
 			snapVer = m.AppVersion
+			snapBin = m.Binary.Path
 		}
 	}
 
@@ -849,30 +851,30 @@ func cmdAppStoreUninstall(args []string) {
 	}
 	stopped, _ := stopProcessesRunningFrom(procRoots, appDirStopGrace)
 
-	// Retry RemoveAll a few times to ride out the supervisor's
-	// in-flight audit writes; the rescan loop cancels the goroutine
-	// within ~RescanInterval (default 30s in prod, but the audit
-	// writes themselves happen at the 30s verify-fail cadence, so a
-	// handful of short retries is usually enough).
-	const (
-		removeRetries = 8
-		retryDelay    = 250 * time.Millisecond
-	)
-	var rmErr error
-	for i := 0; i < removeRetries; i++ {
-		if err := removeAllForce(dir); err == nil { // read-only dirs in $APP (a Go module cache) included
-			rmErr = nil
-			break
-		} else {
-			rmErr = err
-			time.Sleep(retryDelay)
-		}
-	}
-	if rmErr != nil {
+	// The app's dir holds its state: the wallet's EVM private key, smol's
+	// secrets, each metered app's identity. Deleting it deleted those with
+	// no way back. It is moved to the app backups instead, like a replaced
+	// install (without the binary), pinned so retention never removes it;
+	// the wallet restores its key from there when it is installed again.
+	// If it cannot be moved, nothing is deleted: the dir stays, with its
+	// manifest gone so the daemon does not run it.
+	backupDir, bkErr := retireAppDir(dir, appID, appBackupMeta{
+		Kind:        backupKindUninstall,
+		FromVersion: snapVer,
+		Reason:      "uninstalled by " + currentActor(),
+		oldBinary:   snapBin,
+	})
+	if backupDir == "" || filepath.Clean(backupDir) == filepath.Clean(dir) {
 		fatalHint("io_error",
-			"manifest removed but the dir is racing the supervisor; rerun `pilotctl appstore uninstall --yes` after the daemon's next rescan settles (~30s)",
-			"remove %s: %v", dir, rmErr)
+			fmt.Sprintf("nothing was deleted: %s is still there, without its manifest, so the daemon does not run it. Fix the backup location (PILOT_APPSTORE_BACKUP_ROOT or %s) and rerun `pilotctl appstore uninstall %s --yes`", dir, appStoreBackupRoot(), appID),
+			"could not move %s to the app backups: %v", dir, bkErr)
 	}
+	if bkErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", bkErr)
+	}
+	// A process still running from the app's files now runs from the
+	// backup (on Linux its executable path follows the move): look there too.
+	procRoots = append(procRoots, appDirRoots(backupDir)...)
 
 	// A supervisor that had not yet seen the manifest go may have respawned
 	// the app between the stop above and the delete (its restart backoff
@@ -889,7 +891,7 @@ func cmdAppStoreUninstall(args []string) {
 	// of the app dir). Pairs with the install-time event we wrote
 	// into supervisor.log earlier — gives "this app existed between
 	// install T0 and uninstall T1" reconstructable post-hoc.
-	reason := fmt.Sprintf("actor=%s removed=%s", currentActor(), dir)
+	reason := fmt.Sprintf("actor=%s removed=%s backup=%s", currentActor(), dir, backupDir)
 	if len(stopped) > 0 {
 		reason += " stopped=" + describeAppDirProcesses(stopped)
 	}
@@ -911,6 +913,7 @@ func cmdAppStoreUninstall(args []string) {
 		out := map[string]any{
 			"id":            appID,
 			"removed":       dir,
+			"backup":        backupDir,
 			"daemon_notice": "supervisor's next rescan (≤30s) will cancel the per-app goroutine; manifest already removed",
 		}
 		if len(backups) > 0 {
@@ -926,6 +929,7 @@ func cmdAppStoreUninstall(args []string) {
 		return
 	}
 	fmt.Printf("removed %s\n", dir)
+	fmt.Printf("its state (keys, data) is kept in %s; delete it by hand once you no longer need it (the wallet, from 0.4.0, restores its keys from there when installed again)\n", backupDir)
 	if len(stopped) > 0 {
 		fmt.Printf("stopped %d process(es) still running from the app's files: %s\n", len(stopped), describeAppDirProcesses(stopped))
 	}
