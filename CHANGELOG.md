@@ -357,6 +357,21 @@ Detailed per-release notes are on the
   `appstore upgrade` does not wait.
 
 ### Fixed
+- **A send error no longer strands the end of a stream write.** When the
+  tunnel refused a segment of a write's last piece (or of any write up to
+  56 segments), the daemon returned the error and left the rest of the write
+  in the send buffer, where nothing sent it: `send-message` then waited for
+  the receiver's two-minute idle timeout. The refused segment is not lost —
+  it is retransmitted — so the write now carries on past it, as the earlier
+  pieces of a large write already did. Closing a connection likewise sends
+  everything left in the send buffer ahead of the FIN after a send error,
+  instead of dropping the rest.
+- **The retransmission timeout no longer jumps after a recovery.** The ACK
+  for a resent segment also covers the segments behind it, which were sent
+  once, possibly seconds earlier, and the round-trip time was sampled from
+  the oldest of them. After a parked segment was resent the timeout went from
+  437 ms to 4.5 s. Following Karn's algorithm as Linux applies it, an ACK that
+  newly acknowledges any resent segment gives no round-trip sample.
 - **A bulk transfer no longer hangs when the receiver's application falls
   behind.** When a receiver's application stops reading for a second, the
   receiver parks the next in-order segment in its reorder buffer and keeps

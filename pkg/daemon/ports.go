@@ -1109,17 +1109,28 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 	// RFC 6298 §2 requires at most one RTT sample per ACK event; taking a
 	// sample per segment biases SRTT toward short-RTT late-in-batch entries
 	// and inflates RTTVAR with within-batch variance that is not path-level.
+	//
+	// Karn's algorithm, as Linux applies it: an ACK that newly acknowledges
+	// any retransmitted segment gives no sample at all. Skipping only the
+	// retransmitted segment sampled the once-sent ones behind it, and after
+	// a parked head was resent those had been sent seconds earlier: RTO went
+	// from 437ms to 4.5s.
 	var remaining []*retxEntry
 	rttUpdated := false
+	for _, e := range c.Unacked {
+		if e.attempts > 1 && seqAfterOrEqual(ack, e.seq+uint32(len(e.data))) {
+			rttUpdated = true // no sample from this ACK
+			break
+		}
+	}
 	for _, e := range c.Unacked {
 		endSeq := e.seq + uint32(len(e.data))
 		if seqAfterOrEqual(ack, endSeq) {
 			// This segment is fully acked — update RTT from the first one only.
-			// Karn's algorithm: skip retransmitted segments (attempts > 1).
-			// SACK state is not excluded: a once-sent segment is a valid RTT
-			// sample per RFC 6298 regardless of whether it was previously
-			// reported via SACK (the cumulative ACK time is a conservative
-			// upper bound that the EWMA smooths out).
+			// SACK state is not excluded: when nothing before it was resent,
+			// a once-sent segment is a valid RTT sample per RFC 6298 even if
+			// it was already reported via SACK. An ACK that also covers a
+			// resent segment took no sample above.
 			if e.attempts == 1 && !rttUpdated {
 				// Use origSentAt (original send time, never overwritten by
 				// RFC 6298 §5.3 timer restarts) so that the RTT sample

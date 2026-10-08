@@ -48,6 +48,12 @@ import (
 // The alternative — leaving SRTT=0 / RTO=InitialRTO forever on SACK-heavy
 // connections — is far worse for performance.
 //
+// That holds only while nothing before them was resent. When the same ACK
+// also covers a resent segment, the once-sent ones behind it were held back
+// by the repair and the sample is not smoothed out: RTO went from 437ms to
+// 4.5s after a parked head was resent. Such an ACK gives no sample (v1.17.1,
+// TestAckAfterParkedHeadRecoveryTakesNoRTTSample).
+//
 // GREEN assertion: after ProcessAck with a cumulative ACK covering a
 // once-sent sacked entry (attempts=1, sacked=true), conn.SRTT is positive.
 // Against unpatched code SRTT stays at 0 because !e.sacked prevents the call.

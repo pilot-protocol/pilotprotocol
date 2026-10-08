@@ -134,16 +134,13 @@ func TestLargeWriteSendsItsLastPieceAtOnce(t *testing.T) {
 // write can end in a short segment.
 var _ [0]struct{} = [nagleWritePiece % SendSegmentSize]struct{}{}
 
-// A tunnel send error part-way through a large write used to end the write:
-// the failed segment is tracked and retransmitted, but the pieces not yet
-// buffered were dropped, and the connection's next write took their place in
-// the stream. Every byte of the write must be committed to the stream — given
-// a sequence number, or still in the send buffer — in order.
-func TestLargeWriteSurvivesTunnelSendErrors(t *testing.T) {
-	t.Parallel()
+// newUnreachableConn returns an established connection, starting at sequence
+// 1000, to a peer the daemon has no tunnel to: every send fails, after the
+// segment has been given its sequence number and tracked for retransmission.
+func newUnreachableConn(t *testing.T, peer uint32) (*Daemon, *Connection) {
+	t.Helper()
 	d := New(Config{})
 	t.Cleanup(func() { d.tunnels.Close() })
-	const peer uint32 = 0xDADA0003 // no tunnel to it: every send fails
 	conn := d.ports.NewConnection(2003, protocol.Addr{Network: 0, Node: peer}, 80)
 	conn.State = StateEstablished
 	conn.LocalAddr = protocol.Addr{Network: 0, Node: 0x22222222}
@@ -153,18 +150,108 @@ func TestLargeWriteSurvivesTunnelSendErrors(t *testing.T) {
 	conn.CongWin = MaxCongWin
 	conn.PeerRecvWin = 1 << 20
 	t.Cleanup(func() { d.ports.RemoveConnection(conn.ID) })
+	return d, conn
+}
+
+// trackedStream returns the data segments awaiting acknowledgement, joined
+// in sequence order from 1000, and fails if they leave a gap.
+func trackedStream(t *testing.T, conn *Connection) []byte {
+	t.Helper()
+	conn.RetxMu.Lock()
+	defer conn.RetxMu.Unlock()
+	var stream []byte
+	for _, e := range conn.Unacked {
+		if e.isFIN {
+			continue
+		}
+		if want := uint32(1000 + len(stream)); e.seq != want {
+			t.Fatalf("tracked segment at seq %d, want %d: the stream has a gap", e.seq, want)
+		}
+		stream = append(stream, e.data...)
+	}
+	return stream
+}
+
+// A tunnel send error part-way through a large write used to end the write:
+// the failed segment is tracked and retransmitted, but the pieces not yet
+// buffered were dropped, and the connection's next write took their place in
+// the stream. Every byte of the write must be given a sequence number, in
+// order, and the write reported done: the retransmit loop repairs the error.
+func TestLargeWriteSurvivesTunnelSendErrors(t *testing.T) {
+	t.Parallel()
+	d, conn := newUnreachableConn(t, 0xDADA0003)
 	ackEverything(t, conn)
 
 	const size = 200000
-	_ = d.SendData(conn, make([]byte, size)) // the last piece's error is reported
+	if err := d.SendData(conn, make([]byte, size)); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
 	conn.Mu.Lock()
 	sent := int(conn.SendSeq - 1000)
 	conn.Mu.Unlock()
 	conn.NagleMu.Lock()
 	buffered := len(conn.NagleBuf)
 	conn.NagleMu.Unlock()
-	if sent+buffered != size {
-		t.Fatalf("%d bytes given sequence numbers and %d buffered, of a %d-byte write: the rest was dropped", sent, buffered, size)
+	if sent != size || buffered != 0 {
+		t.Fatalf("%d bytes given sequence numbers and %d buffered, of a %d-byte write", sent, buffered, size)
+	}
+}
+
+// The same for a write of one piece or less, and so for the last piece of a
+// large one. A send error on its first segment used to return at once and
+// leave the rest of it in the send buffer, where nothing sends it: only a
+// held short remainder has a goroutine waiting to flush it. send-message
+// then waited for the receiver's idle timeout.
+func TestWriteOfOnePieceSurvivesTunnelSendErrors(t *testing.T) {
+	t.Parallel()
+	for _, size := range []int{10, 3*SendSegmentSize + 10, nagleWritePiece} {
+		d, conn := newUnreachableConn(t, 0xDADA0005)
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i * 7)
+		}
+		if err := d.SendData(conn, data); err != nil {
+			t.Errorf("%d-byte write: SendData: %v", size, err)
+		}
+		conn.NagleMu.Lock()
+		buffered := len(conn.NagleBuf)
+		conn.NagleMu.Unlock()
+		if buffered != 0 {
+			t.Errorf("%d-byte write: %d bytes left in the send buffer with nothing to send them", size, buffered)
+		}
+		if got := trackedStream(t, conn); !bytes.Equal(got, data) {
+			t.Errorf("%d-byte write: %d bytes given sequence numbers, want all of them", size, len(got))
+		}
+	}
+}
+
+// Closing sends what is left in the send buffer ahead of the FIN. A send
+// error on its first segment used to drop the rest, and the FIN took its
+// place in the stream. Every byte must be given a sequence number, and the
+// FIN the one after the last of them.
+func TestCloseCommitsTheWholeTailDespiteSendErrors(t *testing.T) {
+	t.Parallel()
+	d, conn := newUnreachableConn(t, 0xDADA0006)
+	// More than a segment can be left: a writer's piece, appended but not yet
+	// flushed, joins a held remainder.
+	tail := make([]byte, 2*SendSegmentSize+100)
+	for i := range tail {
+		tail[i] = byte(i * 7)
+	}
+	conn.NagleMu.Lock()
+	conn.NagleBuf = append(conn.NagleBuf, tail...)
+	conn.NagleMu.Unlock()
+
+	d.CloseConnection(conn)
+
+	if got := trackedStream(t, conn); !bytes.Equal(got, tail) {
+		t.Fatalf("%d bytes of a %d-byte tail given sequence numbers before the FIN", len(got), len(tail))
+	}
+	conn.RetxMu.Lock()
+	defer conn.RetxMu.Unlock()
+	fin := conn.Unacked[len(conn.Unacked)-1]
+	if want := uint32(1000 + len(tail)); !fin.isFIN || fin.seq != want {
+		t.Fatalf("last tracked entry isFIN=%v seq=%d, want the FIN at %d", fin.isFIN, fin.seq, want)
 	}
 }
 
