@@ -2205,8 +2205,15 @@ func (tm *TunnelManager) SetRelayPeerPinned(nodeID uint32, relay bool) {
 // SendTo sends a packet to a specific UDP address (relay-aware).
 func (tm *TunnelManager) SendTo(addr *net.UDPAddr, nodeID uint32, pkt *protocol.Packet) error {
 	// Path upkeep (keepalives, probes, key exchange) bypasses SendTo, so
-	// everything that arrives here is traffic someone asked for.
-	tm.noteAppActivity(nodeID)
+	// everything that arrives here is traffic someone asked for — except
+	// the pong to a peer's path probe, which is upkeep on that peer's
+	// behalf. Counting it kept every idle peer with a path watchdog
+	// (v1.13.10 and later) maintained: it probes after 55 s of quiet, the
+	// pong made it active again for PeerIdleAfter, and so on. Same rule as
+	// for packets received (handleEncrypted).
+	if !(pkt.Protocol == protocol.ProtoControl && pkt.DstPort == protocol.PortPing) {
+		tm.noteAppActivity(nodeID)
+	}
 	data, err := pkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
