@@ -4388,7 +4388,15 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 			return protocol.ErrConnClosed
 		}
 	}
-	return d.sendDataPiece(conn, data, tailNow)
+	// The last piece, or the whole of a smaller write, drains the same way.
+	// Returning its error left the segments after the failed one in the
+	// buffer, and nothing sends them: only a held short remainder has a
+	// flusher waiting on the ACK. send-message then waited for the
+	// receiver's idle timeout.
+	if err := d.sendDataPiece(conn, data, tailNow); err != nil {
+		return d.drainAfterSendError(conn, err, tailNow)
+	}
+	return nil
 }
 
 // connEstablished reports whether conn is still open for sending.
@@ -4398,8 +4406,8 @@ func connEstablished(conn *Connection) bool {
 	return conn.State == StateEstablished
 }
 
-// drainAfterSendError finishes flushing a piece of a large write after a
-// send error, so the rest of the write can follow it.
+// drainAfterSendError finishes flushing a write, or a piece of a large one,
+// after a send error, so the rest of the write can follow it.
 //
 // A tunnel send error does not lose the segment: it was given its sequence
 // number and tracked before the send, and the retransmit loop resends it.
@@ -4612,8 +4620,11 @@ func (d *Daemon) sendHeldTailBeforeClose(conn *Connection) {
 		if n > SendSegmentSize {
 			n = SendSegmentSize
 		}
+		// A send error does not lose the segment (see drainAfterSendError).
+		// Returning on one dropped the rest of the tail, and the FIN took
+		// its place in the stream.
 		if err := d.transmitSegment(conn, tail[:n]); err != nil {
-			return
+			slog.Debug("stream send failed before close; the segment will be retransmitted", "conn_id", conn.ID, "err", err)
 		}
 		tail = tail[n:]
 	}
