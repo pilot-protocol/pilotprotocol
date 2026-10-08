@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	goruntime "runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -48,18 +47,7 @@ import (
 
 var version = "dev"
 
-// daemonMaxProcs caps the daemon's OS threads unless GOMAXPROCS is set.
-// The daemon's work is many short waits on sockets and timers. With one
-// thread per core (16 on a laptop, 64 on the service-agent VM) a burst of
-// connections spends most of its CPU in the Go scheduler waking and parking
-// idle threads: measured 85% of the daemon's CPU in a 256-way send burst,
-// and 25–40% less CPU per message at 2 threads than at 16.
-const daemonMaxProcs = 4
-
 func main() {
-	if os.Getenv("GOMAXPROCS") == "" && goruntime.GOMAXPROCS(0) > daemonMaxProcs {
-		goruntime.GOMAXPROCS(daemonMaxProcs)
-	}
 	configPath := flag.String("config", "", "path to config file (JSON)")
 	securityProfile := flag.String("security-profile", envString("PILOT_SECURITY_PROFILE", securityProfileCompatible), "locked security profile: compatible or enterprise")
 	registryDefault := defaultRegistryAddr
