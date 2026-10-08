@@ -479,6 +479,13 @@ type Daemon struct {
 	dialOKSeq               atomic.Uint64
 	consecutiveDialTimeouts atomic.Uint64
 
+	// finLinger bounds the wait for a closing connection's data to be
+	// acknowledged before its FIN goes out anyway (releaseHeldFIN).
+	// finHoldIdle bounds how long a FIN from the peer is held for missing
+	// data once nothing more comes from the peer (expireHeldFIN).
+	finLinger   time.Duration
+	finHoldIdle time.Duration
+
 	startTime       time.Time
 	stopCh          chan struct{}         // closed on Stop() to signal goroutines
 	beaconSelection *beaconSelectionState // multi-beacon discovery state
@@ -664,6 +671,8 @@ func New(cfg Config) *Daemon {
 		tunnels:         NewTunnelManager(),
 		ports:           NewPortManager(),
 		stopCh:          make(chan struct{}),
+		finLinger:       defaultFinLinger,
+		finHoldIdle:     defaultFinHoldIdle,
 		hsPoll:          newHandshakePollSched(),
 		synTokens:       cfg.synRateLimit(),
 		synLastFill:     time.Now(),
@@ -1726,8 +1735,19 @@ func (d *Daemon) doStop() {
 		conn.Mu.Lock()
 		st := conn.State
 		seq := conn.SendSeq
+		held, lingerTimer := conn.heldFIN, conn.finLingerTimer
+		conn.heldFIN, conn.finLingerTimer = nil, nil
 		conn.Mu.Unlock()
-		if st == StateEstablished {
+		if lingerTimer != nil {
+			lingerTimer.Stop()
+		}
+		if held != nil && st != StateTimeWait && st != StateClosed {
+			// Closed with data still unacknowledged: its FIN was waiting.
+			// It may still read ESTABLISHED, its close half done; the
+			// FIN's sequence number is already reserved, so send that one
+			// and no second FIN after it.
+			d.tunnels.Send(conn.RemoteAddr.Node, held)
+		} else if st == StateEstablished {
 			// Send FIN
 			fin := &protocol.Packet{
 				Version:  protocol.Version,
@@ -3341,6 +3361,26 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// them as retransmits resends a stale SYN-ACK seq that the new client rejects,
 		// blocking the new connection for up to TimeWaitDuration + IdleSweepInterval.
 		if existing := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort); existing != nil {
+			// A peer that sent a FIN is past its SYN, so a SYN on the same
+			// ports while that FIN is held for missing data is a new
+			// connection from a restarted peer (its ephemeral ports start
+			// over), not a resend. Answered as the old connection, its data
+			// would be acknowledged as duplicates and never delivered. End
+			// the old one here, quietly: its data is not coming, and a
+			// FIN-ACK would reach the new connection.
+			existing.RecvMu.Lock()
+			restarted := existing.finPending
+			existing.RecvMu.Unlock()
+			if restarted {
+				slog.Info("new connection on the ports of one whose FIN was held — the peer restarted; closing the old one",
+					"conn_id", existing.ID, "remote_addr", pkt.Src, "remote_port", pkt.SrcPort)
+				existing.Mu.Lock()
+				existing.State = StateClosed
+				existing.Mu.Unlock()
+				d.stopFINHold(existing)
+				existing.CloseRecvBuf()
+				d.ports.RemoveConnection(existing.ID)
+			}
 			existing.Mu.Lock()
 			st := existing.State
 			eAck := existing.RecvAck
@@ -3594,55 +3634,45 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 	// FIN — remote close (or FIN-ACK acknowledging our FIN)
 	if pkt.HasFlag(protocol.FlagFIN) {
 		conn := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort)
-		if conn != nil {
-			conn.CloseRecvBuf()
-			conn.Mu.Lock()
-			wasFinWait := conn.State == StateFinWait
-			wasTimeWait := conn.State == StateTimeWait
-			conn.State = StateTimeWait
-			// Only refresh LastActivity on the FIRST FIN. A peer's FIN-ACK
-			// reply has FlagFIN set too; if we refresh on every FIN we keep
-			// idleSweepLoop from reaping this conn, which combined with the
-			// guarded send below would have created a packet-amplification
-			// loop (storm) at line rate.
-			if !wasTimeWait {
-				conn.LastActivity = time.Now()
-			}
-			conn.KeepaliveUnacked = 0
-			sendSeq := conn.SendSeq
-			conn.Mu.Unlock()
-			// If we were in FIN_WAIT, this is a FIN-ACK — clear retx buffer
-			if wasFinWait {
-				conn.RetxMu.Lock()
-				conn.Unacked = nil
-				conn.RetxMu.Unlock()
-			}
-			if !wasTimeWait {
-				d.publishEvent("conn.fin", map[string]interface{}{
-					"remote_addr": pkt.Src.String(), "remote_port": pkt.SrcPort,
-					"local_port": pkt.DstPort, "conn_id": conn.ID,
-				})
-			}
-			// Connection will be reaped by idleSweepLoop after TimeWaitDuration
-
-			// Send FIN-ACK once, only on the FIRST FIN. Subsequent FINs are
-			// our peer's FIN-ACK reply (or duplicates); echoing them back
-			// triggers a storm because FIN-ACK has FlagFIN set.
-			if !wasTimeWait {
-				finack := &protocol.Packet{
-					Version:  protocol.Version,
-					Flags:    protocol.FlagFIN | protocol.FlagACK,
-					Protocol: protocol.ProtoStream,
-					Src:      conn.LocalAddr,
-					Dst:      pkt.Src,
-					SrcPort:  pkt.DstPort,
-					DstPort:  pkt.SrcPort,
-					Seq:      sendSeq,
-					Ack:      pkt.Seq + 1,
-				}
-				d.tunnels.Send(pkt.Src.Node, finack)
-			}
+		if conn == nil {
+			return
 		}
+		// A FIN is the end of the peer's stream: it may only be acted on
+		// once everything sent before it has been delivered. Acting on a FIN
+		// that overtook a lost segment closed the stream with that data
+		// missing — and the FIN-ACK made the sender drop the segment it was
+		// about to resend — so a writer that closed right after its last
+		// write lost the end of it under loss (pub/sub events, one-shot
+		// sends). Hold the FIN until delivery reaches it, and ask for the
+		// missing data meanwhile.
+		// Only while this side still delivers data: once it has closed its
+		// own receive side (FIN_WAIT), the data would be discarded anyway.
+		conn.Mu.Lock()
+		receiving := conn.State == StateEstablished
+		conn.Mu.Unlock()
+		// A sender that stops without resending the missing data (a daemon
+		// stopped or restarted with a segment lost, of any version) would
+		// leave the FIN held for good: once nothing has come from the peer
+		// for finHoldIdle, the FIN is handled anyway (expireHeldFIN).
+		conn.RecvMu.Lock()
+		early := receiving && !conn.RecvClosed && seqAfter(pkt.Seq, conn.ExpectedSeq)
+		if early {
+			if !conn.finPending {
+				// The first copy's sequence number; a later one, or a
+				// retransmission, does not move it.
+				conn.finPending = true
+				conn.finSeq = pkt.Seq
+				c := conn
+				conn.finHoldTimer = time.AfterFunc(d.finHoldIdle, func() { d.expireHeldFIN(c) })
+			}
+			conn.finHeard = time.Now()
+		}
+		conn.RecvMu.Unlock()
+		if early {
+			d.sendDelayedACK(conn)
+			return
+		}
+		d.acceptFIN(conn, pkt.Seq)
 		return
 	}
 
@@ -3654,6 +3684,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			conn.State = StateClosed
 			conn.Mu.Unlock()
 			conn.signalDial() // a refused dial ends now, not at the next backstop tick
+			d.stopFINHold(conn)
 			conn.CloseRecvBuf()
 			d.ports.RemoveConnection(conn.ID)
 			d.publishEvent("conn.rst", map[string]interface{}{
@@ -3712,6 +3743,8 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			}
 			conn.ProcessAck(pkt.Ack, isPureACK)
 		}
+		// A FIN held for the data this ACK acknowledged goes out now.
+		d.releaseHeldFINIfAcked(conn)
 
 		// Check if payload is SACK info (not user data)
 		if isSACK {
@@ -3733,6 +3766,26 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			conn.Mu.Lock()
 			conn.RecvAck = cumAck
 			conn.Mu.Unlock()
+
+			// A FIN that arrived ahead of this data is handled now that
+			// delivery has reached it.
+			conn.RecvMu.Lock()
+			finReady := conn.finPending && !seqAfter(conn.finSeq, cumAck)
+			finSeq := conn.finSeq
+			if finReady {
+				conn.finPending = false
+				if conn.finHoldTimer != nil {
+					conn.finHoldTimer.Stop()
+					conn.finHoldTimer = nil
+				}
+			} else if conn.finPending {
+				conn.finHeard = time.Now()
+			}
+			conn.RecvMu.Unlock()
+			if finReady {
+				d.acceptFIN(conn, finSeq)
+				return
+			}
 
 			// Check if we have out-of-order data — ACK immediately with SACK
 			conn.RecvMu.Lock()
@@ -3771,6 +3824,118 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 				}
 			}
 		}
+	}
+}
+
+// defaultFinHoldIdle is how long a FIN held for missing data waits after the
+// last packet from the peer (Daemon.finHoldIdle). A sender that is still
+// there resends the missing data with its retransmission timeout, at most
+// 10 s (RTOMax) apart, so it is always heard from sooner.
+const defaultFinHoldIdle = 15 * time.Second
+
+// expireHeldFIN handles a FIN held for missing data once nothing has come
+// from the peer for finHoldIdle: the sender has stopped resending (it was
+// stopped or restarted, or gave up). The reader gets EOF without the
+// missing data, as every version up to v1.17.0 gave it at once. Runs on the
+// hold timer; a FIN that delivery reached first is not handled again.
+func (d *Daemon) expireHeldFIN(conn *Connection) {
+	conn.Mu.Lock()
+	open := conn.State == StateEstablished
+	conn.Mu.Unlock()
+	conn.RecvMu.Lock()
+	if !conn.finPending {
+		conn.RecvMu.Unlock()
+		return
+	}
+	if !open {
+		// The connection ended some other way (RST, a local close, the
+		// reaper, shutdown): nothing to answer, and a FIN-ACK now could
+		// reach a new connection on the same ports.
+		conn.finPending = false
+		conn.finHoldTimer = nil
+		conn.RecvMu.Unlock()
+		return
+	}
+	if wait := d.finHoldIdle - time.Since(conn.finHeard); wait > 0 {
+		conn.finHoldTimer.Reset(wait)
+		conn.RecvMu.Unlock()
+		return
+	}
+	conn.finPending = false
+	conn.finHoldTimer = nil
+	finSeq, missing := conn.finSeq, conn.finSeq-conn.ExpectedSeq
+	conn.RecvMu.Unlock()
+	slog.Warn("peer closed with data missing and stopped resending it — closing the stream without it",
+		"conn_id", conn.ID, "remote_addr", conn.RemoteAddr, "remote_port", conn.RemotePort,
+		"missing_bytes", missing, "silent_for", d.finHoldIdle)
+	d.acceptFIN(conn, finSeq)
+}
+
+// stopFINHold ends the hold on the peer's FIN, if any, and its timer: the
+// connection ended some other way, or the FIN is being handled now.
+func (d *Daemon) stopFINHold(conn *Connection) {
+	conn.RecvMu.Lock()
+	conn.finPending = false
+	if conn.finHoldTimer != nil {
+		conn.finHoldTimer.Stop()
+		conn.finHoldTimer = nil
+	}
+	conn.RecvMu.Unlock()
+}
+
+// acceptFIN handles the peer's FIN once every byte sent before it has been
+// delivered (see the FIN branch of handleStreamPacket): it closes the
+// receive side, moves to TIME_WAIT and answers with a FIN-ACK.
+func (d *Daemon) acceptFIN(conn *Connection, finSeq uint32) {
+	d.stopFINHold(conn)
+	conn.CloseRecvBuf()
+	conn.Mu.Lock()
+	wasFinWait := conn.State == StateFinWait
+	wasTimeWait := conn.State == StateTimeWait
+	conn.State = StateTimeWait
+	// Only refresh LastActivity on the FIRST FIN. A peer's FIN-ACK
+	// reply has FlagFIN set too; if we refresh on every FIN we keep
+	// idleSweepLoop from reaping this conn, which combined with the
+	// guarded send below would have created a packet-amplification
+	// loop (storm) at line rate.
+	if !wasTimeWait {
+		conn.LastActivity = time.Now()
+	}
+	conn.KeepaliveUnacked = 0
+	sendSeq := conn.SendSeq
+	localAddr, localPort := conn.LocalAddr, conn.LocalPort
+	remoteAddr, remotePort := conn.RemoteAddr, conn.RemotePort
+	conn.Mu.Unlock()
+	// If we were in FIN_WAIT, this is a FIN-ACK — clear retx buffer
+	if wasFinWait {
+		conn.RetxMu.Lock()
+		conn.Unacked = nil
+		conn.RetxMu.Unlock()
+	}
+	if !wasTimeWait {
+		d.publishEvent("conn.fin", map[string]interface{}{
+			"remote_addr": remoteAddr.String(), "remote_port": remotePort,
+			"local_port": localPort, "conn_id": conn.ID,
+		})
+	}
+	// Connection will be reaped by idleSweepLoop after TimeWaitDuration
+
+	// Send FIN-ACK once, only on the FIRST FIN. Subsequent FINs are
+	// our peer's FIN-ACK reply (or duplicates); echoing them back
+	// triggers a storm because FIN-ACK has FlagFIN set.
+	if !wasTimeWait {
+		finack := &protocol.Packet{
+			Version:  protocol.Version,
+			Flags:    protocol.FlagFIN | protocol.FlagACK,
+			Protocol: protocol.ProtoStream,
+			Src:      localAddr,
+			Dst:      remoteAddr,
+			SrcPort:  localPort,
+			DstPort:  remotePort,
+			Seq:      sendSeq,
+			Ack:      finSeq + 1,
+		}
+		d.tunnels.Send(remoteAddr.Node, finack)
 	}
 }
 
@@ -5072,14 +5237,35 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	// segment with the same seq as the FIN sentinel (iter 24 fix, same
 	// pattern as the sendSegment pre-increment fix in iter 23).
 	d.sendHeldTailBeforeClose(conn)
+	// A receiver up to v1.17.0 acts on a FIN that overtook a lost segment,
+	// closing the stream without it. With data unacknowledged the FIN is
+	// held and sent once the data is acknowledged (finLinger at most;
+	// releaseHeldFIN), so the end of a write followed at once by a close
+	// survives loss on such receivers too. The caller does not wait. The
+	// FIN's sequence number is reserved and the FIN held in one critical
+	// section, so shutdown never sees the one without the other.
+	hold := d.unackedHasData(conn) && !d.stopping()
 	conn.Mu.Lock()
 	st := conn.State
-	sendSeq := conn.SendSeq
+	var fin *protocol.Packet
 	if st == StateEstablished {
+		fin = &protocol.Packet{
+			Version:  protocol.Version,
+			Flags:    protocol.FlagFIN,
+			Protocol: protocol.ProtoStream,
+			Src:      conn.LocalAddr,
+			Dst:      conn.RemoteAddr,
+			SrcPort:  conn.LocalPort,
+			DstPort:  conn.RemotePort,
+			Seq:      conn.SendSeq,
+		}
 		conn.SendSeq++ // reserve FIN seq atomically with the read
+		if hold {
+			c := conn
+			conn.heldFIN = fin
+			conn.finLingerTimer = time.AfterFunc(d.finLinger, func() { d.releaseHeldFIN(c) })
+		}
 	}
-	localAddr := conn.LocalAddr
-	localPort := conn.LocalPort
 	remoteAddr := conn.RemoteAddr
 	remotePort := conn.RemotePort
 	connID := conn.ID
@@ -5091,35 +5277,17 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 			"conn_id":     connID,
 		})
 	}
-	if st == StateEstablished {
-		finData := []byte{0} // 1-byte sentinel so retxEntry has non-zero length
-		fin := &protocol.Packet{
-			Version:  protocol.Version,
-			Flags:    protocol.FlagFIN,
-			Protocol: protocol.ProtoStream,
-			Src:      localAddr,
-			Dst:      remoteAddr,
-			SrcPort:  localPort,
-			DstPort:  remotePort,
-			Seq:      sendSeq,
+	if fin != nil {
+		if hold {
+			// The last ACK may have been handled since the check above.
+			d.releaseHeldFINIfAcked(conn)
+		} else {
+			d.sendFIN(conn, fin)
 		}
-		d.tunnels.Send(remoteAddr.Node, fin)
-		// Track FIN in retransmission buffer so the retxLoop retries it.
-		// Use isFIN=true so retransmitUnacked can distinguish the FIN entry
-		// from regular data entries (which must be retransmitted as data even
-		// when the connection is in StateFinWait).
-		conn.RetxMu.Lock()
-		now := time.Now()
-		conn.Unacked = append(conn.Unacked, &retxEntry{
-			data:       finData,
-			seq:        sendSeq,
-			sentAt:     now,
-			origSentAt: now,
-			attempts:   1,
-			isFIN:      true,
-		})
-		conn.RetxMu.Unlock()
 	}
+	// A FIN from the peer held for missing data is moot: this side no
+	// longer reads.
+	d.stopFINHold(conn)
 	conn.CloseRecvBuf()
 	// P1-003: stop a pending delayed-ACK timer so it doesn't fire after
 	// the connection is gone and queue an ACK for a dead peer. ACKTimer
@@ -5136,6 +5304,62 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	conn.State = StateFinWait
 	conn.LastActivity = time.Now()
 	conn.Mu.Unlock()
+}
+
+// defaultFinLinger bounds how long a closing connection waits for its data
+// to be acknowledged before it sends its FIN anyway (Daemon.finLinger).
+const defaultFinLinger = 5 * time.Second
+
+// sendFIN puts the FIN on the wire and tracks it for retransmission.
+func (d *Daemon) sendFIN(conn *Connection, fin *protocol.Packet) {
+	d.tunnels.Send(fin.Dst.Node, fin)
+	// Track FIN in retransmission buffer so the retxLoop retries it.
+	// Use isFIN=true so retransmitUnacked can distinguish the FIN entry
+	// from regular data entries (which must be retransmitted as data even
+	// when the connection is in StateFinWait).
+	conn.RetxMu.Lock()
+	now := time.Now()
+	conn.Unacked = append(conn.Unacked, &retxEntry{
+		data:       []byte{0}, // 1-byte sentinel so retxEntry has non-zero length
+		seq:        fin.Seq,
+		sentAt:     now,
+		origSentAt: now,
+		attempts:   1,
+		isFIN:      true,
+	})
+	conn.RetxMu.Unlock()
+}
+
+// releaseHeldFIN sends this side's held FIN, if it still holds one: when
+// the ACK path sees the data before it acknowledged, when finLinger runs
+// out, when the reaper removes the connection, or at shutdown. Whichever
+// comes first sends it; the others find nothing held. A connection already
+// in TIME_WAIT or CLOSED sends nothing: the peer's FIN closed it, and the
+// FIN-ACK this side sent then stands for its own FIN.
+func (d *Daemon) releaseHeldFIN(conn *Connection) {
+	conn.Mu.Lock()
+	fin, timer := conn.heldFIN, conn.finLingerTimer
+	conn.heldFIN, conn.finLingerTimer = nil, nil
+	st := conn.State
+	conn.Mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+	if fin == nil || st == StateTimeWait || st == StateClosed {
+		return
+	}
+	d.sendFIN(conn, fin)
+}
+
+// releaseHeldFINIfAcked sends the held FIN once no data is unacknowledged.
+// Called from the ACK path.
+func (d *Daemon) releaseHeldFINIfAcked(conn *Connection) {
+	conn.Mu.Lock()
+	held := conn.heldFIN != nil
+	conn.Mu.Unlock()
+	if held && !d.unackedHasData(conn) {
+		d.releaseHeldFIN(conn)
+	}
 }
 
 // SendDatagram sends an unreliable unicast packet. Broadcast addresses
@@ -6303,6 +6527,9 @@ func (d *Daemon) idleSweepLoop() {
 			// Clean up stale non-established connections (CLOSED, FIN_WAIT, etc.)
 			stale := d.ports.StaleConnections(timeWaitDur)
 			for _, conn := range stale {
+				// With a time-wait shorter than finLinger, a closing
+				// connection can be reaped while it holds its FIN.
+				d.releaseHeldFIN(conn)
 				conn.CloseRecvBuf()
 				d.ports.RemoveConnection(conn.ID)
 			}

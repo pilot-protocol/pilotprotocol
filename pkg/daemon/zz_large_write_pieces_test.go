@@ -247,11 +247,17 @@ func TestCloseCommitsTheWholeTailDespiteSendErrors(t *testing.T) {
 	if got := trackedStream(t, conn); !bytes.Equal(got, tail) {
 		t.Fatalf("%d bytes of a %d-byte tail given sequence numbers before the FIN", len(got), len(tail))
 	}
-	conn.RetxMu.Lock()
-	defer conn.RetxMu.Unlock()
-	fin := conn.Unacked[len(conn.Unacked)-1]
-	if want := uint32(1000 + len(tail)); !fin.isFIN || fin.seq != want {
-		t.Fatalf("last tracked entry isFIN=%v seq=%d, want the FIN at %d", fin.isFIN, fin.seq, want)
+	// The FIN comes directly after the tail. It is held until the data is
+	// acknowledged (releaseHeldFIN), never sent here.
+	conn.Mu.Lock()
+	held, next := conn.heldFIN, conn.SendSeq
+	conn.Mu.Unlock()
+	want := uint32(1000 + len(tail))
+	if held == nil || held.Seq != want || held.Flags&protocol.FlagFIN == 0 {
+		t.Fatalf("held FIN after close = %+v, want a FIN at seq %d, directly after the tail", held, want)
+	}
+	if next != want+1 {
+		t.Fatalf("SendSeq after close = %d, want %d: the FIN's sequence number reserved", next, want+1)
 	}
 }
 
