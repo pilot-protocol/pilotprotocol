@@ -287,7 +287,7 @@ const (
 	DialMaxRetries       = 7                      // total attempts (direct + relay). 3 direct + 4 relay. With DialInitialRTO=250ms exponential-backoff capped at DialMaxRTO=8s, the relay phase is ~7.75s — covers cold-start handshake (key_exchange + flushPending + SYN/SYN-ACK round trip) for typical peers while keeping bad dials from blocking longer than the user's --timeout. The probe-and-adapt machinery (see srttHistory below) will let us shorten this for peers we've successfully dialed before.
 	DialInitialRTO       = 250 * time.Millisecond // initial SYN retransmission timeout. Lowered from 1s — modern relay RTT is <200ms; waiting a full second before assuming loss makes cold dials feel like a stall. Three direct retries with exponential backoff (250→500→1000) still cover up to 1.75s of jitter before flipping to relay; that's plenty for an unhealthy direct path while letting the common case (peer is reachable, single retry needed) feel snappy.
 	DialMaxRTO           = 8 * time.Second        // max backoff for SYN retransmission
-	DialCheckInterval    = 10 * time.Millisecond  // backstop poll for state changes during dial (conn.DialCh is the fast path)
+	DialCheckInterval    = 250 * time.Millisecond // backstop poll for state changes during dial; every transition that ends a dial (SYN-ACK, RST, shutdown) signals conn.DialCh
 	RetxCheckInterval    = 100 * time.Millisecond // retransmission check ticker
 	MaxRetxAttempts      = 8                      // abandon connection after this many retransmissions
 	HeartbeatReregThresh = 3                      // heartbeat failures before re-registration
@@ -1730,6 +1730,7 @@ func (d *Daemon) doStop() {
 		conn.Mu.Lock()
 		conn.State = StateClosed
 		conn.Mu.Unlock()
+		conn.signalDial()
 		conn.CloseRecvBuf()
 		d.ports.RemoveConnection(conn.ID)
 	}
@@ -3630,6 +3631,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			conn.Mu.Lock()
 			conn.State = StateClosed
 			conn.Mu.Unlock()
+			conn.signalDial() // a refused dial ends now, not at the next backstop tick
 			conn.CloseRecvBuf()
 			d.ports.RemoveConnection(conn.ID)
 			d.publishEvent("conn.rst", map[string]interface{}{

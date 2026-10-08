@@ -304,6 +304,20 @@ Detailed per-release notes are on the
   CLI 7.5 ms of CPU and 2.9 MB of allocations, more than the rest of a send.
   The second request happened on every send to an agent in the trusted list
   (`list-agents`, `pilot-mom`) and to any public peer not yet trusted.
+- **The daemon uses far less CPU under bursts of sends.** Measured on two
+  local daemons, the sending side's CPU per message fell from 4.5 ms to
+  1.6 ms at 32 concurrent sends and from 24 ms to 3.5 ms at 256. Two
+  changes:
+  - A dial no longer polls its connection every 10 ms. SYN-ACK, RST and
+    shutdown wake the dialer directly; the poll is a 250 ms backstop. With
+    hundreds of dials in flight the poll alone kept the Go scheduler busy.
+  - Concurrent `info` requests share one reply for 200 ms. Every
+    `pilotctl send-message` asks for `info`, and the reply lists every
+    connection, so a burst of N sends built N replies over a table that grew
+    with N: 73% of everything the daemon allocated during a 256-way burst.
+
+  Hosts with many cores can cut scheduler overhead further by setting
+  `GOMAXPROCS` (for example 4) in the daemon's environment.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps

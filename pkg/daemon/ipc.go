@@ -542,7 +542,21 @@ type IPCServer struct {
 	clients    map[*ipcConn]bool
 	closeOnce  sync.Once
 	done       chan struct{}
+
+	// infoMu guards the last info reply. Every `pilotctl send-message`
+	// asks for info, and the reply serialises every peer and connection
+	// row, so a burst of N concurrent sends cost N full builds over a
+	// table that itself grows with N. Requests that arrive while a reply
+	// younger than infoReplyTTL exists share it; requests that arrive
+	// during a build wait for it instead of starting their own.
+	infoMu   sync.Mutex
+	infoAt   time.Time
+	infoData []byte
 }
+
+// infoReplyTTL is how long one info reply is reused. A var so tests that
+// assert on a value changed a moment earlier can turn reuse off.
+var infoReplyTTL = 200 * time.Millisecond
 
 func NewIPCServer(socketPath string, d *Daemon) *IPCServer {
 	return &IPCServer{
@@ -1246,6 +1260,31 @@ type ipcInfoConn struct {
 }
 
 func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
+	s.infoMu.Lock()
+	if infoReplyTTL > 0 && s.infoData != nil && time.Since(s.infoAt) < infoReplyTTL {
+		data := s.infoData
+		s.infoMu.Unlock()
+		if err := conn.writeReply(CmdInfoOK, reqID, data); err != nil {
+			slog.Debug("IPC info reply failed", "err", err)
+		}
+		return
+	}
+	data, err := s.buildInfoReply()
+	if err == nil {
+		s.infoData, s.infoAt = data, time.Now()
+	}
+	s.infoMu.Unlock()
+	if err != nil {
+		s.sendError(conn, reqID, fmt.Sprintf("info marshal: %v", err))
+		return
+	}
+	if err := conn.writeReply(CmdInfoOK, reqID, data); err != nil {
+		slog.Debug("IPC info reply failed", "err", err)
+	}
+}
+
+// buildInfoReply assembles the JSON body of an info reply.
+func (s *IPCServer) buildInfoReply() ([]byte, error) {
 	info := s.daemon.Info()
 
 	// Peer and connection rows are typed structs, not maps: `info` is called
@@ -1348,13 +1387,7 @@ func (s *IPCServer) handleInfo(conn *ipcConn, reqID uint64) {
 			data, err = marshalRowsWithinBudget(body, "conn_list", conns, ipcReplyBudget)
 		}
 	}
-	if err != nil {
-		s.sendError(conn, reqID, fmt.Sprintf("info marshal: %v", err))
-		return
-	}
-	if err := conn.writeReply(CmdInfoOK, reqID, data); err != nil {
-		slog.Debug("IPC info reply failed", "err", err)
-	}
+	return data, err
 }
 
 func (s *IPCServer) handleHealth(conn *ipcConn, reqID uint64) {
