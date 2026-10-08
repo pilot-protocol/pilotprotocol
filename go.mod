@@ -9,7 +9,7 @@ require (
 	github.com/pilot-protocol/common v0.6.1
 	github.com/pilot-protocol/dataexchange v0.3.1
 	github.com/pilot-protocol/eventstream v0.3.0
-	github.com/pilot-protocol/handshake v0.3.2
+	github.com/pilot-protocol/handshake v0.3.3
 	github.com/pilot-protocol/policy v0.2.3
 	github.com/pilot-protocol/rendezvous v0.2.8
 	github.com/pilot-protocol/runtime v0.3.2

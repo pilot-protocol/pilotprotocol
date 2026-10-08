@@ -245,8 +245,8 @@ github.com/pilot-protocol/dataexchange v0.3.1 h1:3VC2V3xnW0rzCPpHuT/10bJnFfL4+N0
 github.com/pilot-protocol/dataexchange v0.3.1/go.mod h1:H1XLM9d6EnlJx4e7hKrP1XFl31zJC2tnN9G0qnWYKzs=
 github.com/pilot-protocol/eventstream v0.3.0 h1:HZmIrbi2tfYBfMBPIc0bG4JISAhmTS3v8c0Xj9LS/RU=
 github.com/pilot-protocol/eventstream v0.3.0/go.mod h1:dQaGmsAY4zHLXC5dhwLsJj8fY54Uu/HxAmgn3HWCtb4=
-github.com/pilot-protocol/handshake v0.3.2 h1:dSx25jXDBFiMSx2JZacR3qY0mWwfk2ER1XZHi60qDdY=
-github.com/pilot-protocol/handshake v0.3.2/go.mod h1:+hTlNxhsPSRxevHrl+UnyNyd/RP7/lTkM2JpUIRUr5U=
+github.com/pilot-protocol/handshake v0.3.3 h1:yRSIExR0ZYsN7FeDKOyG74MuvV/Snq19sYk+puI/EN4=
+github.com/pilot-protocol/handshake v0.3.3/go.mod h1:+hTlNxhsPSRxevHrl+UnyNyd/RP7/lTkM2JpUIRUr5U=
 github.com/pilot-protocol/policy v0.2.3 h1:sonEBL82oGjj1zyMQjJJ5cw+0KQdjS1sgHiLmIVWb8g=
 github.com/pilot-protocol/policy v0.2.3/go.mod h1:ALQdPalluwdzd3AbqbR+iNU5jJc/aG79n9ym0vhhF7w=
 github.com/pilot-protocol/rendezvous v0.2.8 h1:GRJyNplqNrfhPuCUgOAaY5Dg5En4G2aO+W2oCNKuIlo=
