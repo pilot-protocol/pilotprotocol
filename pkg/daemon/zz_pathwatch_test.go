@@ -252,7 +252,8 @@ func TestOnRekeyGaveUpResetsWithCooldown(t *testing.T) {
 	t.Cleanup(func() { gaveUpResetPeer = prev })
 
 	const peer = 77
-	d.onRekeyGaveUp(peer) // fires an async reset
+	d.tunnels.noteAppActivity(peer) // a peer someone is using
+	d.onRekeyGaveUp(peer)           // fires an async reset
 	// second giveup immediately: cooldown must suppress it
 	d.onRekeyGaveUp(peer)
 

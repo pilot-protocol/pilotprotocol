@@ -363,6 +363,17 @@ Detailed per-release notes are on the
   had piled up, every first send to a new peer failed with "too many
   pending key exchanges". A queue now goes after 2 minutes (the exchange
   itself gives up after 20 s), and with its peer when the reaper drops it.
+- **A rekey that gives up no longer resets a peer nobody is using.** The
+  reset starts a new key exchange; for a client that had gone away it gave
+  up again, and the next reset followed, for as long as the daemon ran.
+  With many such peers waiting, the cap of 64 key-exchange retransmits per
+  4 s stretched each round past the 30 s reset cooldown, so nothing broke
+  the cycle: on 2026-10-08 one service agent logged 25,147 of these resets
+  in 90 minutes, each a registry lookup and a new key exchange, and the
+  key-exchange frames counted as contact, so the reaper never dropped those
+  peers. The reset now runs only for a peer with an open connection or
+  application traffic in the last 2 minutes. A path reset also keeps the
+  record of when the peer was last used.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps

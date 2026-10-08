@@ -257,8 +257,18 @@ func (d *Daemon) resetPeerPath(nodeID uint32) peerPathReset {
 
 	d.forgetPeerResolution(nodeID)
 
+	// A reset re-keys the same peer; it does not forget who uses it.
+	// RemovePeer drops the activity record with the rest, so put it back.
+	var lastUse time.Time
+	var hadUse bool
+	if d.tunnels.activity != nil {
+		lastUse, hadUse = d.tunnels.activity.last(nodeID)
+	}
 	if res.HadTunnel {
 		d.tunnels.RemovePeer(nodeID)
+	}
+	if hadUse {
+		d.tunnels.activity.note(nodeID, lastUse)
 	}
 	if res.WasRelayActive {
 		d.tunnels.SetRelayPeer(nodeID, true)
@@ -300,6 +310,19 @@ const gaveUpResetCooldown = 30 * time.Second
 // the keyexchange retransmit loop goroutine.
 func (d *Daemon) onRekeyGaveUp(nodeID uint32) {
 	now := time.Now()
+	// Only for a peer someone is using. Resetting an unused one starts a
+	// new key exchange, and when it never answers (it went away) that ends
+	// in another give-up and another reset. Each round's key-exchange
+	// frames count as contact, so the stale-peer reaper never dropped such
+	// a peer, and with many of them waiting the per-tick retransmit cap
+	// stretched a round past gaveUpResetCooldown, so the cooldown did not
+	// stop it: service agents logged up to 25,000 of these resets an hour
+	// for clients long gone. Left alone, the peer goes quiet and the reaper
+	// drops it; whoever uses it next re-keys it, as first contact does.
+	if !d.tunnels.peerInUse(nodeID, now) {
+		slog.Debug("rekey gave up on an unused peer — leaving it to the reaper", "peer_node_id", nodeID)
+		return
+	}
 	d.gaveUpResetMu.Lock()
 	if last, ok := d.lastGaveUpReset[nodeID]; ok && now.Sub(last) < gaveUpResetCooldown {
 		d.gaveUpResetMu.Unlock()
