@@ -5244,7 +5244,12 @@ func cmdSendMessage(args []string) {
 		// "ok" here was reporting messages that never arrived. A send that
 		// failed outright was reported as "ok" with an error field; it is a
 		// failure too.
+		//
+		// The error carries the message's result, as a --count run's does:
+		// its message_id is how the caller finds the message later, in the
+		// receiver's inbox or in a reply that names it.
 		if e, failed := r["error"].(string); failed {
+			fatalResults = []map[string]interface{}{r}
 			fatalHint("connection_failed",
 				"the message was not sent; check `pilotctl peers` and the daemon log, then send again",
 				"sending to %s failed: %s", target, e)
@@ -5254,6 +5259,7 @@ func cmdSendMessage(args []string) {
 			if e, ok := r["ack_error"].(string); ok {
 				why = ": " + e
 			}
+			fatalResults = []map[string]interface{}{r}
 			fatalHint("connection_failed",
 				"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
 				"%s did not acknowledge the message (%d bytes)%s", target, len(data), why)
@@ -5262,7 +5268,9 @@ func cmdSendMessage(args []string) {
 		// message (disk full, inbox unwritable). That is a failed send, not
 		// a delivered one — same rule send-file applies.
 		if rej := refusal(r); rej != "" {
-			fatalCode("internal", "receiver rejected message: %s", rej)
+			fatalResults = []map[string]interface{}{r}
+			fatalHint("internal", "the receiver did not store the message; send it again once the receiver can store it",
+				"receiver rejected message: %s", rej)
 		}
 		result := map[string]interface{}{
 			"target": target.String(),

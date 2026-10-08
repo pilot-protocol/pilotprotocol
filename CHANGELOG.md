@@ -404,6 +404,13 @@ Detailed per-release notes are on the
   true only when the connection had carried an earlier message. A later
   message whose new connection cannot be dialled is reported as failed, and
   the run goes on.
+- **A failed `pilotctl send-message` says which message failed.** When a
+  single message could not be sent, was not acknowledged or was refused by
+  the receiver, the `--json` error did not include its `message_id`, so the
+  caller could not look for it in the receiver's inbox or for a reply naming
+  it. The error now carries the message's result in `results`, as a
+  `--count` run's error already did. A refused message's error also gets a
+  `hint`.
 - **A bulk transfer no longer hangs when the receiver's application falls
   behind.** When a receiver's application stops reading for a second, the
   receiver parks the next in-order segment in its reorder buffer and keeps

@@ -1232,6 +1232,71 @@ func TestSendMessageReuseConnReportsAFailedRedialAndGoesOn(t *testing.T) {
 	}
 }
 
+// A single message that fails says which message it was: the error envelope
+// carries its result, message_id included, as a --count run's does, so the
+// caller can look for it in the receiver's inbox or for a reply naming it.
+func TestSendMessageFailureReportsTheMessageID(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args   []string
+		answer func(calls int) string
+		check  func(r map[string]interface{}) bool
+	}{
+		"not acknowledged": {
+			args:   []string{"--no-resend"},
+			answer: func(int) string { return dxDropConnection },
+			check:  func(r map[string]interface{}) bool { return r["ack_error"] != nil },
+		},
+		"retry not acknowledged": {
+			answer: func(calls int) string {
+				if calls == 1 {
+					return dxDropConnection
+				}
+				return dxCutAck
+			},
+			check: func(r map[string]interface{}) bool { return r["retried"] == true && r["ack_error"] != nil },
+		},
+		"refused by the receiver": {
+			answer: func(int) string { return "ERR TEXT save failed: no space left on device" },
+			check: func(r map[string]interface{}) bool {
+				return r["ack"] == "ERR TEXT save failed: no space left on device"
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sd := newStreamDaemon(t)
+			sd.useDaemonNoRegistry(t)
+			// fatalResults is a package global; one left by another test
+			// would pass for this one's.
+			fatalResults = nil
+			t.Cleanup(func() { fatalResults = nil })
+			calls := 0
+			newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+				calls++
+				return tc.answer(calls)
+			})
+
+			var stderr string
+			var f *trappedFatal
+			withJSON(func() {
+				_, stderr, f = runTrapped(t, func() {
+					cmdSendMessage(append([]string{"0:0000.0000.002A", "--data", "hello"}, tc.args...))
+				})
+			})
+			if f == nil {
+				t.Fatal("send succeeded")
+			}
+			results := errorResults(t, stderr)
+			if len(results) != 1 {
+				t.Fatalf("error envelope results = %v, want the message's result\n%s", results, stderr)
+			}
+			r := results[0]
+			if id, _ := r["message_id"].(string); !dataexchange.ValidMessageID(id) || !tc.check(r) {
+				t.Errorf("result = %v", r)
+			}
+		})
+	}
+}
+
 // A message whose first ack was lost and whose retry was acknowledged was
 // delivered: a --count run with it succeeds.
 func TestUndeliveredCountsARetriedAndAcknowledgedMessageAsDelivered(t *testing.T) {
