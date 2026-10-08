@@ -336,6 +336,11 @@ type Connection struct {
 	RecvMu      sync.Mutex
 	ExpectedSeq uint32         // next in-order seq expected
 	OOOBuf      []*recvSegment // out-of-order buffer
+	// finPending is set when the peer's FIN arrived ahead of data it sent
+	// before it; finSeq is the FIN's sequence number. The FIN is handled
+	// once delivery reaches finSeq (see Daemon.acceptFIN). Guarded by RecvMu.
+	finPending bool
+	finSeq     uint32
 	// Delayed ACK
 	AckMu       sync.Mutex  // protects PendingACKs, ACKTimer and QuickACKs
 	PendingACKs int         // count of unacked received segments

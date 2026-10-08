@@ -251,6 +251,9 @@ func TestHandleStreamFINEstablishedClosesAndSendsFINACK(t *testing.T) {
 	conn.State = StateEstablished
 	conn.SendSeq = 42
 	conn.Mu.Unlock()
+	conn.RecvMu.Lock()
+	conn.ExpectedSeq = 9000 // everything before the FIN delivered
+	conn.RecvMu.Unlock()
 
 	fin := streamPacket(protocol.FlagFIN, peerNode, d.NodeID(), 443, 55555, 9000, 0)
 	d.handleStreamPacket(fin)

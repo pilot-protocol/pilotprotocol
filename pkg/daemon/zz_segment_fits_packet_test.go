@@ -280,10 +280,13 @@ func TestCloseSendsHeldTailBeforeFIN(t *testing.T) {
 	}
 	d.CloseConnection(conn)
 
-	pkts := readSegments(t, pc, 2)
+	pkts := readSegments(t, pc, 1)
 	if string(pkts[0].Payload) != "last words" {
 		t.Fatalf("first packet after close carries %q, want the held write", pkts[0].Payload)
 	}
+	// The FIN waits for the data to be acknowledged (sendFINAfterData).
+	conn.ProcessAck(pkts[0].Seq+uint32(len(pkts[0].Payload)), false)
+	pkts = append(pkts, readSegments(t, pc, 1)...)
 	if pkts[1].Flags&protocol.FlagFIN == 0 {
 		t.Fatalf("second packet after close has flags %#x, want FIN", pkts[1].Flags)
 	}

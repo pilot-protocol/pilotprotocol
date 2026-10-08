@@ -394,6 +394,18 @@ Detailed per-release notes are on the
   `appstore upgrade` does not wait.
 
 ### Fixed
+- **A write followed at once by a close no longer loses its end under
+  loss.** A FIN that overtook a lost segment was acted on at once: the
+  receiver closed the stream with the segment missing, and its FIN-ACK made
+  the sender drop the segment it was about to resend. Every version did
+  this. In the lab, 4 of 30 pub/sub events at 5% loss never reached the
+  broker while `pilotctl publish` reported success; one-shot sends and any
+  client that closes right after writing were exposed the same way. A
+  receiver now handles the FIN only once the data before it has arrived,
+  and asks for what is missing meanwhile. A closing sender also holds its
+  FIN until its data is acknowledged (5 s at most, without blocking the
+  caller), so the end of a write survives loss on receivers that have not
+  upgraded too.
 - **A send error no longer strands the end of a stream write.** When the
   tunnel refused a segment of a write's last piece (or of any write up to
   56 segments), the daemon returned the error and left the rest of the write

@@ -475,6 +475,10 @@ type Daemon struct {
 	// (see dialConnectionLocked): dialOKSeq counts completed dials, and a
 	// dial compares it with the count it saw when it started. A counter,
 	// not lastDialOKNano, so a wall-clock step cannot hide timeouts.
+	// finLinger bounds the wait for a closing connection's data to be
+	// acknowledged before its FIN goes out (sendFINAfterData).
+	finLinger time.Duration
+
 	lastDialOKNano          atomic.Int64
 	dialOKSeq               atomic.Uint64
 	consecutiveDialTimeouts atomic.Uint64
@@ -664,6 +668,7 @@ func New(cfg Config) *Daemon {
 		tunnels:         NewTunnelManager(),
 		ports:           NewPortManager(),
 		stopCh:          make(chan struct{}),
+		finLinger:       defaultFinLinger,
 		hsPoll:          newHandshakePollSched(),
 		synTokens:       cfg.synRateLimit(),
 		synLastFill:     time.Now(),
@@ -3594,55 +3599,34 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 	// FIN — remote close (or FIN-ACK acknowledging our FIN)
 	if pkt.HasFlag(protocol.FlagFIN) {
 		conn := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort)
-		if conn != nil {
-			conn.CloseRecvBuf()
-			conn.Mu.Lock()
-			wasFinWait := conn.State == StateFinWait
-			wasTimeWait := conn.State == StateTimeWait
-			conn.State = StateTimeWait
-			// Only refresh LastActivity on the FIRST FIN. A peer's FIN-ACK
-			// reply has FlagFIN set too; if we refresh on every FIN we keep
-			// idleSweepLoop from reaping this conn, which combined with the
-			// guarded send below would have created a packet-amplification
-			// loop (storm) at line rate.
-			if !wasTimeWait {
-				conn.LastActivity = time.Now()
-			}
-			conn.KeepaliveUnacked = 0
-			sendSeq := conn.SendSeq
-			conn.Mu.Unlock()
-			// If we were in FIN_WAIT, this is a FIN-ACK — clear retx buffer
-			if wasFinWait {
-				conn.RetxMu.Lock()
-				conn.Unacked = nil
-				conn.RetxMu.Unlock()
-			}
-			if !wasTimeWait {
-				d.publishEvent("conn.fin", map[string]interface{}{
-					"remote_addr": pkt.Src.String(), "remote_port": pkt.SrcPort,
-					"local_port": pkt.DstPort, "conn_id": conn.ID,
-				})
-			}
-			// Connection will be reaped by idleSweepLoop after TimeWaitDuration
-
-			// Send FIN-ACK once, only on the FIRST FIN. Subsequent FINs are
-			// our peer's FIN-ACK reply (or duplicates); echoing them back
-			// triggers a storm because FIN-ACK has FlagFIN set.
-			if !wasTimeWait {
-				finack := &protocol.Packet{
-					Version:  protocol.Version,
-					Flags:    protocol.FlagFIN | protocol.FlagACK,
-					Protocol: protocol.ProtoStream,
-					Src:      conn.LocalAddr,
-					Dst:      pkt.Src,
-					SrcPort:  pkt.DstPort,
-					DstPort:  pkt.SrcPort,
-					Seq:      sendSeq,
-					Ack:      pkt.Seq + 1,
-				}
-				d.tunnels.Send(pkt.Src.Node, finack)
-			}
+		if conn == nil {
+			return
 		}
+		// A FIN is the end of the peer's stream: it may only be acted on
+		// once everything sent before it has been delivered. Acting on a FIN
+		// that overtook a lost segment closed the stream with that data
+		// missing — and the FIN-ACK made the sender drop the segment it was
+		// about to resend — so a writer that closed right after its last
+		// write lost the end of it under loss (pub/sub events, one-shot
+		// sends). Hold the FIN until delivery reaches it, and ask for the
+		// missing data meanwhile.
+		// Only while this side still delivers data: once it has closed its
+		// own receive side (FIN_WAIT), the data would be discarded anyway.
+		conn.Mu.Lock()
+		receiving := conn.State == StateEstablished
+		conn.Mu.Unlock()
+		conn.RecvMu.Lock()
+		early := receiving && !conn.RecvClosed && seqAfter(pkt.Seq, conn.ExpectedSeq)
+		if early {
+			conn.finPending = true
+			conn.finSeq = pkt.Seq
+		}
+		conn.RecvMu.Unlock()
+		if early {
+			d.sendDelayedACK(conn)
+			return
+		}
+		d.acceptFIN(conn, pkt.Seq)
 		return
 	}
 
@@ -3734,6 +3718,20 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			conn.RecvAck = cumAck
 			conn.Mu.Unlock()
 
+			// A FIN that arrived ahead of this data is handled now that
+			// delivery has reached it.
+			conn.RecvMu.Lock()
+			finReady := conn.finPending && !seqAfter(conn.finSeq, cumAck)
+			finSeq := conn.finSeq
+			if finReady {
+				conn.finPending = false
+			}
+			conn.RecvMu.Unlock()
+			if finReady {
+				d.acceptFIN(conn, finSeq)
+				return
+			}
+
 			// Check if we have out-of-order data — ACK immediately with SACK
 			conn.RecvMu.Lock()
 			hasOOO := len(conn.OOOBuf) > 0
@@ -3771,6 +3769,61 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 				}
 			}
 		}
+	}
+}
+
+// acceptFIN handles the peer's FIN once every byte sent before it has been
+// delivered (see the FIN branch of handleStreamPacket): it closes the
+// receive side, moves to TIME_WAIT and answers with a FIN-ACK.
+func (d *Daemon) acceptFIN(conn *Connection, finSeq uint32) {
+	conn.CloseRecvBuf()
+	conn.Mu.Lock()
+	wasFinWait := conn.State == StateFinWait
+	wasTimeWait := conn.State == StateTimeWait
+	conn.State = StateTimeWait
+	// Only refresh LastActivity on the FIRST FIN. A peer's FIN-ACK
+	// reply has FlagFIN set too; if we refresh on every FIN we keep
+	// idleSweepLoop from reaping this conn, which combined with the
+	// guarded send below would have created a packet-amplification
+	// loop (storm) at line rate.
+	if !wasTimeWait {
+		conn.LastActivity = time.Now()
+	}
+	conn.KeepaliveUnacked = 0
+	sendSeq := conn.SendSeq
+	localAddr, localPort := conn.LocalAddr, conn.LocalPort
+	remoteAddr, remotePort := conn.RemoteAddr, conn.RemotePort
+	conn.Mu.Unlock()
+	// If we were in FIN_WAIT, this is a FIN-ACK — clear retx buffer
+	if wasFinWait {
+		conn.RetxMu.Lock()
+		conn.Unacked = nil
+		conn.RetxMu.Unlock()
+	}
+	if !wasTimeWait {
+		d.publishEvent("conn.fin", map[string]interface{}{
+			"remote_addr": remoteAddr.String(), "remote_port": remotePort,
+			"local_port": localPort, "conn_id": conn.ID,
+		})
+	}
+	// Connection will be reaped by idleSweepLoop after TimeWaitDuration
+
+	// Send FIN-ACK once, only on the FIRST FIN. Subsequent FINs are
+	// our peer's FIN-ACK reply (or duplicates); echoing them back
+	// triggers a storm because FIN-ACK has FlagFIN set.
+	if !wasTimeWait {
+		finack := &protocol.Packet{
+			Version:  protocol.Version,
+			Flags:    protocol.FlagFIN | protocol.FlagACK,
+			Protocol: protocol.ProtoStream,
+			Src:      localAddr,
+			Dst:      remoteAddr,
+			SrcPort:  localPort,
+			DstPort:  remotePort,
+			Seq:      sendSeq,
+			Ack:      finSeq + 1,
+		}
+		d.tunnels.Send(remoteAddr.Node, finack)
 	}
 }
 
@@ -5092,7 +5145,6 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 		})
 	}
 	if st == StateEstablished {
-		finData := []byte{0} // 1-byte sentinel so retxEntry has non-zero length
 		fin := &protocol.Packet{
 			Version:  protocol.Version,
 			Flags:    protocol.FlagFIN,
@@ -5103,22 +5155,16 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 			DstPort:  remotePort,
 			Seq:      sendSeq,
 		}
-		d.tunnels.Send(remoteAddr.Node, fin)
-		// Track FIN in retransmission buffer so the retxLoop retries it.
-		// Use isFIN=true so retransmitUnacked can distinguish the FIN entry
-		// from regular data entries (which must be retransmitted as data even
-		// when the connection is in StateFinWait).
-		conn.RetxMu.Lock()
-		now := time.Now()
-		conn.Unacked = append(conn.Unacked, &retxEntry{
-			data:       finData,
-			seq:        sendSeq,
-			sentAt:     now,
-			origSentAt: now,
-			attempts:   1,
-			isFIN:      true,
-		})
-		conn.RetxMu.Unlock()
+		// A receiver up to v1.17.0 acts on a FIN that overtook a lost
+		// segment, closing the stream without it. Send the FIN once the
+		// data is acknowledged (finLinger at most), so the end of a write
+		// that is followed at once by a close survives loss on such
+		// receivers too. The caller does not wait.
+		if d.unackedHasData(conn) {
+			go d.sendFINAfterData(conn, fin)
+		} else {
+			d.sendFIN(conn, fin)
+		}
 	}
 	conn.CloseRecvBuf()
 	// P1-003: stop a pending delayed-ACK timer so it doesn't fire after
@@ -5136,6 +5182,56 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	conn.State = StateFinWait
 	conn.LastActivity = time.Now()
 	conn.Mu.Unlock()
+}
+
+// defaultFinLinger bounds how long a closing connection waits for its data
+// to be acknowledged before it sends its FIN anyway (Daemon.finLinger).
+const defaultFinLinger = 5 * time.Second
+
+// sendFIN puts the FIN on the wire and tracks it for retransmission.
+func (d *Daemon) sendFIN(conn *Connection, fin *protocol.Packet) {
+	d.tunnels.Send(fin.Dst.Node, fin)
+	// Track FIN in retransmission buffer so the retxLoop retries it.
+	// Use isFIN=true so retransmitUnacked can distinguish the FIN entry
+	// from regular data entries (which must be retransmitted as data even
+	// when the connection is in StateFinWait).
+	conn.RetxMu.Lock()
+	now := time.Now()
+	conn.Unacked = append(conn.Unacked, &retxEntry{
+		data:       []byte{0}, // 1-byte sentinel so retxEntry has non-zero length
+		seq:        fin.Seq,
+		sentAt:     now,
+		origSentAt: now,
+		attempts:   1,
+		isFIN:      true,
+	})
+	conn.RetxMu.Unlock()
+}
+
+// sendFINAfterData sends the FIN once every data segment is acknowledged,
+// or after finLinger. It gives up if the connection goes away, the daemon
+// stops, or the peer's own FIN closed the connection meanwhile (its
+// FIN-ACK then stands for ours).
+func (d *Daemon) sendFINAfterData(conn *Connection, fin *protocol.Packet) {
+	deadline := time.Now().Add(d.finLinger)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for d.unackedHasData(conn) && time.Now().Before(deadline) {
+		select {
+		case <-conn.RetxStop:
+			return
+		case <-d.stopCh:
+			return
+		case <-tick.C:
+		}
+	}
+	conn.Mu.Lock()
+	st := conn.State
+	conn.Mu.Unlock()
+	if st != StateFinWait {
+		return
+	}
+	d.sendFIN(conn, fin)
 }
 
 // SendDatagram sends an unreliable unicast packet. Broadcast addresses
