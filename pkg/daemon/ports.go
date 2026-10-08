@@ -287,6 +287,10 @@ type Connection struct {
 	RemotePort   uint16
 	State        ConnState
 	LastActivity time.Time // updated on send/recv
+	// heldFIN is this side's FIN while it waits for the data before it to
+	// be acknowledged (Daemon.sendFINAfterData). Whoever takes it sends it:
+	// that goroutine, or shutdown. Guarded by Mu.
+	heldFIN *protocol.Packet
 	// Reliable delivery
 	SendSeq uint32
 	RecvAck uint32

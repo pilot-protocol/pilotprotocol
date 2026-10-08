@@ -152,6 +152,40 @@ func TestCloseSendsTheFINAfterTheLingerIfNothingIsAcknowledged(t *testing.T) {
 	}
 }
 
+// A FIN still waiting for its data when the daemon stops goes out at
+// shutdown, as it did when it was sent at close: otherwise the peer is left
+// with an open connection until keepalive gives up on it.
+func TestStopSendsAFINThatWasWaitingForData(t *testing.T) {
+	t.Parallel()
+	d, pc, conn := newSendDataFixture(t, 0xD9D90004)
+	conn.NoDelay = true
+	if err := d.SendData(conn, []byte("unacknowledged")); err != nil {
+		t.Fatalf("SendData: %v", err)
+	}
+	readOneSegment(t, pc, 2*time.Second) // the data
+	d.CloseConnection(conn)
+	conn.Mu.Lock()
+	held := conn.heldFIN != nil
+	conn.Mu.Unlock()
+	if !held {
+		t.Fatal("the FIN went out with the data unacknowledged; nothing to test")
+	}
+	stopped := make(chan struct{})
+	go func() { d.Stop(); close(stopped) }()
+	fin := readOneSegment(t, pc, 2*time.Second)
+	if fin.Flags&protocol.FlagFIN == 0 {
+		t.Fatalf("next packet flags %#x, want the FIN", fin.Flags)
+	}
+	if fin.Seq != 1000+uint32(len("unacknowledged")) {
+		t.Fatalf("FIN seq %d, want %d", fin.Seq, 1000+len("unacknowledged"))
+	}
+	<-stopped
+	pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, err := pc.ReadFromUDP(make([]byte, 65535)); err == nil {
+		t.Fatalf("a second packet (%d bytes) after the FIN: it must go out once", n)
+	}
+}
+
 // End to end over two daemons: a writer that closes right after its last
 // write, with one segment's first transmission lost, still gets every byte
 // to the reader before EOF. finLinger 0 sends the FIN at once, as senders up

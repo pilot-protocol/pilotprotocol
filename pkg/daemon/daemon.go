@@ -1731,7 +1731,13 @@ func (d *Daemon) doStop() {
 		conn.Mu.Lock()
 		st := conn.State
 		seq := conn.SendSeq
+		held := conn.heldFIN
+		conn.heldFIN = nil
 		conn.Mu.Unlock()
+		if held != nil && st == StateFinWait {
+			// Closed with data still unacknowledged: its FIN was waiting.
+			d.tunnels.Send(conn.RemoteAddr.Node, held)
+		}
 		if st == StateEstablished {
 			// Send FIN
 			fin := &protocol.Packet{
@@ -5160,8 +5166,11 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 		// data is acknowledged (finLinger at most), so the end of a write
 		// that is followed at once by a close survives loss on such
 		// receivers too. The caller does not wait.
-		if d.unackedHasData(conn) {
-			go d.sendFINAfterData(conn, fin)
+		if d.unackedHasData(conn) && !d.stopping() {
+			conn.Mu.Lock()
+			conn.heldFIN = fin
+			conn.Mu.Unlock()
+			go d.sendFINAfterData(conn)
 		} else {
 			d.sendFIN(conn, fin)
 		}
@@ -5208,11 +5217,11 @@ func (d *Daemon) sendFIN(conn *Connection, fin *protocol.Packet) {
 	conn.RetxMu.Unlock()
 }
 
-// sendFINAfterData sends the FIN once every data segment is acknowledged,
-// or after finLinger. It gives up if the connection goes away, the daemon
-// stops, or the peer's own FIN closed the connection meanwhile (its
-// FIN-ACK then stands for ours).
-func (d *Daemon) sendFINAfterData(conn *Connection, fin *protocol.Packet) {
+// sendFINAfterData sends the held FIN once every data segment is
+// acknowledged, or after finLinger. It gives up if the connection goes
+// away or the peer's own FIN closed it meanwhile (its FIN-ACK then stands
+// for ours). When the daemon stops, shutdown sends the FIN instead.
+func (d *Daemon) sendFINAfterData(conn *Connection) {
 	deadline := time.Now().Add(d.finLinger)
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
@@ -5226,9 +5235,11 @@ func (d *Daemon) sendFINAfterData(conn *Connection, fin *protocol.Packet) {
 		}
 	}
 	conn.Mu.Lock()
+	fin := conn.heldFIN
+	conn.heldFIN = nil
 	st := conn.State
 	conn.Mu.Unlock()
-	if st != StateFinWait {
+	if fin == nil || st != StateFinWait {
 		return
 	}
 	d.sendFIN(conn, fin)
