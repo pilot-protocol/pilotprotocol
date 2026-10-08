@@ -318,6 +318,25 @@ Detailed per-release notes are on the
 
   Hosts with many cores can cut scheduler overhead further by setting
   `GOMAXPROCS` (for example 4) in the daemon's environment.
+- **`pilotctl dgram` exits with a code that says whether to retry.** Every
+  datagram the daemon refused was `connection_failed`, which the error-code
+  list calls retryable, though a port the network's policy forbids or a
+  datagram too large to send fails the same way every time. The `code` in
+  the error (and in `--json`) now follows the reason, so scripts that
+  matched `connection_failed` for these see a different code:
+  - a port the network's policy does not allow: `permission_denied` (now in
+    the `pilotctl context` error-code list);
+  - a payload too large for a packet, the tunnel socket or the IPC frame,
+    or a broadcast address: `invalid_argument`;
+  - a node the registry does not know: `not_found`;
+  - a datagram that waited too long for its turn and was not sent:
+    `timeout`, as one whose answer did not come in time already was;
+  - anything else (no route or tunnel yet, a key exchange in progress, the
+    registry unreachable, ephemeral ports exhausted): `connection_failed`,
+    as before.
+
+  A `--data` over 65535 bytes is now refused before the daemon is
+  contacted.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps

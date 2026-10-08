@@ -1401,6 +1401,11 @@ have no ACK, no retry and no ordering guarantee. The local daemon does say
 whether it sent the datagram: if it could not (no route to the node, port
 policy, payload too large) the command fails with its reason. "confirmed":
 false means the daemon is too old to say, and the datagram was sent anyway.
+A datagram carries at most 65535 bytes.
+
+The error code says whether sending again can help: permission_denied (the
+network's port policy), invalid_argument (too large), not_found (no such
+node), timeout, or connection_failed (no route or tunnel yet; may retry).
 
 Use for: real-time telemetry, heartbeats, anything where freshness > reliability.
 `,
@@ -2687,6 +2692,7 @@ func contextCatalog() map[string]interface{} {
 		"error_codes": map[string]interface{}{
 			"invalid_argument":  "Bad input or usage error (do not retry)",
 			"not_found":         "Resource not found (hostname/name resolve failure)",
+			"permission_denied": "Refused by policy or verification (do not retry unchanged)",
 			"already_exists":    "Duplicate operation (daemon/gateway already running)",
 			"not_running":       "Service not available (daemon/gateway not running)",
 			"connection_failed": "Network or dial failure (may retry)",
@@ -4481,15 +4487,6 @@ func cmdDgram(args []string) {
 	if len(pos) < 2 {
 		fatalCode("invalid_argument", "usage: pilotctl dgram <address|hostname> <port> --data <msg>")
 	}
-
-	d := connectDriver()
-	defer d.Close()
-
-	target, err := parseAddrOrHostname(d, pos[0])
-	if err != nil {
-		fatalCode("not_found", "%v", err)
-	}
-	maybeAutoHandshake(d, target, flagBool(flags, "no-auto-handshake"))
 	p, err := strconv.ParseUint(pos[1], 10, 16)
 	if err != nil {
 		fatalCode("invalid_argument", "invalid port %q: %v", pos[1], err)
@@ -4500,17 +4497,34 @@ func cmdDgram(args []string) {
 	if data == "" {
 		fatalCode("invalid_argument", "--data is required")
 	}
+	// A packet's payload length is 16 bits: the daemon refuses anything
+	// larger, so say so before contacting it.
+	if len(data) > maxDatagramBytes {
+		fatalCode("invalid_argument", "datagram is %d bytes; one datagram can carry at most %d (use send-message for larger payloads)", len(data), maxDatagramBytes)
+	}
+
+	d := connectDriver()
+	defer d.Close()
+
+	target, err := parseAddrOrHostname(d, pos[0])
+	if err != nil {
+		fatalCode("not_found", "%v", err)
+	}
+	maybeAutoHandshake(d, target, flagBool(flags, "no-auto-handshake"))
 
 	// The daemon says whether it sent the datagram. The fire-and-forget
 	// send reported success even when the daemon could not send it (no
 	// route to the node, port policy, ephemeral ports exhausted).
 	confirmed, err := d.SendToConfirmed(target, port, []byte(data))
 	if err != nil {
-		if errors.Is(err, driver.ErrConfirmTimeout) {
+		switch {
+		case errors.Is(err, driver.ErrConfirmTimeout):
 			fatalHint("timeout", "the datagram may or may not have been sent; datagrams are unreliable, so send it again if it matters", "%v", err)
+		case errors.Is(err, driver.ErrConfirmQueueTimeout):
+			fatalHint("timeout", "the datagram was not sent; send it again", "%v", err)
 		}
 		// The driver's error already names the step ("daemon: sendto: ...").
-		fatalCode("connection_failed", "%v", err)
+		fatalCode(dgramErrorCode(err), "%v", err)
 	}
 
 	if jsonOutput {
@@ -4527,6 +4541,41 @@ func cmdDgram(args []string) {
 	} else {
 		fmt.Printf("sent %d byte(s) to %s port %d (the daemon is too old to confirm it was sent)\n", len(data), target, port)
 	}
+}
+
+// maxDatagramBytes is the most one datagram can carry: a packet's payload
+// length field is 16 bits.
+const maxDatagramBytes = 0xFFFF
+
+// dgramErrorCode is the exit code for a datagram the daemon could not send,
+// or that never reached it. The daemon's reasons arrive as "daemon: sendto:
+// <reason>". They used to be connection_failed, which the error-code list
+// calls retryable, whatever the reason: a port the network's policy forbids
+// or a datagram too large to send fails the same way every time.
+func dgramErrorCode(err error) string {
+	if errors.Is(err, driver.ErrConfirmTimeout) || errors.Is(err, driver.ErrConfirmQueueTimeout) {
+		return "timeout"
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "not allowed by network"):
+		// "port %d not allowed by network %d policy"
+		return "permission_denied"
+	case strings.Contains(s, "payload too large"),
+		strings.Contains(s, "message too long"),
+		strings.Contains(s, "ipc frame too large"),
+		strings.Contains(s, "broadcast address requires admin token"):
+		// Too large for a packet, for the tunnel socket or for the IPC
+		// frame, or a broadcast address (refused by the driver or the
+		// daemon).
+		return "invalid_argument"
+	case strings.Contains(s, "resolve node") && strings.Contains(s, "not found"):
+		// The registry does not know the node.
+		return "not_found"
+	}
+	// No route yet, no tunnel, a key exchange in progress, the registry
+	// unreachable, ports exhausted: sending again may work.
+	return "connection_failed"
 }
 
 // cmdSendFile transfers a file via the dataexchange overlay stream.
