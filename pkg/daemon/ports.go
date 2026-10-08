@@ -1127,10 +1127,10 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 		endSeq := e.seq + uint32(len(e.data))
 		if seqAfterOrEqual(ack, endSeq) {
 			// This segment is fully acked — update RTT from the first one only.
-			// SACK state is not excluded: a once-sent segment is a valid RTT
-			// sample per RFC 6298 regardless of whether it was previously
-			// reported via SACK (the cumulative ACK time is a conservative
-			// upper bound that the EWMA smooths out).
+			// SACK state is not excluded: when nothing before it was resent,
+			// a once-sent segment is a valid RTT sample per RFC 6298 even if
+			// it was already reported via SACK. An ACK that also covers a
+			// resent segment took no sample above.
 			if e.attempts == 1 && !rttUpdated {
 				// Use origSentAt (original send time, never overwritten by
 				// RFC 6298 §5.3 timer restarts) so that the RTT sample
