@@ -341,6 +341,56 @@ Detailed per-release notes are on the
 
   A `--data` over 65535 bytes is now refused before the daemon is
   contacted.
+- **Peers nobody is using no longer cost anything.** The daemon kept every
+  peer it had ever exchanged keys with warm forever: a NAT keepalive every
+  25 s, path-watchdog probes and resets when the peer went quiet, and for
+  each relayed peer a direct-upgrade attempt (registry lookup, beacon punch,
+  five probes) every 15 s. A public service agent that had answered a few
+  thousand clients sent about 1,600 packets a second on this while serving
+  a few requests a minute. A peer with no application traffic for 2 minutes
+  and no open connection now gets none of it. Sending to it works as
+  before, re-establishing the path through the usual fallbacks if a NAT
+  mapping expired meanwhile. Five minutes after the last frame either way,
+  the stale-peer reaper now drops the peer, as it was meant to: the
+  keepalives counted as contact, so it never fired, and busy nodes held
+  every peer they had ever seen (service agents: 3,500 to 10,900). The next
+  contact runs a fresh key exchange. The reaper also counts relayed inbound
+  frames as contact now, so a peer still sending to us is kept.
+- **A reaped peer leaves nothing behind, and frames for a peer that never
+  answers no longer wait forever.** Frames queued for a key exchange were
+  dropped only when the exchange completed; for a peer that never answered
+  they stayed until the daemon exited, reaper or not. Once 256 such peers
+  had piled up, every first send to a new peer failed with "too many
+  pending key exchanges". A queue now goes after 2 minutes (the exchange
+  itself gives up after 20 s), and with its peer when the reaper drops it.
+- **A rekey that gives up no longer resets a peer nobody is using.** The
+  reset starts a new key exchange; for a client that had gone away it gave
+  up again, and the next reset followed, for as long as the daemon ran.
+  With many such peers waiting, the cap of 64 key-exchange retransmits per
+  4 s stretched each round past the 30 s reset cooldown, so nothing broke
+  the cycle: on 2026-10-08 one service agent logged 25,147 of these resets
+  in 90 minutes, each a registry lookup and a new key exchange, and the
+  key-exchange frames counted as contact, so the reaper never dropped those
+  peers. The reset now runs only for a peer with an open connection or
+  application traffic in the last 2 minutes. A path reset also keeps the
+  record of when the peer was last used.
+- **State left behind for a node with no tunnel is reaped too.** A path
+  reset that could not re-resolve its peer left the peer's relay flag (and
+  whatever else it had) with no tunnel entry, which the stale-peer reaper,
+  walking tunnel peers, never visited: the flag kept the node in the 15 s
+  direct-upgrade loop and counted against the 4,096 relay peers a daemon
+  admits, for as long as the daemon ran. Such state now goes 5 minutes
+  after the last frame with the node, and the upgrade loop skips nodes with
+  no tunnel.
+- **A slow registry no longer piles up goroutines.** Every 15 s the daemon
+  tries to move each relayed peer to a direct path, and an attempt that
+  must resolve the peer waits for the registry. It gave up waiting after
+  8 s but left the call running, and the next round started another, so
+  while the registry was slow the waiting calls grew by one per relayed
+  peer every 15 s. A local soak test reached 21,000 goroutines, and since
+  Go keeps a goroutine's descriptor for the life of the process, the heap
+  stayed ~30 MB higher afterwards. A peer now has at most one attempt
+  running.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps

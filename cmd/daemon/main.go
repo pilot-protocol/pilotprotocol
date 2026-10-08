@@ -116,6 +116,7 @@ func main() {
 	compatBeacon := flag.String("compat-beacon", defaultCompatBeacon, "beacon WSS URL for -transport=compat")
 	tlsTrust := flag.String("tls-trust", "system", "TLS trust store for -transport=compat: 'system' (OS trust store; current default while compat mode uses Let's Encrypt certs on beacon.pilotprotocol.network — on a host without a CA bundle set SSL_CERT_FILE or SSL_CERT_DIR) or 'pinned' (Pilot CA root embedded in the daemon binary; will become the default in a future release once production root ships)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	pprofAddr := flag.String("pprof", "", "serve Go runtime profiles (heap, goroutine, CPU, trace) over HTTP at this loopback address, e.g. 127.0.0.1:6060; empty (the default) disables. Loopback only: any local user can connect, so leave it off on shared hosts")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
 	logMaxSize := flag.Int("log-max-size", 50, "rotate the daemon log once it exceeds this many MB (copy-truncate into gzipped <log>.pilot.N.gz backups). By default only a log Pilot set up is rotated: one inside ~/.pilot (install.sh's launchd daemon.log, pilotctl's pilot-<pid>.log) or the Homebrew service's <brew prefix>/var/log/pilot-daemon.log; a log elsewhere only when this is set explicitly, here or in config.json. 0 disables")
@@ -178,6 +179,13 @@ func main() {
 	}
 
 	logging.Setup(*logLevel, *logFormat)
+	if *pprofAddr != "" {
+		bound, err := startPprof(*pprofAddr)
+		if err != nil {
+			log.Fatalf("pprof: %v", err)
+		}
+		slog.Info("pprof listening", "addr", bound.String(), "path", "/debug/pprof/")
+	}
 	// launchd never rotates StandardOutPath/StandardErrorPath (daemon.log
 	// reached 22 MB on one laptop), so cap it from the inside. No-op when
 	// stderr isn't a regular file (journald, a terminal, a pipe), and by

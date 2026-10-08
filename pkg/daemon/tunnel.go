@@ -85,6 +85,10 @@ type TunnelManager struct {
 	sock transport.Transport
 	// peers maps node_id → real UDP endpoint. Owned by L4 (routing).
 	peers map[uint32]*net.UDPAddr
+	// activity and openConnPeers decide which peers are idle; see
+	// peeractivity.go.
+	activity      *peerActivity
+	openConnPeers func() map[uint32]bool
 	// envelope is the L5-owned per-peer crypto Store (named "envelope"
 	// for historical reasons — pre-T5.x-followup the Store lived in
 	// pkg/daemon/envelope). Accessed by:
@@ -132,6 +136,9 @@ type TunnelManager struct {
 	// Pending sends waiting for key exchange to complete
 	pendMu  sync.Mutex
 	pending map[uint32][][]byte // node_id → queued frames
+	// pendingSince is when each queue in pending got its first frame;
+	// reapStalePending drops queues older than pendingMaxAge.
+	pendingSince map[uint32]time.Time
 	// lastPendDropLog records when we last logged a "tunnel pending queue
 	// full; dropped newest" warning for a peer. The drop counter
 	// (PendingDrops) still increments on every drop so metrics are exact;
@@ -406,6 +413,7 @@ func NewTunnelManager() *TunnelManager {
 		peers:           make(map[uint32]*net.UDPAddr),
 		envelope:        store,
 		pending:         make(map[uint32][][]byte),
+		pendingSince:    make(map[uint32]time.Time),
 		lastPendDropLog: make(map[uint32]time.Time),
 		lastRekeyReq:    make(map[uint32]time.Time),
 		recvCh:          make(chan *IncomingPacket, RecvChSize),
@@ -413,6 +421,7 @@ func NewTunnelManager() *TunnelManager {
 		routing:         routing.New(),
 		kxRateLim:       make(map[string]*srcKxBucket),
 		relayKxLim:      make(map[uint32]*srcKxBucket),
+		activity:        newPeerActivity(),
 	}
 	tm.routing.SetLocalNodeIDFn(tm.loadNodeID)
 	tm.kx = keyexchange.New(store)
@@ -515,6 +524,79 @@ const rekeyRequestInterval = 3 * time.Second
 // counter (PendingDrops) increments on every drop regardless, so
 // metric accuracy is unaffected.
 const pendingDropLogInterval = 5 * time.Second
+
+// pendingMaxAge bounds how long frames wait in the pending queue for a key
+// exchange. A key exchange is retransmitted for 20 s (MaxRekeyAttempts ×
+// RekeyRetransmitInterval) and then given up, so a queue still waiting
+// after this long belongs to a peer that never answered: its frames would
+// only ever be sent stale (a SYN for a dial abandoned minutes ago), and
+// the queue holds one of the maxPendingPeers slots that every first
+// contact with a new peer needs.
+const pendingMaxAge = 2 * time.Minute
+
+// reapStalePending drops pending queues older than pendingMaxAge. Before
+// it, a queue was removed only when its peer's key exchange completed
+// (flushPending): queues for peers that never answered stayed for the
+// daemon's lifetime, and once maxPendingPeers of them had piled up, every
+// send to a peer without a session failed with "too many pending key
+// exchanges". Called from the idleSweepLoop tick.
+func (tm *TunnelManager) reapStalePending(now time.Time) int {
+	dropped := 0
+	tm.pendMu.Lock()
+	for nodeID, since := range tm.pendingSince {
+		if now.Sub(since) > pendingMaxAge {
+			delete(tm.pending, nodeID)
+			delete(tm.pendingSince, nodeID)
+			dropped++
+		}
+	}
+	// A queue with no start time cannot age out; give it one.
+	for nodeID := range tm.pending {
+		if _, ok := tm.pendingSince[nodeID]; !ok {
+			tm.pendingSince[nodeID] = now
+		}
+	}
+	tm.pendMu.Unlock()
+	return dropped
+}
+
+// dropPending discards a peer's pending queue and its log throttle, for a
+// peer the daemon is forgetting (see Daemon.forgetPeer). RemovePeer keeps
+// the queue on purpose: a path reset removes the peer and re-keys at once,
+// and the queued frames go out when the new key is in.
+func (tm *TunnelManager) dropPending(nodeID uint32) {
+	tm.pendMu.Lock()
+	delete(tm.pending, nodeID)
+	delete(tm.pendingSince, nodeID)
+	delete(tm.lastPendDropLog, nodeID)
+	tm.pendMu.Unlock()
+}
+
+// peerStateEntries counts the entries in every per-peer table the tunnel
+// and its routing and key-exchange managers keep, by table. Tests use it to
+// check that per-peer state goes when the peer does.
+func (tm *TunnelManager) peerStateEntries() map[string]int {
+	out := map[string]int{}
+	tm.mu.RLock()
+	out["peers"] = len(tm.peers)
+	tm.mu.RUnlock()
+	out["crypto"] = tm.envelope.Len()
+	tm.pendMu.Lock()
+	out["pending"] = len(tm.pending) + len(tm.pendingSince)
+	out["pending_drop_log"] = len(tm.lastPendDropLog)
+	tm.pendMu.Unlock()
+	keyViaRelay := 0
+	tm.keyViaRelay.Range(func(_, _ any) bool { keyViaRelay++; return true })
+	out["key_via_relay"] = keyViaRelay
+	if tm.activity != nil {
+		tm.activity.mu.RLock()
+		out["activity"] = len(tm.activity.m)
+		tm.activity.mu.RUnlock()
+	}
+	out["routing"] = tm.routing.PeerStateEntries()
+	out["keyexchange"] = tm.kx.PeerStateEntries()
+	return out
+}
 
 // reapPendDropLog evicts lastPendDropLog entries older than
 // pendingDropLogInterval. Without periodic reaping, every peer that
@@ -988,11 +1070,15 @@ func (tm *TunnelManager) keepaliveSweep(now time.Time) int {
 		addr *net.UDPAddr
 		pc   *peerCrypto
 	}
+	idle := tm.idleFilter(now)
 	tm.mu.RLock()
 	stale := make([]peerInfo, 0, len(tm.peers))
 	for nodeID, addr := range tm.peers {
 		last, ok := tm.routing.LastOutboundSend(nodeID)
 		if ok && now.Sub(last) < TunnelKeepaliveInterval {
+			continue
+		}
+		if idle(nodeID) {
 			continue
 		}
 		pc := tm.envelope.Get(nodeID)
@@ -1585,6 +1671,12 @@ func (tm *TunnelManager) onKeyInstalled(ev keyexchange.PostInstallEvent) {
 	// and the per-peer 1s reply cooldown holds the ping-pong back but
 	// never lets the staleness flag clear.
 	tm.recordInboundDecrypt(peerNodeID)
+	if !ev.HadCrypto {
+		// A new session counts as activity, so it starts out maintained
+		// and ages into idleness like any other. A rekey of an existing
+		// session does not: it is upkeep, not use.
+		tm.noteAppActivity(peerNodeID)
+	}
 	if !ev.HadCrypto || ev.KeyChanged {
 		tm.keyViaRelay.Store(peerNodeID, fromRelay)
 	}
@@ -1866,6 +1958,9 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 	if isTunnelKeepalive(pkt) {
 		return
 	}
+	if !(pkt.Protocol == protocol.ProtoControl && pkt.DstPort == protocol.PortPing) {
+		tm.noteAppActivity(peerNodeID)
+	}
 
 	select {
 	case tm.recvCh <- &IncomingPacket{Packet: pkt, From: from}:
@@ -2014,6 +2109,7 @@ func (tm *TunnelManager) flushPending(nodeID uint32) {
 	tm.pendMu.Lock()
 	frames := tm.pending[nodeID]
 	delete(tm.pending, nodeID)
+	delete(tm.pendingSince, nodeID)
 	tm.pendMu.Unlock()
 
 	if len(frames) == 0 {
@@ -2192,6 +2288,16 @@ func (tm *TunnelManager) SetRelayPeerPinned(nodeID uint32, relay bool) {
 
 // SendTo sends a packet to a specific UDP address (relay-aware).
 func (tm *TunnelManager) SendTo(addr *net.UDPAddr, nodeID uint32, pkt *protocol.Packet) error {
+	// Path upkeep (keepalives, probes, key exchange) bypasses SendTo, so
+	// everything that arrives here is traffic someone asked for — except
+	// the pong to a peer's path probe, which is upkeep on that peer's
+	// behalf. Counting it kept every idle peer with a path watchdog
+	// (v1.13.10 and later) maintained: it probes after 55 s of quiet, the
+	// pong made it active again for PeerIdleAfter, and so on. Same rule as
+	// for packets received (handleEncrypted).
+	if !(pkt.Protocol == protocol.ProtoControl && pkt.DstPort == protocol.PortPing) {
+		tm.noteAppActivity(nodeID)
+	}
 	data, err := pkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -2245,6 +2351,9 @@ func (tm *TunnelManager) SendTo(addr *net.UDPAddr, nodeID uint32, pkt *protocol.
 			dropped = true
 			atomic.AddUint64(&tm.PendingDrops, 1)
 		} else {
+			if len(q) == 0 {
+				tm.pendingSince[nodeID] = time.Now()
+			}
 			tm.pending[nodeID] = append(q, data)
 		}
 		qlen := len(tm.pending[nodeID])
@@ -2329,6 +2438,9 @@ func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 	// L5-owned per-peer state (peerPubKeys, pendingRekey, lastInboundDecrypt).
 	tm.kx.RemovePeer(nodeID)
 	tm.keyViaRelay.Delete(nodeID)
+	if tm.activity != nil {
+		tm.activity.forget(nodeID)
+	}
 }
 
 // KeyArrivedViaRelayOnly reports whether the peer's session key was

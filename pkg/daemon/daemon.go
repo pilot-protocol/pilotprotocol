@@ -579,6 +579,15 @@ type Daemon struct {
 	netPolicyMu sync.RWMutex
 	netPolicies map[uint16][]uint16
 
+	// upgradeInFlight holds the peers with a direct-upgrade attempt
+	// running (nodeID → struct{}); see relayProbeTick.
+	upgradeInFlight sync.Map
+
+	// orphanSeen records when reapOrphanedPeerState first found per-peer
+	// state, with no contact ever recorded, for a node with no tunnel
+	// entry. Only the idle sweep (reapStalePeers) touches it.
+	orphanSeen map[uint32]time.Time
+
 	// gaveUpResetMu guards lastGaveUpReset, the per-peer cooldown for
 	// rekey-gave-up-triggered path resets (onRekeyGaveUp).
 	gaveUpResetMu   sync.Mutex
@@ -701,6 +710,7 @@ func New(cfg Config) *Daemon {
 	// peer trusted only through the registry now gets the redacted event,
 	// which is the conservative side.
 	d.tunnels.SetPeerTrustFn(d.handshakeTrusts)
+	d.tunnels.SetOpenConnPeers(d.ports.ActiveNodeIDs)
 	d.ipc = NewIPCServer(cfg.SocketPath, d)
 	// HandshakeService is wired post-construction by the composition
 	// root via RegisterHandshakeService (T3.3 — handshake plugin moved
@@ -6450,14 +6460,30 @@ func (d *Daemon) restoreRegistryState(nodeID uint32, trust bool) bool {
 	return complete
 }
 
+// peerReapIdleTimeout is how long a peer with no open connection may go
+// without contact before reapStalePeers forgets it.
+const peerReapIdleTimeout = 5 * time.Minute
+
+// lastPeerContact is the latest frame either way with a peer: our last
+// send, its last direct packet, or any authenticated inbound frame (relayed
+// ones too, which LastDirectRecv skips). Zero when none was ever recorded.
+func (d *Daemon) lastPeerContact(nodeID uint32) time.Time {
+	latest := d.tunnels.LastDirectRecv(nodeID)
+	if lastOutbound, ok := d.tunnels.LastOutboundSend(nodeID); ok && lastOutbound.After(latest) {
+		latest = lastOutbound
+	}
+	if lastIn, ok := d.tunnels.LastInboundDecrypt(nodeID); ok && lastIn.After(latest) {
+		latest = lastIn
+	}
+	return latest
+}
+
 // reapStalePeers removes tunnel peers that have no active connections
 // and haven't been contacted for peerReapIdleTimeout. Called periodically
 // from idleSweepLoop to prevent unbounded growth of per-peer maps
 // (tm.peers, routing relay/blackhole/send-err maps, keyexchange
 // pubkey/rekey state) in long-running daemons with peer churn.
 func (d *Daemon) reapStalePeers() {
-	const peerReapIdleTimeout = 5 * time.Minute
-
 	active := d.ports.ActiveNodeIDs()
 	now := time.Now()
 	peers := d.tunnels.PeerList()
@@ -6467,14 +6493,10 @@ func (d *Daemon) reapStalePeers() {
 			continue // has active connection — keep
 		}
 
-		lastDirect := d.tunnels.LastDirectRecv(p.NodeID)
-		lastOutbound, ok := d.tunnels.LastOutboundSend(p.NodeID)
-
-		// Find the latest known contact.
-		latest := lastDirect
-		if ok && lastOutbound.After(latest) {
-			latest = lastOutbound
-		}
+		// Any authenticated inbound frame counts as contact, relayed ones
+		// too: a peer still talking to us is not stale, and dropping it
+		// would only make its next frame trigger a rekey.
+		latest := d.lastPeerContact(p.NodeID)
 
 		if latest.IsZero() {
 			// Never contacted — fresh peer entry, don't reap yet.
@@ -6485,9 +6507,70 @@ func (d *Daemon) reapStalePeers() {
 			slog.Debug("reaping stale peer", "node_id", p.NodeID,
 				"last_contact", latest.Round(time.Second),
 				"has_encryption", p.Encrypted)
-			d.tunnels.RemovePeer(p.NodeID)
+			d.forgetPeer(p.NodeID)
 		}
 	}
+	d.reapOrphanedPeerState(now, active)
+}
+
+// reapOrphanedPeerState forgets routing, key-exchange and session state
+// held for a node that has no tunnel entry, so the loop above never sees
+// it. A path reset leaves such state when the peer cannot be re-resolved:
+// it removes the peer, puts its relay flag back for the recovery PILA, and
+// re-adds the peer only if the registry answers. The orphaned relay flag
+// then kept the node in the 15 s direct-upgrade loop and counted against
+// MaxRelayPeers for the daemon's lifetime (a local soak: 875 relay flags
+// for 381 peers after 23 minutes). State with no contact recorded at all
+// is given peerReapIdleTimeout from when this sweep first finds it.
+func (d *Daemon) reapOrphanedPeerState(now time.Time, active map[uint32]bool) {
+	ids := map[uint32]struct{}{}
+	for _, id := range d.tunnels.routing.PeerIDs() {
+		ids[id] = struct{}{}
+	}
+	for _, id := range d.tunnels.kx.PeerIDs() {
+		ids[id] = struct{}{}
+	}
+	for _, id := range d.tunnels.envelope.PeerIDs() {
+		ids[id] = struct{}{}
+	}
+	if d.orphanSeen == nil {
+		d.orphanSeen = make(map[uint32]time.Time)
+	}
+	for id := range d.orphanSeen {
+		if _, ok := ids[id]; !ok {
+			delete(d.orphanSeen, id)
+		}
+	}
+	for id := range ids {
+		if active[id] || d.tunnels.HasPeer(id) {
+			delete(d.orphanSeen, id)
+			continue
+		}
+		latest := d.lastPeerContact(id)
+		if latest.IsZero() {
+			first, seen := d.orphanSeen[id]
+			if !seen {
+				d.orphanSeen[id] = now
+				continue
+			}
+			latest = first
+		}
+		if now.Sub(latest) > peerReapIdleTimeout {
+			slog.Debug("reaping orphaned peer state", "node_id", id, "last_contact", latest.Round(time.Second))
+			d.forgetPeer(id)
+			delete(d.orphanSeen, id)
+		}
+	}
+}
+
+// forgetPeer drops everything the daemon keeps for a peer it no longer
+// talks to: the tunnel entry and its routing and key state (RemovePeer),
+// and the frames still queued for a key exchange the peer never answered,
+// which RemovePeer keeps for a path reset's re-key. The next contact
+// starts from scratch, as first contact does.
+func (d *Daemon) forgetPeer(nodeID uint32) {
+	d.tunnels.RemovePeer(nodeID)
+	d.tunnels.dropPending(nodeID)
 }
 
 // hostnameReannounceLoop periodically re-sets the daemon's hostname
@@ -6555,6 +6638,10 @@ func (d *Daemon) idleSweepLoop() {
 			// lastPendDropLog doesn't accumulate one slot per
 			// unique-peer-ever-throttled.
 			d.tunnels.reapPendDropLog()
+
+			// Drop frames that have waited too long for a key exchange
+			// that is not coming, freeing their pending-peer slot.
+			d.tunnels.reapStalePending(time.Now())
 
 			// Evict expired entries from the three peer-resolution caches.
 			// epCache: stale-but-usable after EndpointCacheTTL; evict after 1 hour.
@@ -6651,10 +6738,43 @@ func (d *Daemon) relayProbeLoop() {
 		case <-d.stopCh:
 			return
 		case <-ticker.C:
-			for _, nodeID := range d.tunnels.RelayPeerIDs() {
-				go d.tryDirectUpgrade(nodeID)
-			}
+			d.relayProbeTick(time.Now())
 		}
+	}
+}
+
+// directUpgradePeer runs one direct-upgrade attempt; tests swap it.
+var directUpgradePeer = func(d *Daemon, nodeID uint32) { d.tryDirectUpgrade(nodeID) }
+
+// relayProbeTick starts a direct-upgrade attempt for each relayed peer in
+// use, unless one for that peer is still running. An attempt that has to
+// resolve the peer waits for the registry, and with the registry slow
+// (or a pooled connection half-open) a new attempt every
+// RelayProbeInterval stacked up behind the old ones: goroutines grew with
+// how long the registry stayed slow, not with the number of peers, and Go
+// keeps a goroutine's descriptor for the life of the process, so the heap
+// stayed up after the backlog drained. With the guard, at most one attempt
+// per peer waits.
+func (d *Daemon) relayProbeTick(now time.Time) {
+	idle := d.tunnels.idleFilter(now)
+	for _, nodeID := range d.tunnels.RelayPeerIDs() {
+		if idle(nodeID) {
+			// An upgrade costs a registry lookup, a beacon punch
+			// and five probes; nobody is using this path.
+			continue
+		}
+		if !d.tunnels.HasPeer(nodeID) {
+			// A relay flag with no tunnel behind it (see
+			// reapOrphanedPeerState): no session to upgrade.
+			continue
+		}
+		if _, running := d.upgradeInFlight.LoadOrStore(nodeID, struct{}{}); running {
+			continue
+		}
+		go func(nodeID uint32) {
+			defer d.upgradeInFlight.Delete(nodeID)
+			directUpgradePeer(d, nodeID)
+		}(nodeID)
 	}
 }
 
@@ -6684,9 +6804,11 @@ func (d *Daemon) tryDirectUpgrade(nodeID uint32) {
 		if rc == nil {
 			return
 		}
-		r, err := withRegistryDeadline(registryCallDeadline, func() (map[string]interface{}, error) {
-			return rc.Resolve(nodeID, d.NodeID())
-		})
+		// Waited for in full, not cut off at registryCallDeadline: this
+		// runs in its own goroutine, and relayProbeTick starts no other
+		// attempt for the peer until this one returns. Cutting it off left
+		// the call running anyway, and the next tick added another.
+		r, err := rc.Resolve(nodeID, d.NodeID())
 		if err != nil {
 			return
 		}
