@@ -1103,16 +1103,11 @@ func (d *Daemon) Start() error {
 			return fmt.Errorf("tunnel listen: %w", err)
 		}
 		actualAddr = d.tunnels.LocalAddr().String()
+		// The tunnel binds every interface by default, as a node must to
+		// receive from its peers: that is not a warning. It was one, on
+		// every start of every default install, with a hint (-listen
+		// 127.0.0.1:0) that would cut the node off from the network.
 		slog.Info("tunnel listening", "addr", actualAddr)
-
-		// Warn when the tunnel bound to a wildcard address — reachable
-		// from any network interface that can route to this host.
-		// Pass -listen 127.0.0.1:0 to restrict to localhost only.
-		if host, _, hostErr := net.SplitHostPort(actualAddr); hostErr == nil && (host == "0.0.0.0" || host == "::") {
-			slog.Warn("tunnel bound to wildcard address",
-				"addr", actualAddr,
-				"hint", "pass -listen 127.0.0.1:0 to restrict to localhost; see -endpoint for fixed public IP")
-		}
 
 		// Collect LAN addresses using the actual tunnel port (not config port which may be 0)
 		_, actualPort, _ := net.SplitHostPort(actualAddr)
