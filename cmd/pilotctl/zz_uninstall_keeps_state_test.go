@@ -112,4 +112,52 @@ func TestUninstallNeverDeletesTheKeyWhenBackupsFail(t *testing.T) {
 	if len(found) == 0 {
 		t.Fatal("the key is gone after an uninstall whose backup failed")
 	}
+	// Left beside the install, it is named as backup listings and the
+	// wallet's key restore look for it.
+	parked, _ := filepath.Glob(filepath.Join(root, appID+".previous-*", "identity-evm.json"))
+	if len(parked) != 1 {
+		t.Fatalf("the key is at %v, want it in %s.previous-<stamp>", found, appID)
+	}
+}
+
+// When the dir cannot even be renamed in place, uninstall fails and says
+// nothing was deleted; it used to report success with the dir still there.
+func TestUninstallFailsWhenTheDirCannotBeMoved(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root renames in read-only dirs")
+	}
+	home := t.TempDir()
+	root := filepath.Join(home, ".pilot", "apps")
+	t.Setenv("PILOT_APPSTORE_ROOT", root)
+	t.Setenv("PILOT_APPSTORE_BACKUP_ROOT", "")
+	appID := "io.pilot.wallet"
+	appDir := filepath.Join(root, appID)
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "manifest.json"), minimalManifestJSON(appID, nil), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "identity-evm.json"), []byte("the key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The install lock lives in the root; it exists already on a real node.
+	if err := os.WriteFile(filepath.Join(root, "."+appID+".lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o555); err != nil { // no rename out of, or within, the install root
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	prev := jsonOutput
+	defer func() { jsonOutput = prev }()
+	jsonOutput = true
+	_, stderr, f := runTrapped(t, func() { cmdAppStoreUninstall([]string{appID, "--yes"}) })
+	if f == nil || f.Code != "io_error" || !strings.Contains(stderr+f.Message, "nothing was deleted") {
+		t.Fatalf("uninstall = %+v (stderr %q); want it to fail, saying nothing was deleted", f, stderr)
+	}
+	if b, err := os.ReadFile(filepath.Join(appDir, "identity-evm.json")); err != nil || string(b) != "the key" {
+		t.Fatalf("key after the failed uninstall = %q, %v", b, err)
+	}
 }

@@ -965,7 +965,7 @@ func retireAppDir(previousDir, appID string, meta appBackupMeta) (string, error)
 		return dst, nil
 	}
 
-	parked := previousDir + "-" + stamp
+	parked := parkedDirName(previousDir, appID, stamp)
 	if err := os.Rename(previousDir, parked); err != nil {
 		parked = previousDir
 	}
@@ -979,6 +979,14 @@ func retireAppDir(previousDir, appID string, meta appBackupMeta) (string, error)
 	}
 	return parked, fmt.Errorf("could not move the replaced install of %s to any backup location (%s); it is kept at %s with its manifest disabled",
 		appID, strings.Join(failures, "; "), parked)
+}
+
+// parkedDirName is where a dir that could not be moved to any backup location
+// is left: beside it, as <appID>.previous-<stamp>, the name backup listings and
+// the wallet's key restore look for — whether it was <appID>.previous (an
+// upgrade) or <appID> itself (an uninstall).
+func parkedDirName(dir, appID, stamp string) string {
+	return filepath.Join(filepath.Dir(dir), appID+".previous-"+stamp)
 }
 
 // moveIntoBackupLocation moves previousDir to <loc>/<appID>/<name>. Across
@@ -1015,7 +1023,7 @@ func moveIntoBackupLocation(previousDir, loc, appID, name, oldBinary string) (st
 	// removal that fails halfway can never leave an adoptable dir behind.
 	_ = disableManifest(previousDir)
 	if err := removeAllForce(previousDir); err != nil {
-		rest := previousDir + "-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+		rest := parkedDirName(previousDir, appID, time.Now().UTC().Format("20060102T150405.000000000Z"))
 		if rerr := os.Rename(previousDir, rest); rerr != nil {
 			rest = previousDir
 		}
