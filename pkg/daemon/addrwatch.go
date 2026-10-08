@@ -72,10 +72,12 @@ import (
 // addrObservedCooldownMax for a beacon-observed one, and drops back after a
 // quiet period. A flapping interface costs a handful of re-registrations and
 // then one every two minutes; a NAT whose public IP keeps flapping costs one
-// an hour. A change seen during the cooldown is not lost: it runs when the
-// cooldown ends, unless the address has gone back to the one already
-// announced. The gaps are measured on the wall clock (addrWatchNow), so time
-// the host spends asleep counts.
+// an hour. The registry-only retries (addrRegistryRetryMax) have a backoff of
+// their own, on the local-address schedule and started over by every move,
+// so they never hold the next move back. A change seen during the cooldown
+// is not lost: it runs when the cooldown ends, unless the address has gone
+// back to the one already announced. The gaps are measured on the wall clock
+// (addrWatchNow), so time the host spends asleep counts.
 //
 // -no-addr-watch (Config.DisableAddrWatch) turns the watcher off.
 const (
@@ -150,8 +152,9 @@ type addrWatchState struct {
 	registryRetries int // registry-only retries still owed
 
 	lastRecover time.Time   // the latest recovery of any kind
-	localGap    addrBackoff // local-address and registry-retry recoveries
+	localGap    addrBackoff // local-address recoveries
 	observedGap addrBackoff // observed-endpoint recoveries
+	registryGap addrBackoff // registry-only retries, started over by every move
 }
 
 // addrBackoff is one input's run of recoveries.
@@ -243,6 +246,7 @@ func (st *addrWatchState) pending() string {
 
 // addrGapParams is the backoff schedule of the input behind reason: the
 // first gap, its cap, and how long without a recovery before it drops back.
+// Registry retries follow the local-address schedule.
 func addrGapParams(reason string) (base, max, quiet time.Duration) {
 	if reason == addrReasonObserved {
 		return addrObservedCooldown, addrObservedCooldownMax, addrObservedQuiet
@@ -252,8 +256,11 @@ func addrGapParams(reason string) (base, max, quiet time.Duration) {
 
 // gapFor returns the backoff of the input behind reason.
 func (st *addrWatchState) gapFor(reason string) *addrBackoff {
-	if reason == addrReasonObserved {
+	switch reason {
+	case addrReasonObserved:
 		return &st.observedGap
+	case addrReasonRegistry:
+		return &st.registryGap
 	}
 	return &st.localGap
 }
@@ -327,6 +334,10 @@ func (st *addrWatchState) began(now time.Time, reason string) (previous, current
 		st.registryRetries--
 	} else {
 		st.registryRetries = 0
+		// The retries this move may leave owed are spaced from it, on their
+		// own backoff. Counted in the move's, each one would hold the next
+		// move back as if the address had changed again.
+		st.registryGap = addrBackoff{last: now, streak: 1}
 	}
 	return previous, current
 }

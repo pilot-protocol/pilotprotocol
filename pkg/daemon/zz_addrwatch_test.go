@@ -619,6 +619,51 @@ func TestAddrWatchRegistryRetryIsBounded(t *testing.T) {
 	}
 }
 
+// Registry retries do not count as moves. When they shared the local-address
+// backoff, the three retries after a move (at +10 s, +30 s and +70 s) left its
+// streak at 4, and the next real move waited 80 s after the last retry
+// instead of the 10 s every recovery keeps from the one before.
+func TestAddrWatchRegistryRetriesDoNotHoldBackTheNextMove(t *testing.T) {
+	ok := false // the registry is unreachable throughout
+	calls := swapAddrRecoverForTest(t, &ok)
+	d := newAddrWatchTestDaemon()
+	src := &fakeAddrSource{ip: "10.0.0.4", ok: true}
+	st := &addrWatchState{}
+	now := time.Now()
+	d.addrWatchTick(st, src.fn, now)
+
+	src.ip = "10.0.0.77"
+	var fired []int
+	for i := 1; i <= 160; i++ {
+		if i == 72 {
+			src.ip = "10.0.0.78" // the next move, just after the last retry
+		}
+		if d.addrWatchTick(st, src.fn, now.Add(time.Duration(i)*time.Second)) {
+			fired = append(fired, i)
+		}
+	}
+	// The move, its three retries, then the next move 10 s after the last
+	// retry. Its own retries follow from 91 s on.
+	want := []int{1, 11, 31, 71, 81}
+	if len(fired) < len(want) {
+		t.Fatalf("fired at %v, want it to start %v", fired, want)
+	}
+	for i, w := range want {
+		if fired[i] != w {
+			t.Fatalf("fired at %v, want it to start %v", fired, want)
+		}
+	}
+	reasons := []string{addrReasonLocal, addrReasonRegistry, addrReasonRegistry, addrReasonRegistry, addrReasonLocal}
+	for i, r := range reasons {
+		if (*calls)[i].reason != r {
+			t.Fatalf("recovery %d = %+v, want reason %s", i, (*calls)[i], r)
+		}
+	}
+	if got := (*calls)[4]; got.previous != "10.0.0.77" || got.current != "10.0.0.78" || !got.announce {
+		t.Fatalf("second move = %+v, want an announced move from .77 to .78", got)
+	}
+}
+
 // The production source: the kernel's choice of source address for a target.
 // Toward loopback that is loopback, every time; an unrelated interface
 // appearing, a link-local address or a rotating IPv6 temporary address cannot
