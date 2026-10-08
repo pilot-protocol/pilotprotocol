@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -958,6 +959,10 @@ Examples:
 	"bench": `Usage: pilotctl bench <address|hostname> [size_mb] [flags]
 
 Measure throughput to a remote node via the echo port.
+
+The run fails unless everything sent is echoed back: with code timeout when
+--timeout ends the wait for the echo, connection_failed when the echo stream
+ends early. The error's "results" carry the partial figures.
 
 Flags:
   --timeout <dur>       overall deadline (default: 120s)
@@ -6970,17 +6975,19 @@ func cmdBench(args []string) {
 	}
 	defer conn.Close()
 
-	var recvTotal int
+	// The reader may still be running when the wait below gives up, so the
+	// count it keeps is atomic.
+	var recvTotal atomic.Int64
 	recvDone := make(chan struct{})
 	go func() {
 		defer close(recvDone)
 		buf := make([]byte, 65535)
-		for recvTotal < totalSize {
+		for recvTotal.Load() < int64(totalSize) {
 			n, err := conn.Read(buf)
 			if err != nil {
 				return
 			}
-			recvTotal += n
+			recvTotal.Add(int64(n))
 		}
 	}()
 
@@ -7007,34 +7014,53 @@ func cmdBench(args []string) {
 	// Waiting for the full echo to come back is the silent half of the
 	// benchmark — on a slow path it can run to --timeout with no output.
 	stopProgress := startWaitProgress(fmt.Sprintf("benchmarking %s", target))
+	timedOut := false
 	select {
 	case <-recvDone:
-		stopProgress()
 	case <-time.After(timeout):
-		stopProgress()
-		if !jsonOutput {
-			fmt.Printf("warning: receive timed out (got %s of %s)\n",
-				formatBytes(uint64(recvTotal)), formatBytes(uint64(totalSize)))
-		}
+		timedOut = true
 	}
+	stopProgress()
 	totalDuration := time.Since(start)
+	received := int(recvTotal.Load())
 
 	sendThroughput := float64(totalSize) / sendDuration.Seconds() / 1024 / 1024
-	totalThroughput := float64(totalSize) / totalDuration.Seconds() / 1024 / 1024
+	// The round trip carried what came back, which is less than was sent
+	// when the echo stopped short.
+	totalThroughput := float64(received) / totalDuration.Seconds() / 1024 / 1024
+	complete := received >= totalSize
 
-	if jsonOutput {
-		output(map[string]interface{}{
-			"target":            target.String(),
-			"sent_bytes":        sent,
-			"recv_bytes":        recvTotal,
-			"send_duration_ms":  float64(sendDuration.Milliseconds()),
-			"total_duration_ms": float64(totalDuration.Milliseconds()),
-			"send_mbps":         sendThroughput,
-			"total_mbps":        totalThroughput,
-		})
-	} else {
+	stats := map[string]interface{}{
+		"target":            target.String(),
+		"sent_bytes":        sent,
+		"recv_bytes":        received,
+		"send_duration_ms":  float64(sendDuration.Milliseconds()),
+		"total_duration_ms": float64(totalDuration.Milliseconds()),
+		"send_mbps":         sendThroughput,
+		"total_mbps":        totalThroughput,
+		"complete":          complete,
+	}
+	if !jsonOutput {
 		fmt.Printf("  Sent:     %s in %v (%.1f MB/s)\n", formatBytes(uint64(sent)), sendDuration.Round(time.Millisecond), sendThroughput)
-		fmt.Printf("  Echoed:   %s in %v (%.1f MB/s round-trip)\n", formatBytes(uint64(recvTotal)), totalDuration.Round(time.Millisecond), totalThroughput)
+		fmt.Printf("  Echoed:   %s in %v (%.1f MB/s round-trip)\n", formatBytes(uint64(received)), totalDuration.Round(time.Millisecond), totalThroughput)
+	}
+	// A partial echo is a failed benchmark, not a slow one: it used to be
+	// reported as "ok". The error carries the figures, as a failed
+	// send-message --count carries each message's result.
+	if !complete {
+		fatalResults = []map[string]interface{}{stats}
+		got := fmt.Sprintf("%s of %s", formatBytes(uint64(received)), formatBytes(uint64(totalSize)))
+		if timedOut {
+			fatalHint("timeout",
+				fmt.Sprintf("the path is slow or losing data: check `pilotctl ping %s`, or try a smaller size or a longer --timeout", target),
+				"%s echoed %s within --timeout %s", target, got, timeout)
+		}
+		fatalHint("connection_failed",
+			fmt.Sprintf("the echo stream ended early; check `pilotctl ping %s` and the daemon log", target),
+			"the echo stream from %s ended after %s", target, got)
+	}
+	if jsonOutput {
+		output(stats)
 	}
 }
 

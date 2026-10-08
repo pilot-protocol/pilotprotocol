@@ -430,6 +430,16 @@ Detailed per-release notes are on the
   it. The error now carries the message's result in `results`, as a
   `--count` run's error already did. A refused message's error also gets a
   `hint`.
+- **`pilotctl bench` fails when the echo does not all come back.** A run
+  whose echo stopped short printed `"status":"ok"` and exited 0: with the
+  echo cut off after 2 KiB, `bench <peer> 0.01 --timeout 300ms` reported
+  4096 of 10485 bytes received as a success. Such a run now **exits 1**,
+  with code `timeout` when `--timeout` ended the wait for the echo, or
+  `connection_failed` when the echo stream ended early, and the error's
+  `results` carry the partial figures. A complete run adds
+  `"complete": true` to its result. `total_mbps` is now computed from the
+  bytes that came back rather than the bytes sent, and the received count is
+  no longer read while the reader may still be writing it (a data race).
 - **A bulk transfer no longer hangs when the receiver's application falls
   behind.** When a receiver's application stops reading for a second, the
   receiver parks the next in-order segment in its reorder buffer and keeps

@@ -889,6 +889,88 @@ func TestCmdBenchSmall(t *testing.T) {
 	if data["sent_bytes"].(float64) < 1 {
 		t.Errorf("sent_bytes = %v", data["sent_bytes"])
 	}
+	if data["complete"] != true || data["recv_bytes"] != data["sent_bytes"] {
+		t.Errorf("result = %v, want complete with everything echoed", data)
+	}
+}
+
+// echoUpTo makes the daemon echo only the first n bytes written to each
+// connection. With end, it then ends the stream, as a peer that closes it
+// does; without, the stream stays open and silent.
+func echoUpTo(sd *streamDaemon, n int, end bool) {
+	var mu sync.Mutex
+	echoed := map[uint32]int{}
+	sd.on(tdCmdSend, func(frame []byte) [][]byte {
+		if len(frame) < 5 {
+			return nil
+		}
+		connID, payload := frame[1:5], frame[5:]
+		mu.Lock()
+		defer mu.Unlock()
+		id := binary.BigEndian.Uint32(connID)
+		left := n - echoed[id]
+		if left <= 0 {
+			return nil
+		}
+		if len(payload) > left {
+			payload = payload[:left]
+		}
+		echoed[id] += len(payload)
+		out := [][]byte{append(append([]byte{tdCmdRecv}, connID...), payload...)}
+		if end && echoed[id] == n {
+			out = append(out, append([]byte{tdCmdCloseOK}, connID...))
+		}
+		return out
+	})
+}
+
+// The echo stops short of what was sent. bench used to print "status":"ok"
+// with 4096 of 10485 bytes received and a round-trip rate computed from the
+// full size. It now fails, with the partial figures in the error: timeout
+// when --timeout cut it, connection_failed when the echo stream ended.
+func TestCmdBenchFailsOnAPartialEcho(t *testing.T) {
+	for name, tc := range map[string]struct {
+		end  bool
+		code string
+	}{
+		"cut by --timeout":   {false, "timeout"},
+		"echo stream closed": {true, "connection_failed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sd := newStreamDaemon(t)
+			sd.useDaemonNoRegistry(t)
+			echoUpTo(sd, 4096, tc.end)
+			fatalResults = nil
+			t.Cleanup(func() { fatalResults = nil })
+
+			var stderr string
+			var f *trappedFatal
+			withJSON(func() {
+				_, stderr, f = runTrapped(t, func() { cmdBench([]string{"0:0000.0000.002A", "0.01", "--timeout", "300ms"}) })
+			})
+			if f == nil || f.Code != tc.code || !strings.Contains(f.Message, "4.0 KB of 10.2 KB") {
+				t.Fatalf("bench = %+v, want %s naming what came back", f, tc.code)
+			}
+			results := errorResults(t, stderr)
+			if len(results) != 1 {
+				t.Fatalf("error results = %v, want the partial figures", results)
+			}
+			r := results[0]
+			if r["complete"] != false || r["sent_bytes"] != 10485.0 || r["recv_bytes"] != 4096.0 {
+				t.Fatalf("result = %v", r)
+			}
+			// The round-trip rate is what came back over the time it took
+			// (measurable here only when the wait ran to --timeout).
+			ms, _ := r["total_duration_ms"].(float64)
+			mbps, _ := r["total_mbps"].(float64)
+			if want := 4096.0 / (ms / 1000) / 1024 / 1024; ms >= 100 && (mbps < want*0.95 || mbps > want*1.05) {
+				t.Errorf("total_mbps = %v, want about %v (4096 bytes in %v ms)", mbps, want, ms)
+			}
+			if tc.code == "timeout" && ms < 300 {
+				t.Errorf("total_duration_ms = %v, want at least the 300ms --timeout", ms)
+			}
+		})
+	}
 }
 
 func TestCmdBenchText(t *testing.T) {
