@@ -266,12 +266,38 @@ type reestablishOpts struct {
 	// instead of the full reRegister with its visibility, hostname and
 	// trust re-sync.
 	endpointOnly bool
-	// always runs even right after another run. Without it the call is
-	// skipped when a run the registry accepted finished less than
+	// always runs even right after another run. Without it the registry
+	// half is skipped when a re-registration the registry accepted (a
+	// recovery's, or the heartbeat's) finished less than
 	// reestablishCoalesce ago and did at least the same work: a full
 	// re-registration for a full caller. The address watcher sets it: a run
 	// that started before our address changed registered the old one.
 	always bool
+}
+
+// reestablishedRecently reports whether a re-registration the registry
+// accepted finished less than reestablishCoalesce ago and covers what the
+// caller needs (for full, a full re-registration), and how long ago it
+// finished. The caller holds reestablishMu.
+//
+// Wall clock, not the monotonic one: on Linux the monotonic clock stops
+// while the host is suspended, so a run from just before a suspend would
+// look recent to the resume handler.
+func (d *Daemon) reestablishedRecently(full bool) (time.Duration, bool) {
+	if d.reestablishOKWall == 0 || (full && !d.reestablishOKFull) {
+		return 0, false
+	}
+	age := time.Duration(time.Now().UnixNano() - d.reestablishOKWall)
+	return age, age >= 0 && age < reestablishCoalesce
+}
+
+// noteReestablished records a re-registration the registry accepted: full
+// when the registry also took back all of this node's state (visibility,
+// hostname, every trust pair), so that a full one after it would repeat it.
+// The caller holds reestablishMu.
+func (d *Daemon) noteReestablished(full bool) {
+	d.reestablishOKWall = time.Now().UnixNano()
+	d.reestablishOKFull = full
 }
 
 // reestablishTransport re-registers this node with the beacon and the
@@ -288,18 +314,17 @@ func (d *Daemon) reestablishTransport(cause string, o reestablishOpts) bool {
 	d.reestablishMu.Lock()
 	defer d.reestablishMu.Unlock()
 
-	// Wall clock, not the monotonic one: on Linux the monotonic clock stops
-	// while the host is suspended, so a run from just before a suspend would
-	// look recent to the resume handler.
-	covered := o.endpointOnly || d.reestablishOKFull
-	if age := time.Now().UnixNano() - d.reestablishOKWall; !o.always && covered && d.reestablishOKWall != 0 &&
-		age >= 0 && age < int64(reestablishCoalesce) {
-		slog.Info("transport re-established moments ago — not repeating it", "cause", cause,
-			"age", time.Duration(age).Truncate(time.Millisecond).String())
+	// The beacon registration is one datagram and runs every time, also
+	// when the registry half below is skipped as recently done: an
+	// endpoint-only re-registration does not register with the beacon, and
+	// the rx watchdog's soft recovery counts on the beacon's reply as
+	// inbound traffic.
+	d.tunnels.RegisterWithBeacon()
+	if age, ok := d.reestablishedRecently(!o.endpointOnly); ok && !o.always {
+		slog.Info("registry re-registered moments ago — not repeating it", "cause", cause,
+			"age", age.Truncate(time.Millisecond).String())
 		return true
 	}
-
-	d.tunnels.RegisterWithBeacon()
 	if d.reg() == nil {
 		return false
 	}
@@ -309,15 +334,17 @@ func (d *Daemon) reestablishTransport(cause string, o reestablishOpts) bool {
 			return false
 		}
 	}
-	register := d.reRegister
+	full := false
+	var err error
 	if o.endpointOnly {
-		register = d.reRegisterEndpoint
+		err = d.reRegisterEndpoint()
+	} else {
+		full, err = d.reRegisterFull()
 	}
-	if err := register(); err != nil {
+	if err != nil {
 		return false // registerEndpoint logs what the registry answered
 	}
-	d.reestablishOKWall = time.Now().UnixNano()
-	d.reestablishOKFull = !o.endpointOnly
+	d.noteReestablished(full)
 	return true
 }
 

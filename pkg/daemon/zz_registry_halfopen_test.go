@@ -147,3 +147,38 @@ func TestForceReconnectRegistryAfterStopDoesNotReplaceConn(t *testing.T) {
 		t.Fatal("forceReconnectRegistry replaced the registry conn after Stop began")
 	}
 }
+
+// A recovery redialling a registry that refuses connections gives way to
+// Stop. Its dial backoff used to sleep through Stop: ten attempts took 47.5 s,
+// and Stop gave up on it after 5 s and reported a leaked goroutine.
+func TestForceReconnectRegistryGivesWayToStop(t *testing.T) {
+	t.Parallel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // nothing listens there now: every dial is refused
+
+	d := New(Config{RegistryAddr: addr})
+	done := make(chan error, 1)
+	go func() { done <- d.forceReconnectRegistry() }()
+	time.Sleep(200 * time.Millisecond) // inside the dial backoff
+	close(d.stopCh)
+	stopped := time.Now()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errDaemonStopping) {
+			t.Fatalf("reconnect after stop: err = %v, want errDaemonStopping", err)
+		}
+		if took := time.Since(stopped); took > time.Second {
+			t.Fatalf("reconnect returned %v after Stop, want within 1s", took)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconnect still dialling the registry 3s after Stop")
+	}
+	if d.reg() != nil {
+		t.Fatal("a registry connection was installed after Stop")
+	}
+}
