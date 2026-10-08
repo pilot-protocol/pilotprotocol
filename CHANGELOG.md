@@ -391,6 +391,18 @@ Detailed per-release notes are on the
   one whose hold-off ends soonest makes room.
 - **Bytes after a known beacon notify kind are ignored** instead of the
   whole notify being dropped, so a later beacon can extend the message.
+- **`info` and the trusted-peers list work on nodes with very many peers.**
+  One IPC message holds at most 1 MB. Past about 10,000 peers the `info`
+  reply no longer fit, nor did the trusted list past about 8,000 records;
+  the daemon could not send it and closed the client's connection. Every
+  command that asked for it failed with `daemon disconnected`: `pilotctl
+  info`, `peers`, `connections` and `trust`, and `send-message`, whose
+  later requests went over the closed connection. Seen on service agents
+  with 10,909 peers and over 20,000 trust records. The daemon now sends as
+  many rows as fit, peers with an open connection and the newest trust
+  records first, and marks the list with `peer_list_truncated` or
+  `trusted_truncated`; the counts still give the totals. `pilotctl peers`
+  and `trust` say when a list was cut.
 - **Stream segments fit one packet.** A full stream segment was 4096 bytes,
   about 4.2 KB on the wire and three IP fragments on a 1500-byte path. NATs,
   firewalls and some virtual networks drop fragments, so on those paths
