@@ -225,7 +225,7 @@ func TestHeldPeerFINIsHandledOnceThePeerFallsSilent(t *testing.T) {
 	t.Parallel()
 	d, peerNode, peerConn := setupDaemonWithPeer(t, Config{Public: true})
 	d.setNodeID_testhelper(0xABCD00F3)
-	d.finHoldIdle = 400 * time.Millisecond
+	d.finHoldIdle = time.Second
 	conn := finTestConn(t, d, peerNode)
 
 	d.handleStreamPacket(finTestData(peerNode, d.NodeID(), 1000, "abcde"))
@@ -238,7 +238,7 @@ func TestHeldPeerFINIsHandledOnceThePeerFallsSilent(t *testing.T) {
 
 	var finack *protocol.Packet
 	for finack == nil {
-		pkt := readPacket(t, peerConn, 2*time.Second)
+		pkt := readPacket(t, peerConn, 3*time.Second)
 		if pkt == nil {
 			t.Fatal("the held FIN was never handled after the peer fell silent")
 		}
@@ -246,8 +246,8 @@ func TestHeldPeerFINIsHandledOnceThePeerFallsSilent(t *testing.T) {
 			finack = pkt
 		}
 	}
-	if waited := time.Since(start); waited < 600*time.Millisecond {
-		t.Fatalf("FIN handled %s after it arrived, want the wait restarted by the data at 250 ms (>= 650 ms)", waited)
+	if waited := time.Since(start); waited < 1200*time.Millisecond {
+		t.Fatalf("FIN handled %s after it arrived, want the wait restarted by the data at 250 ms (>= 1.25 s)", waited)
 	}
 	if finack.Ack != 1021 {
 		t.Fatalf("FIN-ACK ack=%d, want 1021", finack.Ack)
@@ -258,6 +258,74 @@ func TestHeldPeerFINIsHandledOnceThePeerFallsSilent(t *testing.T) {
 	}
 	if string(got) != "abcde" {
 		t.Fatalf("reader got %q before EOF, want the in-order data only", got)
+	}
+}
+
+// A SYN on the ports of a connection whose FIN is held is a restarted
+// peer dialling again (its ephemeral ports start over), not a resend: a
+// peer that sent a FIN is past its SYN. The old connection ends, quietly,
+// and the SYN opens a new one. Answered as the old connection, the new
+// one's data was acknowledged as duplicates and never delivered.
+func TestSYNOnAConnectionWithAHeldFINIsANewConnection(t *testing.T) {
+	t.Parallel()
+	d, peerNode, peerConn := setupDaemonWithPeer(t, Config{Public: true})
+	d.setNodeID_testhelper(0xABCD00F4)
+	if _, err := d.ports.Bind(55555); err != nil {
+		t.Fatal(err)
+	}
+	old := finTestConn(t, d, peerNode)
+	d.handleStreamPacket(finTestData(peerNode, d.NodeID(), 1000, "abcde"))
+	d.handleStreamPacket(streamPacket(protocol.FlagFIN, peerNode, d.NodeID(), 443, 55555, 1010, 0))
+	for readPacket(t, peerConn, 150*time.Millisecond) != nil {
+	}
+
+	d.handleStreamPacket(streamPacket(protocol.FlagSYN, peerNode, d.NodeID(), 443, 55555, 7000, 0))
+
+	var got []byte
+	for b := range old.RecvBuf {
+		got = append(got, b...)
+	}
+	if string(got) != "abcde" {
+		t.Fatalf("old reader got %q before EOF, want the in-order data", got)
+	}
+	cur := d.ports.FindConnection(55555, protocol.Addr{Node: peerNode}, 443)
+	if cur == nil || cur.ID == old.ID {
+		t.Fatalf("connection on the ports after the SYN = %v, want a new one", cur)
+	}
+	for {
+		pkt := readPacket(t, peerConn, time.Second)
+		if pkt == nil {
+			t.Fatal("no SYN-ACK for the new connection")
+		}
+		if pkt.HasFlag(protocol.FlagFIN) {
+			t.Fatalf("a FIN (flags %d) went to the peer: it would close its new connection", pkt.Flags)
+		}
+		if pkt.HasFlag(protocol.FlagSYN) && pkt.HasFlag(protocol.FlagACK) {
+			if pkt.Ack != 7001 {
+				t.Fatalf("SYN-ACK ack=%d, want 7001: answered as the old connection", pkt.Ack)
+			}
+			break
+		}
+	}
+}
+
+// A connection that ends some other way while the peer's FIN is held (here
+// an RST) stops the hold: no FIN-ACK goes out for it later, where it could
+// reach a new connection on the same ports.
+func TestHoldEndsWithTheConnection(t *testing.T) {
+	t.Parallel()
+	d, peerNode, peerConn := setupDaemonWithPeer(t, Config{Public: true})
+	d.setNodeID_testhelper(0xABCD00F5)
+	d.finHoldIdle = 200 * time.Millisecond
+	finTestConn(t, d, peerNode)
+	d.handleStreamPacket(finTestData(peerNode, d.NodeID(), 1000, "abcde"))
+	d.handleStreamPacket(streamPacket(protocol.FlagFIN, peerNode, d.NodeID(), 443, 55555, 1010, 0))
+	d.handleStreamPacket(streamPacket(protocol.FlagRST, peerNode, d.NodeID(), 443, 55555, 0, 0))
+	deadline := time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if pkt := readPacket(t, peerConn, 100*time.Millisecond); pkt != nil && pkt.HasFlag(protocol.FlagFIN) {
+			t.Fatalf("FIN (flags %d) sent for a connection the peer reset", pkt.Flags)
+		}
 	}
 }
 

@@ -3361,6 +3361,26 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// them as retransmits resends a stale SYN-ACK seq that the new client rejects,
 		// blocking the new connection for up to TimeWaitDuration + IdleSweepInterval.
 		if existing := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort); existing != nil {
+			// A peer that sent a FIN is past its SYN, so a SYN on the same
+			// ports while that FIN is held for missing data is a new
+			// connection from a restarted peer (its ephemeral ports start
+			// over), not a resend. Answered as the old connection, its data
+			// would be acknowledged as duplicates and never delivered. End
+			// the old one here, quietly: its data is not coming, and a
+			// FIN-ACK would reach the new connection.
+			existing.RecvMu.Lock()
+			restarted := existing.finPending
+			existing.RecvMu.Unlock()
+			if restarted {
+				slog.Info("new connection on the ports of one whose FIN was held — the peer restarted; closing the old one",
+					"conn_id", existing.ID, "remote_addr", pkt.Src, "remote_port", pkt.SrcPort)
+				existing.Mu.Lock()
+				existing.State = StateClosed
+				existing.Mu.Unlock()
+				d.stopFINHold(existing)
+				existing.CloseRecvBuf()
+				d.ports.RemoveConnection(existing.ID)
+			}
 			existing.Mu.Lock()
 			st := existing.State
 			eAck := existing.RecvAck
@@ -3664,6 +3684,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			conn.State = StateClosed
 			conn.Mu.Unlock()
 			conn.signalDial() // a refused dial ends now, not at the next backstop tick
+			d.stopFINHold(conn)
 			conn.CloseRecvBuf()
 			d.ports.RemoveConnection(conn.ID)
 			d.publishEvent("conn.rst", map[string]interface{}{
@@ -3818,8 +3839,20 @@ const defaultFinHoldIdle = 15 * time.Second
 // missing data, as every version up to v1.17.0 gave it at once. Runs on the
 // hold timer; a FIN that delivery reached first is not handled again.
 func (d *Daemon) expireHeldFIN(conn *Connection) {
+	conn.Mu.Lock()
+	open := conn.State == StateEstablished
+	conn.Mu.Unlock()
 	conn.RecvMu.Lock()
 	if !conn.finPending {
+		conn.RecvMu.Unlock()
+		return
+	}
+	if !open {
+		// The connection ended some other way (RST, a local close, the
+		// reaper, shutdown): nothing to answer, and a FIN-ACK now could
+		// reach a new connection on the same ports.
+		conn.finPending = false
+		conn.finHoldTimer = nil
 		conn.RecvMu.Unlock()
 		return
 	}
@@ -3838,10 +3871,23 @@ func (d *Daemon) expireHeldFIN(conn *Connection) {
 	d.acceptFIN(conn, finSeq)
 }
 
+// stopFINHold ends the hold on the peer's FIN, if any, and its timer: the
+// connection ended some other way, or the FIN is being handled now.
+func (d *Daemon) stopFINHold(conn *Connection) {
+	conn.RecvMu.Lock()
+	conn.finPending = false
+	if conn.finHoldTimer != nil {
+		conn.finHoldTimer.Stop()
+		conn.finHoldTimer = nil
+	}
+	conn.RecvMu.Unlock()
+}
+
 // acceptFIN handles the peer's FIN once every byte sent before it has been
 // delivered (see the FIN branch of handleStreamPacket): it closes the
 // receive side, moves to TIME_WAIT and answers with a FIN-ACK.
 func (d *Daemon) acceptFIN(conn *Connection, finSeq uint32) {
+	d.stopFINHold(conn)
 	conn.CloseRecvBuf()
 	conn.Mu.Lock()
 	wasFinWait := conn.State == StateFinWait
@@ -5191,14 +5237,35 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	// segment with the same seq as the FIN sentinel (iter 24 fix, same
 	// pattern as the sendSegment pre-increment fix in iter 23).
 	d.sendHeldTailBeforeClose(conn)
+	// A receiver up to v1.17.0 acts on a FIN that overtook a lost segment,
+	// closing the stream without it. With data unacknowledged the FIN is
+	// held and sent once the data is acknowledged (finLinger at most;
+	// releaseHeldFIN), so the end of a write followed at once by a close
+	// survives loss on such receivers too. The caller does not wait. The
+	// FIN's sequence number is reserved and the FIN held in one critical
+	// section, so shutdown never sees the one without the other.
+	hold := d.unackedHasData(conn) && !d.stopping()
 	conn.Mu.Lock()
 	st := conn.State
-	sendSeq := conn.SendSeq
+	var fin *protocol.Packet
 	if st == StateEstablished {
+		fin = &protocol.Packet{
+			Version:  protocol.Version,
+			Flags:    protocol.FlagFIN,
+			Protocol: protocol.ProtoStream,
+			Src:      conn.LocalAddr,
+			Dst:      conn.RemoteAddr,
+			SrcPort:  conn.LocalPort,
+			DstPort:  conn.RemotePort,
+			Seq:      conn.SendSeq,
+		}
 		conn.SendSeq++ // reserve FIN seq atomically with the read
+		if hold {
+			c := conn
+			conn.heldFIN = fin
+			conn.finLingerTimer = time.AfterFunc(d.finLinger, func() { d.releaseHeldFIN(c) })
+		}
 	}
-	localAddr := conn.LocalAddr
-	localPort := conn.LocalPort
 	remoteAddr := conn.RemoteAddr
 	remotePort := conn.RemotePort
 	connID := conn.ID
@@ -5210,34 +5277,17 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 			"conn_id":     connID,
 		})
 	}
-	if st == StateEstablished {
-		fin := &protocol.Packet{
-			Version:  protocol.Version,
-			Flags:    protocol.FlagFIN,
-			Protocol: protocol.ProtoStream,
-			Src:      localAddr,
-			Dst:      remoteAddr,
-			SrcPort:  localPort,
-			DstPort:  remotePort,
-			Seq:      sendSeq,
-		}
-		// A receiver up to v1.17.0 acts on a FIN that overtook a lost
-		// segment, closing the stream without it. Send the FIN once the
-		// data is acknowledged (finLinger at most), so the end of a write
-		// that is followed at once by a close survives loss on such
-		// receivers too. The caller does not wait.
-		if d.unackedHasData(conn) && !d.stopping() {
-			c := conn
-			conn.Mu.Lock()
-			conn.heldFIN = fin
-			conn.finLingerTimer = time.AfterFunc(d.finLinger, func() { d.releaseHeldFIN(c) })
-			conn.Mu.Unlock()
+	if fin != nil {
+		if hold {
 			// The last ACK may have been handled since the check above.
 			d.releaseHeldFINIfAcked(conn)
 		} else {
 			d.sendFIN(conn, fin)
 		}
 	}
+	// A FIN from the peer held for missing data is moot: this side no
+	// longer reads.
+	d.stopFINHold(conn)
 	conn.CloseRecvBuf()
 	// P1-003: stop a pending delayed-ACK timer so it doesn't fire after
 	// the connection is gone and queue an ACK for a dead peer. ACKTimer
