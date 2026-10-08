@@ -935,6 +935,11 @@ sender and arrival time, as before. From a peer known to echo IDs (one of its
 earlier messages in the inbox carries a reply_to) such a reply is held back
 until 0.75s after it arrived, in case the reply naming the ID follows.
 
+A receiver from v1.13.9 or older does not know message IDs and stores nothing
+for the message carrying one. It is sent the whole message a second time,
+without the ID ("tagged": false), so the payload (up to 64 MiB) crosses the
+network twice, and twice more if an ack is lost and the message is re-sent.
+
 Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
   pilotctl send-message my-peer --data "hello" --wait
@@ -5118,8 +5123,10 @@ func cmdSendMessage(args []string) {
 	// Every send carries a new message ID, so the receiver can tell a
 	// re-delivery from a new message and a reply can name the request it
 	// answers (reply_to). Client.Send delivers the message without the ID to
-	// a receiver too old to know it: such a receiver stores nothing for the
-	// tagged frame, says so, and gets the plain frame on the same connection.
+	// a receiver too old to know it (v1.13.9 and older): such a receiver
+	// stores nothing for the tagged frame, says so, and gets the plain frame
+	// on the same connection. That is the whole payload (up to 64 MiB) sent
+	// a second time, and a retry after a lost ack (below) sends both again.
 	sendOne := func(cl *dataexchange.Client, seq int, reused bool, redial func() (*dataexchange.Client, error)) (map[string]interface{}, *dataexchange.Client) {
 		messageID := dataexchange.NewMessageID()
 		if watch != nil {
@@ -5144,7 +5151,8 @@ func cmdSendMessage(args []string) {
 			// Send the same frame once more on a new connection: a receiver
 			// from v1.13.10 on recognises the repeat by its ID and keeps one
 			// copy, and an older one answers the tagged frame again and gets
-			// the untagged copy. The one case that stores the message twice
+			// the untagged copy (the payload crosses the network twice more
+			// for it). The one case that stores the message twice
 			// is a receiver through v1.13.9 that stored the untagged copy
 			// and lost its ack; --no-resend opts out of the retry. A --trace
 			// message is never sent again: receivers do not suppress

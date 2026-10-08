@@ -60,10 +60,14 @@ Detailed per-release notes are on the
   from v1.13.10 on recognises the repeat and keeps one copy; one through
   v1.13.9 can store the message twice when the ack of its untagged copy is
   the one lost. A `--trace` message is never sent again: receivers do not
-  suppress repeated trace frames. Receivers that predate message IDs still
-  get the message, in the old format (`"tagged": false` in the result); that
-  costs one extra exchange on the same connection. No dependency change: the
-  dataexchange release already required carries the IDs.
+  suppress repeated trace frames. Receivers that predate message IDs
+  (v1.13.9 and older) still get the message, in the old format
+  (`"tagged": false` in the result). They store nothing for the message
+  carrying the ID, so it is sent to them a second time on the same
+  connection, without the ID: the whole payload, up to 64 MiB, crosses the
+  network twice, and twice more when its ack is lost and it is sent again.
+  No dependency change: the dataexchange release already required carries
+  the IDs.
 - **The daemon caps its own log file.** launchd never rotates the daemon's
   `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
   without bound — 22 MB on one laptop. When stderr is a regular file the
