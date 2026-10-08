@@ -111,6 +111,7 @@ const (
 	backupKindResetState = "reset-state" // --reset-state: the only copy of the dropped state
 	backupKindIncomplete = "incomplete"  // holds state that could not be carried into the new install
 	backupKindRecovered  = "recovered"   // a leftover found by crash recovery; what it holds is unknown
+	backupKindUninstall  = "uninstall"   // removed by uninstall: the only copy of its state (the wallet's key)
 )
 
 // backupKindRotated reports the kinds retention may prune. Anything else,
@@ -880,6 +881,11 @@ type appBackupMeta struct {
 	// backup but could not be carried into the install that replaced it.
 	NotCarried []string `json:"not_carried,omitempty"`
 	CreatedAt  string   `json:"created_at"`
+
+	// oldBinary names the install's binary (relative to the app dir) when
+	// its manifest is already gone, as after uninstall removed it: the
+	// backup keeps state, not the binary.
+	oldBinary string
 }
 
 // replacedInstallBackupKind classifies the backup of a replaced install.
@@ -917,7 +923,7 @@ var unsafeBackupNameChars = regexp.MustCompile(`[^0-9A-Za-z._+-]`)
 // warning (the backup is not where it was configured to go); with an empty
 // path, the dir could not be retired at all.
 func retireAppDir(previousDir, appID string, meta appBackupMeta) (string, error) {
-	oldBinary := ""
+	oldBinary := meta.oldBinary
 	if m, _, err := readInstalledManifest(previousDir); err == nil {
 		oldBinary = m.Binary.Path
 		if meta.FromVersion == "" {

@@ -394,6 +394,14 @@ Detailed per-release notes are on the
   `appstore upgrade` does not wait.
 
 ### Fixed
+- **`pilotctl appstore uninstall` no longer deletes an app's keys.** It
+  deleted the app's dir, and with it the app's state: the wallet's EVM private
+  key (and the funds at its address), smol's secrets, each metered app's
+  identity. The dir now goes to the app backups (`~/.pilot/app-backups/<id>/`),
+  without the binary and pinned so retention never removes it, and the
+  command says where. The wallet (0.4.0) restores its key from there, or from
+  its own copy in `~/.pilot/keys/io.pilot.wallet`, when it is installed
+  again. If the dir cannot be moved, nothing is deleted.
 - **A write followed at once by a close no longer loses its end under
   loss.** A FIN that overtook a lost segment was acted on at once: the
   receiver closed the stream with the segment missing, and its FIN-ACK made
