@@ -356,6 +356,13 @@ Detailed per-release notes are on the
   every peer they had ever seen (service agents: 3,500 to 10,900). The next
   contact runs a fresh key exchange. The reaper also counts relayed inbound
   frames as contact now, so a peer still sending to us is kept.
+- **A reaped peer leaves nothing behind, and frames for a peer that never
+  answers no longer wait forever.** Frames queued for a key exchange were
+  dropped only when the exchange completed; for a peer that never answered
+  they stayed until the daemon exited, reaper or not. Once 256 such peers
+  had piled up, every first send to a new peer failed with "too many
+  pending key exchanges". A queue now goes after 2 minutes (the exchange
+  itself gives up after 20 s), and with its peer when the reaper drops it.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps

@@ -738,6 +738,21 @@ func (m *Manager) SetReplyWhitelistMatchAll(on bool) {
 	m.replyWhitelistAll.Store(on)
 }
 
+// PeerStateEntries counts the entries in every per-peer map this manager
+// keeps. RemovePeer clears most of them; rekeyGaveUp expires on its own
+// cooldown. A count that only grows is per-peer state that outlives its
+// peer.
+func (m *Manager) PeerStateEntries() int {
+	m.pubKeysMu.RLock()
+	n := len(m.peerPubKeys) + len(m.negPubKeys)
+	m.pubKeysMu.RUnlock()
+	m.rkPendingMu.Lock()
+	n += len(m.pendingRekey) + len(m.lastInboundDecrypt) + len(m.rekeyGaveUp) +
+		len(m.lastKeyExchangeReply) + len(m.keyRequestDue)
+	m.rkPendingMu.Unlock()
+	return n
+}
+
 // RemovePeer wipes per-peer L5 state (called from TunnelManager.RemovePeer).
 func (m *Manager) RemovePeer(nodeID uint32) {
 	m.pubKeysMu.Lock()

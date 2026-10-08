@@ -6492,9 +6492,19 @@ func (d *Daemon) reapStalePeers() {
 			slog.Debug("reaping stale peer", "node_id", p.NodeID,
 				"last_contact", latest.Round(time.Second),
 				"has_encryption", p.Encrypted)
-			d.tunnels.RemovePeer(p.NodeID)
+			d.forgetPeer(p.NodeID)
 		}
 	}
+}
+
+// forgetPeer drops everything the daemon keeps for a peer it no longer
+// talks to: the tunnel entry and its routing and key state (RemovePeer),
+// and the frames still queued for a key exchange the peer never answered,
+// which RemovePeer keeps for a path reset's re-key. The next contact
+// starts from scratch, as first contact does.
+func (d *Daemon) forgetPeer(nodeID uint32) {
+	d.tunnels.RemovePeer(nodeID)
+	d.tunnels.dropPending(nodeID)
 }
 
 // hostnameReannounceLoop periodically re-sets the daemon's hostname
@@ -6562,6 +6572,10 @@ func (d *Daemon) idleSweepLoop() {
 			// lastPendDropLog doesn't accumulate one slot per
 			// unique-peer-ever-throttled.
 			d.tunnels.reapPendDropLog()
+
+			// Drop frames that have waited too long for a key exchange
+			// that is not coming, freeing their pending-peer slot.
+			d.tunnels.reapStalePending(time.Now())
 
 			// Evict expired entries from the three peer-resolution caches.
 			// epCache: stale-but-usable after EndpointCacheTTL; evict after 1 hour.

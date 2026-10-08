@@ -136,6 +136,9 @@ type TunnelManager struct {
 	// Pending sends waiting for key exchange to complete
 	pendMu  sync.Mutex
 	pending map[uint32][][]byte // node_id → queued frames
+	// pendingSince is when each queue in pending got its first frame;
+	// reapStalePending drops queues older than pendingMaxAge.
+	pendingSince map[uint32]time.Time
 	// lastPendDropLog records when we last logged a "tunnel pending queue
 	// full; dropped newest" warning for a peer. The drop counter
 	// (PendingDrops) still increments on every drop so metrics are exact;
@@ -410,6 +413,7 @@ func NewTunnelManager() *TunnelManager {
 		peers:           make(map[uint32]*net.UDPAddr),
 		envelope:        store,
 		pending:         make(map[uint32][][]byte),
+		pendingSince:    make(map[uint32]time.Time),
 		lastPendDropLog: make(map[uint32]time.Time),
 		lastRekeyReq:    make(map[uint32]time.Time),
 		recvCh:          make(chan *IncomingPacket, RecvChSize),
@@ -520,6 +524,79 @@ const rekeyRequestInterval = 3 * time.Second
 // counter (PendingDrops) increments on every drop regardless, so
 // metric accuracy is unaffected.
 const pendingDropLogInterval = 5 * time.Second
+
+// pendingMaxAge bounds how long frames wait in the pending queue for a key
+// exchange. A key exchange is retransmitted for 20 s (MaxRekeyAttempts ×
+// RekeyRetransmitInterval) and then given up, so a queue still waiting
+// after this long belongs to a peer that never answered: its frames would
+// only ever be sent stale (a SYN for a dial abandoned minutes ago), and
+// the queue holds one of the maxPendingPeers slots that every first
+// contact with a new peer needs.
+const pendingMaxAge = 2 * time.Minute
+
+// reapStalePending drops pending queues older than pendingMaxAge. Before
+// it, a queue was removed only when its peer's key exchange completed
+// (flushPending): queues for peers that never answered stayed for the
+// daemon's lifetime, and once maxPendingPeers of them had piled up, every
+// send to a peer without a session failed with "too many pending key
+// exchanges". Called from the idleSweepLoop tick.
+func (tm *TunnelManager) reapStalePending(now time.Time) int {
+	dropped := 0
+	tm.pendMu.Lock()
+	for nodeID, since := range tm.pendingSince {
+		if now.Sub(since) > pendingMaxAge {
+			delete(tm.pending, nodeID)
+			delete(tm.pendingSince, nodeID)
+			dropped++
+		}
+	}
+	// A queue with no start time cannot age out; give it one.
+	for nodeID := range tm.pending {
+		if _, ok := tm.pendingSince[nodeID]; !ok {
+			tm.pendingSince[nodeID] = now
+		}
+	}
+	tm.pendMu.Unlock()
+	return dropped
+}
+
+// dropPending discards a peer's pending queue and its log throttle, for a
+// peer the daemon is forgetting (see Daemon.forgetPeer). RemovePeer keeps
+// the queue on purpose: a path reset removes the peer and re-keys at once,
+// and the queued frames go out when the new key is in.
+func (tm *TunnelManager) dropPending(nodeID uint32) {
+	tm.pendMu.Lock()
+	delete(tm.pending, nodeID)
+	delete(tm.pendingSince, nodeID)
+	delete(tm.lastPendDropLog, nodeID)
+	tm.pendMu.Unlock()
+}
+
+// peerStateEntries counts the entries in every per-peer table the tunnel
+// and its routing and key-exchange managers keep, by table. Tests use it to
+// check that per-peer state goes when the peer does.
+func (tm *TunnelManager) peerStateEntries() map[string]int {
+	out := map[string]int{}
+	tm.mu.RLock()
+	out["peers"] = len(tm.peers)
+	tm.mu.RUnlock()
+	out["crypto"] = tm.envelope.Len()
+	tm.pendMu.Lock()
+	out["pending"] = len(tm.pending) + len(tm.pendingSince)
+	out["pending_drop_log"] = len(tm.lastPendDropLog)
+	tm.pendMu.Unlock()
+	keyViaRelay := 0
+	tm.keyViaRelay.Range(func(_, _ any) bool { keyViaRelay++; return true })
+	out["key_via_relay"] = keyViaRelay
+	if tm.activity != nil {
+		tm.activity.mu.RLock()
+		out["activity"] = len(tm.activity.m)
+		tm.activity.mu.RUnlock()
+	}
+	out["routing"] = tm.routing.PeerStateEntries()
+	out["keyexchange"] = tm.kx.PeerStateEntries()
+	return out
+}
 
 // reapPendDropLog evicts lastPendDropLog entries older than
 // pendingDropLogInterval. Without periodic reaping, every peer that
@@ -2032,6 +2109,7 @@ func (tm *TunnelManager) flushPending(nodeID uint32) {
 	tm.pendMu.Lock()
 	frames := tm.pending[nodeID]
 	delete(tm.pending, nodeID)
+	delete(tm.pendingSince, nodeID)
 	tm.pendMu.Unlock()
 
 	if len(frames) == 0 {
@@ -2273,6 +2351,9 @@ func (tm *TunnelManager) SendTo(addr *net.UDPAddr, nodeID uint32, pkt *protocol.
 			dropped = true
 			atomic.AddUint64(&tm.PendingDrops, 1)
 		} else {
+			if len(q) == 0 {
+				tm.pendingSince[nodeID] = time.Now()
+			}
 			tm.pending[nodeID] = append(q, data)
 		}
 		qlen := len(tm.pending[nodeID])

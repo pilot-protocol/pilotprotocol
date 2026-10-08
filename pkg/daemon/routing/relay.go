@@ -168,6 +168,17 @@ func (m *Manager) ClearRelayOnDirect(peerNodeID uint32, from *net.UDPAddr) bool 
 	return false
 }
 
+// PeerStateEntries counts the entries in every per-peer map this manager
+// keeps. It drops back as peers are removed (RemovePeer): a count that
+// only grows is per-peer state that outlives its peer.
+func (m *Manager) PeerStateEntries() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.relayPeers) + len(m.relayPinned) + len(m.lastOutboundSend) +
+		len(m.firstOutboundSend) + len(m.sendErrCount) + len(m.lastDirectRecv) +
+		len(m.blackholeMissCount) + len(m.directClearCount)
+}
+
 // RemovePeer wipes per-peer L4 state.
 func (m *Manager) RemovePeer(nodeID uint32) {
 	m.mu.Lock()
