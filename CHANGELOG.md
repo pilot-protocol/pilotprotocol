@@ -60,10 +60,14 @@ Detailed per-release notes are on the
   from v1.13.10 on recognises the repeat and keeps one copy; one through
   v1.13.9 can store the message twice when the ack of its untagged copy is
   the one lost. A `--trace` message is never sent again: receivers do not
-  suppress repeated trace frames. Receivers that predate message IDs still
-  get the message, in the old format (`"tagged": false` in the result); that
-  costs one extra exchange on the same connection. No dependency change: the
-  dataexchange release already required carries the IDs.
+  suppress repeated trace frames. Receivers that predate message IDs
+  (v1.13.9 and older) still get the message, in the old format
+  (`"tagged": false` in the result). They store nothing for the message
+  carrying the ID, so it is sent to them a second time on the same
+  connection, without the ID: the whole payload, up to 64 MiB, crosses the
+  network twice, and twice more when its ack is lost and it is sent again.
+  No dependency change: the dataexchange release already required carries
+  the IDs.
 - **The daemon caps its own log file.** launchd never rotates the daemon's
   `StandardOutPath`/`StandardErrorPath` (`~/.pilot/daemon.log`), which grew
   without bound — 22 MB on one laptop. When stderr is a regular file the
@@ -318,6 +322,25 @@ Detailed per-release notes are on the
 
   Hosts with many cores can cut scheduler overhead further by setting
   `GOMAXPROCS` (for example 4) in the daemon's environment.
+- **`pilotctl dgram` exits with a code that says whether to retry.** Every
+  datagram the daemon refused was `connection_failed`, which the error-code
+  list calls retryable, though a port the network's policy forbids or a
+  datagram too large to send fails the same way every time. The `code` in
+  the error (and in `--json`) now follows the reason, so scripts that
+  matched `connection_failed` for these see a different code:
+  - a port the network's policy does not allow: `permission_denied` (now in
+    the `pilotctl context` error-code list);
+  - a payload too large for a packet, the tunnel socket or the IPC frame,
+    or a broadcast address: `invalid_argument`;
+  - a node the registry does not know: `not_found`;
+  - a datagram that waited too long for its turn and was not sent:
+    `timeout`, as one whose answer did not come in time already was;
+  - anything else (no route or tunnel yet, a key exchange in progress, the
+    registry unreachable, ephemeral ports exhausted): `connection_failed`,
+    as before.
+
+  A `--data` over 65535 bytes is now refused before the daemon is
+  contacted.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps
@@ -393,6 +416,34 @@ Detailed per-release notes are on the
   reconnect and full re-registration a recovery has just done. A recovery
   whose re-registration failed, or that restored the node's visibility,
   hostname or trust pairs only in part, does not count as done.
+- **`pilotctl send-message --count N --reuse-conn` carries on after a lost
+  ack.** A lost ack means the shared connection is gone, but the messages
+  after it were still written into it. The driver only notices a connection
+  it closed itself, so those writes appeared to succeed and were dropped. Each
+  later message then lost its ack too and was sent again on a new connection:
+  every message showed `"retried": true`, and with `--no-resend` every
+  message after the lost one failed. The messages after it now go on the
+  retry's connection, or on a new one when there was no retry. `reused` is
+  true only when the connection had carried an earlier message. A later
+  message whose new connection cannot be dialled is reported as failed, and
+  the run goes on.
+- **A failed `pilotctl send-message` says which message failed.** When a
+  single message could not be sent, was not acknowledged or was refused by
+  the receiver, the `--json` error did not include its `message_id`, so the
+  caller could not look for it in the receiver's inbox or for a reply naming
+  it. The error now carries the message's result in `results`, as a
+  `--count` run's error already did. A refused message's error also gets a
+  `hint`.
+- **`pilotctl bench` fails when the echo does not all come back.** A run
+  whose echo stopped short printed `"status":"ok"` and exited 0: with the
+  echo cut off after 2 KiB, `bench <peer> 0.01 --timeout 300ms` reported
+  4096 of 10485 bytes received as a success. Such a run now **exits 1**,
+  with code `timeout` when `--timeout` ended the wait for the echo, or
+  `connection_failed` when the echo stream ended early, and the error's
+  `results` carry the partial figures. A complete run adds
+  `"complete": true` to its result. `total_mbps` is now computed from the
+  bytes that came back rather than the bytes sent, and the received count is
+  no longer read while the reader may still be writing it (a data race).
 - **A bulk transfer no longer hangs when the receiver's application falls
   behind.** When a receiver's application stops reading for a second, the
   receiver parks the next in-order segment in its reorder buffer and keeps

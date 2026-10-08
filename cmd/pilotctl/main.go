@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -934,6 +935,11 @@ sender and arrival time, as before. From a peer known to echo IDs (one of its
 earlier messages in the inbox carries a reply_to) such a reply is held back
 until 0.75s after it arrived, in case the reply naming the ID follows.
 
+A receiver from v1.13.9 or older does not know message IDs and stores nothing
+for the message carrying one. It is sent the whole message a second time,
+without the ID ("tagged": false), so the payload (up to 64 MiB) crosses the
+network twice, and twice more if an ack is lost and the message is re-sent.
+
 Examples:
   pilotctl send-message list-agents --data '/data {"search":"weather","limit":5}'
   pilotctl send-message my-peer --data "hello" --wait
@@ -958,6 +964,10 @@ Examples:
 	"bench": `Usage: pilotctl bench <address|hostname> [size_mb] [flags]
 
 Measure throughput to a remote node via the echo port.
+
+The run fails unless everything sent is echoed back: with code timeout when
+--timeout ends the wait for the echo, connection_failed when the echo stream
+ends early. The error's "results" carry the partial figures.
 
 Flags:
   --timeout <dur>       overall deadline (default: 120s)
@@ -1401,6 +1411,13 @@ have no ACK, no retry and no ordering guarantee. The local daemon does say
 whether it sent the datagram: if it could not (no route to the node, port
 policy, payload too large) the command fails with its reason. "confirmed":
 false means the daemon is too old to say, and the datagram was sent anyway.
+The daemon refuses a payload over 65535 bytes, and less fits in practice:
+the datagram and its headers must fit one UDP packet, about 65400 bytes on a
+direct path and less relayed. Use send-message for anything large.
+
+The error code says whether sending again can help: permission_denied (the
+network's port policy), invalid_argument (too large), not_found (no such
+node), timeout, or connection_failed (no route or tunnel yet; may retry).
 
 Use for: real-time telemetry, heartbeats, anything where freshness > reliability.
 `,
@@ -2687,6 +2704,7 @@ func contextCatalog() map[string]interface{} {
 		"error_codes": map[string]interface{}{
 			"invalid_argument":  "Bad input or usage error (do not retry)",
 			"not_found":         "Resource not found (hostname/name resolve failure)",
+			"permission_denied": "Refused by policy or verification (do not retry unchanged)",
 			"already_exists":    "Duplicate operation (daemon/gateway already running)",
 			"not_running":       "Service not available (daemon/gateway not running)",
 			"connection_failed": "Network or dial failure (may retry)",
@@ -4481,15 +4499,6 @@ func cmdDgram(args []string) {
 	if len(pos) < 2 {
 		fatalCode("invalid_argument", "usage: pilotctl dgram <address|hostname> <port> --data <msg>")
 	}
-
-	d := connectDriver()
-	defer d.Close()
-
-	target, err := parseAddrOrHostname(d, pos[0])
-	if err != nil {
-		fatalCode("not_found", "%v", err)
-	}
-	maybeAutoHandshake(d, target, flagBool(flags, "no-auto-handshake"))
 	p, err := strconv.ParseUint(pos[1], 10, 16)
 	if err != nil {
 		fatalCode("invalid_argument", "invalid port %q: %v", pos[1], err)
@@ -4500,17 +4509,36 @@ func cmdDgram(args []string) {
 	if data == "" {
 		fatalCode("invalid_argument", "--data is required")
 	}
+	// A packet's payload length is 16 bits: the daemon refuses anything
+	// larger, so say so before contacting it. Headers take some of the UDP
+	// packet, so slightly smaller payloads can still fail to send; the
+	// daemon reports those.
+	if len(data) > maxDatagramBytes {
+		fatalCode("invalid_argument", "datagram is %d bytes; the daemon refuses more than %d, and less fits after headers (use send-message for larger payloads)", len(data), maxDatagramBytes)
+	}
+
+	d := connectDriver()
+	defer d.Close()
+
+	target, err := parseAddrOrHostname(d, pos[0])
+	if err != nil {
+		fatalCode("not_found", "%v", err)
+	}
+	maybeAutoHandshake(d, target, flagBool(flags, "no-auto-handshake"))
 
 	// The daemon says whether it sent the datagram. The fire-and-forget
 	// send reported success even when the daemon could not send it (no
 	// route to the node, port policy, ephemeral ports exhausted).
 	confirmed, err := d.SendToConfirmed(target, port, []byte(data))
 	if err != nil {
-		if errors.Is(err, driver.ErrConfirmTimeout) {
+		switch {
+		case errors.Is(err, driver.ErrConfirmTimeout):
 			fatalHint("timeout", "the datagram may or may not have been sent; datagrams are unreliable, so send it again if it matters", "%v", err)
+		case errors.Is(err, driver.ErrConfirmQueueTimeout):
+			fatalHint("timeout", "the datagram was not sent; send it again", "%v", err)
 		}
 		// The driver's error already names the step ("daemon: sendto: ...").
-		fatalCode("connection_failed", "%v", err)
+		fatalCode(dgramErrorCode(err), "%v", err)
 	}
 
 	if jsonOutput {
@@ -4527,6 +4555,42 @@ func cmdDgram(args []string) {
 	} else {
 		fmt.Printf("sent %d byte(s) to %s port %d (the daemon is too old to confirm it was sent)\n", len(data), target, port)
 	}
+}
+
+// maxDatagramBytes is the largest payload the daemon accepts for a
+// datagram: a packet's payload length field is 16 bits. What fits one UDP
+// packet with the headers is somewhat less.
+const maxDatagramBytes = 0xFFFF
+
+// dgramErrorCode is the exit code for a datagram the daemon could not send,
+// or that never reached it. The daemon's reasons arrive as "daemon: sendto:
+// <reason>". They used to be connection_failed, which the error-code list
+// calls retryable, whatever the reason: a port the network's policy forbids
+// or a datagram too large to send fails the same way every time.
+func dgramErrorCode(err error) string {
+	if errors.Is(err, driver.ErrConfirmTimeout) || errors.Is(err, driver.ErrConfirmQueueTimeout) {
+		return "timeout"
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "not allowed by network"):
+		// "port %d not allowed by network %d policy"
+		return "permission_denied"
+	case strings.Contains(s, "payload too large"),
+		strings.Contains(s, "message too long"),
+		strings.Contains(s, "ipc frame too large"),
+		strings.Contains(s, "broadcast address requires admin token"):
+		// Too large for a packet, for the tunnel socket or for the IPC
+		// frame, or a broadcast address (refused by the driver or the
+		// daemon).
+		return "invalid_argument"
+	case strings.Contains(s, "resolve node") && strings.Contains(s, "not found"):
+		// The registry does not know the node.
+		return "not_found"
+	}
+	// No route yet, no tunnel, a key exchange in progress, the registry
+	// unreachable, ports exhausted: sending again may work.
+	return "connection_failed"
 }
 
 // cmdSendFile transfers a file via the dataexchange overlay stream.
@@ -5043,22 +5107,37 @@ func cmdSendMessage(args []string) {
 	// redial dials like dialOnce but returns the error: when sendOne's
 	// retry after a lost ack cannot connect, the first attempt stands.
 	redial := func() (*dataexchange.Client, error) { return dataexchange.Dial(d, target) }
+	// dialFailed is the result of a message of a multi-send whose dial
+	// failed after earlier messages went out.
+	dialFailed := func(seq int, err error) map[string]interface{} {
+		return map[string]interface{}{"seq": seq, "error": fmt.Sprintf("cannot connect to %s (data exchange port %d): %v", target, protocol.PortDataExchange, err)}
+	}
 
 	// Set below when --wait is given. Declared here so sendOne can register
 	// each request's message ID with it before the request leaves.
 	var watch *inboxWatch
 
-	// sendOne sends one message on cl and returns timing/ack metadata.
-	// reused=true is recorded when the connection was dialled on a prior call.
-	// redial opens a new connection to the same receiver, for the one retry
-	// after a lost ack (below).
+	// sendOne sends one message on cl and returns timing/ack metadata, and
+	// the connection the next message can go on. reused=true says cl carried
+	// an earlier message. redial opens a new connection to the same
+	// receiver, for the one retry after a lost ack (below).
+	//
+	// sendOne takes cl over. It returns cl, or the retry's connection when
+	// the ack on cl was lost, and closes the connections it does not return.
+	// It returns nil when neither can carry another message: the next one
+	// needs a new connection. A failed ack read means the connection is
+	// gone. No read deadline is set, so the read failed because the
+	// connection ended, and later writes to it would still succeed (the
+	// driver only notices a local close) and be dropped.
 	//
 	// Every send carries a new message ID, so the receiver can tell a
 	// re-delivery from a new message and a reply can name the request it
 	// answers (reply_to). Client.Send delivers the message without the ID to
-	// a receiver too old to know it: such a receiver stores nothing for the
-	// tagged frame, says so, and gets the plain frame on the same connection.
-	sendOne := func(cl *dataexchange.Client, seq int, reused bool, redial func() (*dataexchange.Client, error)) map[string]interface{} {
+	// a receiver too old to know it (v1.13.9 and older): such a receiver
+	// stores nothing for the tagged frame, says so, and gets the plain frame
+	// on the same connection. That is the whole payload (up to 64 MiB) sent
+	// a second time, and a retry after a lost ack (below) sends both again.
+	sendOne := func(cl *dataexchange.Client, seq int, reused bool, redial func() (*dataexchange.Client, error)) (map[string]interface{}, *dataexchange.Client) {
 		messageID := dataexchange.NewMessageID()
 		if watch != nil {
 			watch.addID(messageID)
@@ -5066,6 +5145,13 @@ func cmdSendMessage(args []string) {
 		sentAtNs := time.Now().UnixNano()
 		frame := messageFrame(innerType, []byte(data), messageID, replyTo, traceTime, sentAtNs)
 		res, sendErr := cl.Send(frame)
+		next := cl
+		if res == nil {
+			// Not answered: the write failed, or the ack read did. Either way
+			// cl cannot carry another message.
+			_ = cl.Close()
+			next = nil
+		}
 		retried := false
 		if res == nil && isAckReadError(sendErr) && !noResend && !traceTime {
 			// The frame was written but no ack came back, so whether it was
@@ -5075,7 +5161,8 @@ func cmdSendMessage(args []string) {
 			// Send the same frame once more on a new connection: a receiver
 			// from v1.13.10 on recognises the repeat by its ID and keeps one
 			// copy, and an older one answers the tagged frame again and gets
-			// the untagged copy. The one case that stores the message twice
+			// the untagged copy (the payload crosses the network twice more
+			// for it). The one case that stores the message twice
 			// is a receiver through v1.13.9 that stored the untagged copy
 			// and lost its ack; --no-resend opts out of the retry. A --trace
 			// message is never sent again: receivers do not suppress
@@ -5090,13 +5177,20 @@ func cmdSendMessage(args []string) {
 				res2, err2 := c2.Send(frame)
 				switch {
 				case res2 != nil, isAckReadError(err2):
-					res, sendErr = res2, err2
+					// The retry's outcome is the message's, on a connection
+					// that carried nothing before.
+					res, sendErr, reused = res2, err2, false
 				default:
 					// The retry was not written: the first attempt, written
 					// but unacknowledged, is what happened to the message.
 					sendErr = fmt.Errorf("%w; sending again failed: %v", sendErr, err2)
 				}
-				_ = c2.Close()
+				if res2 != nil {
+					// Answered, so still open: the next message goes on it.
+					next = c2
+				} else {
+					_ = c2.Close()
+				}
 			}
 		}
 		ackRecvAtNs := time.Now().UnixNano()
@@ -5112,7 +5206,7 @@ func cmdSendMessage(args []string) {
 			slog.Debug("send-message ACK read failed", "err", sendErr)
 			ackErr = sendErr
 		default:
-			return map[string]interface{}{"seq": seq, "error": sendErr.Error(), "message_id": messageID}
+			return map[string]interface{}{"seq": seq, "error": sendErr.Error(), "message_id": messageID}, next
 		}
 		if res != nil && res.Tagged && watch != nil {
 			watch.markTagged()
@@ -5167,7 +5261,7 @@ func cmdSendMessage(args []string) {
 				}
 			}
 		}
-		return r
+		return r, next
 	}
 	tracef("dial+send")
 
@@ -5211,8 +5305,10 @@ func cmdSendMessage(args []string) {
 				"cannot connect to %s (data exchange port %d)", target, protocol.PortDataExchange)
 		}
 		tracef("dataexchange.Dial")
-		defer cl.Close()
-		r := sendOne(cl, 0, false, redial)
+		r, cl := sendOne(cl, 0, false, redial)
+		if cl != nil {
+			defer cl.Close()
+		}
 		ackAt := time.Now()
 		// Every receiver answers a stored message with an ACK frame. No ACK
 		// means the message was not stored, or was never sent — the daemon
@@ -5220,7 +5316,12 @@ func cmdSendMessage(args []string) {
 		// "ok" here was reporting messages that never arrived. A send that
 		// failed outright was reported as "ok" with an error field; it is a
 		// failure too.
+		//
+		// The error carries the message's result, as a --count run's does:
+		// its message_id is how the caller finds the message later, in the
+		// receiver's inbox or in a reply that names it.
 		if e, failed := r["error"].(string); failed {
+			fatalResults = []map[string]interface{}{r}
 			fatalHint("connection_failed",
 				"the message was not sent; check `pilotctl peers` and the daemon log, then send again",
 				"sending to %s failed: %s", target, e)
@@ -5230,6 +5331,7 @@ func cmdSendMessage(args []string) {
 			if e, ok := r["ack_error"].(string); ok {
 				why = ": " + e
 			}
+			fatalResults = []map[string]interface{}{r}
 			fatalHint("connection_failed",
 				"the receiver did not confirm it stored the message; check `pilotctl peers` and the daemon log, then send again",
 				"%s did not acknowledge the message (%d bytes)%s", target, len(data), why)
@@ -5238,7 +5340,9 @@ func cmdSendMessage(args []string) {
 		// message (disk full, inbox unwritable). That is a failed send, not
 		// a delivered one — same rule send-file applies.
 		if rej := refusal(r); rej != "" {
-			fatalCode("internal", "receiver rejected message: %s", rej)
+			fatalResults = []map[string]interface{}{r}
+			fatalHint("internal", "the receiver did not store the message; send it again once the receiver can store it",
+				"receiver rejected message: %s", rej)
 		}
 		result := map[string]interface{}{
 			"target": target.String(),
@@ -5285,8 +5389,10 @@ func cmdSendMessage(args []string) {
 						if err != nil {
 							return time.Time{}, err
 						}
-						defer c.Close()
-						rr := sendOne(c, 1, false, func() (*dataexchange.Client, error) { return dataexchange.Dial(rd, target) })
+						rr, c := sendOne(c, 1, false, func() (*dataexchange.Client, error) { return dataexchange.Dial(rd, target) })
+						if c != nil {
+							_ = c.Close()
+						}
 						if e, failed := rr["error"].(string); failed {
 							return time.Time{}, errors.New(e)
 						}
@@ -5332,16 +5438,33 @@ func cmdSendMessage(args []string) {
 	} else if reuseConn {
 		// --reuse-conn: one dial shared across all N sends. Seq 0 pays dial
 		// cost; seqs 1+ skip it. Savings ≈ one relay RTT (~70ms) per msg.
+		// A connection whose ack was lost is gone: the messages after it go
+		// on the retry's connection, or on a new one.
 		cl := dialOnce()
 		tracef("dataexchange.Dial (shared)")
-		defer cl.Close()
+		defer func() {
+			if cl != nil {
+				_ = cl.Close()
+			}
+		}()
+		carried := false // cl carried an earlier message
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
-			result := sendOne(cl, i, i > 0, redial)
-			results = append(results, result)
-			if i < sendCount-1 {
+			if i > 0 {
 				time.Sleep(50 * time.Millisecond)
 			}
+			if cl == nil {
+				c, err := redial()
+				if err != nil {
+					results = append(results, dialFailed(i, err))
+					continue
+				}
+				cl, carried = c, false
+			}
+			var result map[string]interface{}
+			result, cl = sendOne(cl, i, carried, redial)
+			results = append(results, result)
+			carried = cl != nil
 		}
 		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
@@ -5356,12 +5479,26 @@ func cmdSendMessage(args []string) {
 		// baseline — measures true per-message cost including dial overhead.
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
-			cl := dialOnce()
-			result := sendOne(cl, i, false, redial)
-			results = append(results, result)
-			cl.Close()
-			if i < sendCount-1 {
+			if i > 0 {
 				time.Sleep(50 * time.Millisecond)
+			}
+			// The first dial fails the command, as for one message. A
+			// later one is recorded against its message, so the results
+			// still list the messages already delivered.
+			var c *dataexchange.Client
+			if i == 0 {
+				c = dialOnce()
+			} else {
+				var err error
+				if c, err = redial(); err != nil {
+					results = append(results, dialFailed(i, err))
+					continue
+				}
+			}
+			result, cl := sendOne(c, i, false, redial)
+			results = append(results, result)
+			if cl != nil {
+				_ = cl.Close()
 			}
 		}
 		failIfUndelivered(target.String(), results)
@@ -6869,17 +7006,19 @@ func cmdBench(args []string) {
 	}
 	defer conn.Close()
 
-	var recvTotal int
+	// The reader may still be running when the wait below gives up, so the
+	// count it keeps is atomic.
+	var recvTotal atomic.Int64
 	recvDone := make(chan struct{})
 	go func() {
 		defer close(recvDone)
 		buf := make([]byte, 65535)
-		for recvTotal < totalSize {
+		for recvTotal.Load() < int64(totalSize) {
 			n, err := conn.Read(buf)
 			if err != nil {
 				return
 			}
-			recvTotal += n
+			recvTotal.Add(int64(n))
 		}
 	}()
 
@@ -6906,34 +7045,53 @@ func cmdBench(args []string) {
 	// Waiting for the full echo to come back is the silent half of the
 	// benchmark — on a slow path it can run to --timeout with no output.
 	stopProgress := startWaitProgress(fmt.Sprintf("benchmarking %s", target))
+	timedOut := false
 	select {
 	case <-recvDone:
-		stopProgress()
 	case <-time.After(timeout):
-		stopProgress()
-		if !jsonOutput {
-			fmt.Printf("warning: receive timed out (got %s of %s)\n",
-				formatBytes(uint64(recvTotal)), formatBytes(uint64(totalSize)))
-		}
+		timedOut = true
 	}
+	stopProgress()
 	totalDuration := time.Since(start)
+	received := int(recvTotal.Load())
 
 	sendThroughput := float64(totalSize) / sendDuration.Seconds() / 1024 / 1024
-	totalThroughput := float64(totalSize) / totalDuration.Seconds() / 1024 / 1024
+	// The round trip carried what came back, which is less than was sent
+	// when the echo stopped short.
+	totalThroughput := float64(received) / totalDuration.Seconds() / 1024 / 1024
+	complete := received >= totalSize
 
-	if jsonOutput {
-		output(map[string]interface{}{
-			"target":            target.String(),
-			"sent_bytes":        sent,
-			"recv_bytes":        recvTotal,
-			"send_duration_ms":  float64(sendDuration.Milliseconds()),
-			"total_duration_ms": float64(totalDuration.Milliseconds()),
-			"send_mbps":         sendThroughput,
-			"total_mbps":        totalThroughput,
-		})
-	} else {
+	stats := map[string]interface{}{
+		"target":            target.String(),
+		"sent_bytes":        sent,
+		"recv_bytes":        received,
+		"send_duration_ms":  float64(sendDuration.Milliseconds()),
+		"total_duration_ms": float64(totalDuration.Milliseconds()),
+		"send_mbps":         sendThroughput,
+		"total_mbps":        totalThroughput,
+		"complete":          complete,
+	}
+	if !jsonOutput {
 		fmt.Printf("  Sent:     %s in %v (%.1f MB/s)\n", formatBytes(uint64(sent)), sendDuration.Round(time.Millisecond), sendThroughput)
-		fmt.Printf("  Echoed:   %s in %v (%.1f MB/s round-trip)\n", formatBytes(uint64(recvTotal)), totalDuration.Round(time.Millisecond), totalThroughput)
+		fmt.Printf("  Echoed:   %s in %v (%.1f MB/s round-trip)\n", formatBytes(uint64(received)), totalDuration.Round(time.Millisecond), totalThroughput)
+	}
+	// A partial echo is a failed benchmark, not a slow one: it used to be
+	// reported as "ok". The error carries the figures, as a failed
+	// send-message --count carries each message's result.
+	if !complete {
+		fatalResults = []map[string]interface{}{stats}
+		got := fmt.Sprintf("%s of %s", formatBytes(uint64(received)), formatBytes(uint64(totalSize)))
+		if timedOut {
+			fatalHint("timeout",
+				fmt.Sprintf("the path is slow or losing data: check `pilotctl ping %s`, or try a smaller size or a longer --timeout", target),
+				"%s echoed %s within --timeout %s", target, got, timeout)
+		}
+		fatalHint("connection_failed",
+			fmt.Sprintf("the echo stream ended early; check `pilotctl ping %s` and the daemon log", target),
+			"the echo stream from %s ended after %s", target, got)
+	}
+	if jsonOutput {
+		output(stats)
 	}
 }
 

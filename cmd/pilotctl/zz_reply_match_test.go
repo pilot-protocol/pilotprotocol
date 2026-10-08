@@ -181,15 +181,18 @@ const dxCutAck = "\x00cut"
 // dxReceiver turns the stream daemon's echo into a data-exchange receiver:
 // answer is called with each complete wire frame (its type and payload) the
 // client wrote and returns the acknowledgement text (or dxDropConnection).
+// Like a real daemon, it discards what is written to a connection it has
+// closed: the client's driver does not notice, and its writes "succeed".
 type dxReceiver struct {
 	mu     sync.Mutex
 	buf    map[uint32][]byte
+	closed map[uint32]bool
 	types  []uint32
 	frames []*dataexchange.Frame // decoded with the current library
 }
 
 func newDXReceiver(sd *streamDaemon, answer func(ftype uint32, payload []byte, decoded *dataexchange.Frame) string) *dxReceiver {
-	r := &dxReceiver{buf: map[uint32][]byte{}}
+	r := &dxReceiver{buf: map[uint32][]byte{}, closed: map[uint32]bool{}}
 	sd.on(tdCmdSend, func(frame []byte) [][]byte {
 		sd.sendCount.Add(1)
 		if len(frame) < 5 {
@@ -198,6 +201,9 @@ func newDXReceiver(sd *streamDaemon, answer func(ftype uint32, payload []byte, d
 		connID := binary.BigEndian.Uint32(frame[1:5])
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		if r.closed[connID] {
+			return nil
+		}
 		r.buf[connID] = append(r.buf[connID], frame[5:]...)
 		var out [][]byte
 		for {
@@ -227,6 +233,8 @@ func newDXReceiver(sd *streamDaemon, answer func(ftype uint32, payload []byte, d
 				closed[0] = tdCmdCloseOK
 				binary.BigEndian.PutUint32(closed[1:5], connID)
 				out = append(out, closed)
+				r.closed[connID] = true
+				delete(r.buf, connID)
 				break
 			}
 			var ack bytes.Buffer
@@ -1069,6 +1077,269 @@ func TestSendMessageSendsAgainWhenTheAckIsLost(t *testing.T) {
 			}
 		}
 	})
+}
+
+// ── --reuse-conn after a lost ack ─────────────────────────────────────────
+
+// dials is how many connections the client has dialled.
+func (sd *streamDaemon) dials() int {
+	sd.streamMu.Lock()
+	defer sd.streamMu.Unlock()
+	return len(sd.dialed)
+}
+
+// errorResults decodes the "results" in the --json error envelope a failed
+// command printed to stderr.
+func errorResults(t *testing.T, stderr string) []map[string]interface{} {
+	t.Helper()
+	var env struct {
+		Results []map[string]interface{} `json:"results"`
+	}
+	i := strings.Index(stderr, "{")
+	if i < 0 {
+		t.Fatalf("no error envelope in stderr:\n%s", stderr)
+	}
+	if err := json.Unmarshal([]byte(stderr[i:]), &env); err != nil {
+		t.Fatalf("error envelope: %v\n%s", err, stderr)
+	}
+	return env.Results
+}
+
+// The first message's ack is lost, so the shared connection is gone: no read
+// deadline is set, so the ack read failed because the connection ended, and
+// writes to it would still "succeed" (the driver only notices a local close)
+// and be dropped. The messages after it go on the retry's connection, which
+// is still open: two dials in all and one retry, and only the later messages
+// are reported as reused. Each of them used to be written into the dead
+// connection, lose its ack and be sent again on a new one.
+func TestSendMessageReuseConnContinuesOnTheRetrysConnection(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	calls := 0
+	rcv := newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+		if calls++; calls == 1 {
+			return dxDropConnection
+		}
+		return "ACK TEXT 5 bytes"
+	})
+
+	data := sendMessageJSON(t, "0:0000.0000.002A", "--data", "hello", "--count", "3", "--reuse-conn")
+	if n := sd.dials(); n != 2 {
+		t.Errorf("%d dials, want 2: the shared connection and the retry's", n)
+	}
+	if types, _ := rcv.seen(); len(types) != 4 {
+		t.Errorf("receiver got %d frames, want 4: the lost one, its retry and two more", len(types))
+	}
+	results, _ := data["results"].([]interface{})
+	if len(results) != 3 {
+		t.Fatalf("results = %v, want 3", data["results"])
+	}
+	for i, want := range []struct{ retried, reused bool }{{true, false}, {false, true}, {false, true}} {
+		r := results[i].(map[string]interface{})
+		if retried, _ := r["retried"].(bool); retried != want.retried || r["reused"] != want.reused || r["ack"] != "ACK TEXT 5 bytes" {
+			t.Errorf("message %d = %v, want retried=%v reused=%v", i, r, want.retried, want.reused)
+		}
+	}
+}
+
+// With --no-resend the message whose ack was lost is not sent again, and its
+// connection is gone: the next message goes on a new one. One message of
+// three is undelivered, where all three used to be.
+func TestSendMessageReuseConnRedialsAfterALostAckWithoutResend(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	fatalResults = nil
+	t.Cleanup(func() { fatalResults = nil })
+	calls := 0
+	newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+		if calls++; calls == 1 {
+			return dxDropConnection
+		}
+		return "ACK TEXT 5 bytes"
+	})
+
+	var stderr string
+	var f *trappedFatal
+	withJSON(func() {
+		_, stderr, f = runTrapped(t, func() {
+			cmdSendMessage([]string{"0:0000.0000.002A", "--data", "hello", "--count", "3", "--reuse-conn", "--no-resend"})
+		})
+	})
+	if f == nil || f.Code != "connection_failed" || !strings.HasPrefix(f.Message, "1 of 3 messages") {
+		t.Fatalf("send = %+v, want connection_failed for 1 of 3 messages", f)
+	}
+	if n := sd.dials(); n != 2 {
+		t.Errorf("%d dials, want 2: the shared connection and the one after it was lost", n)
+	}
+	results := errorResults(t, stderr)
+	if len(results) != 3 {
+		t.Fatalf("results = %v, want 3", results)
+	}
+	if _, acked := results[0]["ack"]; acked || results[0]["ack_error"] == nil || results[0]["retried"] != nil {
+		t.Errorf("message 0 = %v, want unacknowledged and not sent again", results[0])
+	}
+	for i, reused := range []bool{false, true} {
+		if r := results[i+1]; r["ack"] != "ACK TEXT 5 bytes" || r["reused"] != reused {
+			t.Errorf("message %d = %v, want acknowledged with reused=%v", i+1, r, reused)
+		}
+	}
+}
+
+// The new connection for the message after a lost one cannot be dialled:
+// that message fails with the reason, and the one after it dials again.
+func TestSendMessageReuseConnReportsAFailedRedialAndGoesOn(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	fatalResults = nil
+	t.Cleanup(func() { fatalResults = nil })
+	sd.mu.Lock()
+	accept := sd.handlers[tdCmdDial]
+	sd.mu.Unlock()
+	var attempts atomic.Int32
+	sd.on(tdCmdDial, func(frame []byte) [][]byte {
+		if attempts.Add(1) == 2 {
+			return [][]byte{append([]byte{tdCmdError, 0, 1}, "dial timeout"...)}
+		}
+		return accept(frame)
+	})
+	calls := 0
+	newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+		if calls++; calls == 1 {
+			return dxDropConnection
+		}
+		return "ACK TEXT 5 bytes"
+	})
+
+	var stderr string
+	var f *trappedFatal
+	withJSON(func() {
+		_, stderr, f = runTrapped(t, func() {
+			cmdSendMessage([]string{"0:0000.0000.002A", "--data", "hello", "--count", "3", "--reuse-conn", "--no-resend"})
+		})
+	})
+	if f == nil || !strings.HasPrefix(f.Message, "2 of 3 messages") {
+		t.Fatalf("send = %+v, want 2 of 3 messages undelivered", f)
+	}
+	results := errorResults(t, stderr)
+	if len(results) != 3 {
+		t.Fatalf("results = %v, want 3", results)
+	}
+	if e, _ := results[1]["error"].(string); !strings.Contains(e, "cannot connect") || !strings.Contains(e, "dial timeout") {
+		t.Errorf("message 1 = %v, want the dial failure", results[1])
+	}
+	if r := results[2]; r["ack"] != "ACK TEXT 5 bytes" || r["reused"] != false {
+		t.Errorf("message 2 = %v, want acknowledged on a new connection", r)
+	}
+}
+
+// Without --reuse-conn every message dials its own connection. One whose
+// dial fails is recorded against that message, as with --reuse-conn: the run
+// used to exit at once with no results, losing the message IDs of the ones
+// already delivered, and a caller sending them all again duplicated those.
+func TestSendMessageCountReportsAFailedDialAndGoesOn(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	fatalResults = nil
+	t.Cleanup(func() { fatalResults = nil })
+	sd.mu.Lock()
+	accept := sd.handlers[tdCmdDial]
+	sd.mu.Unlock()
+	var attempts atomic.Int32
+	sd.on(tdCmdDial, func(frame []byte) [][]byte {
+		if attempts.Add(1) == 2 {
+			return [][]byte{append([]byte{tdCmdError, 0, 1}, "dial timeout"...)}
+		}
+		return accept(frame)
+	})
+	newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string { return "ACK TEXT 5 bytes" })
+
+	var stderr string
+	var f *trappedFatal
+	withJSON(func() {
+		_, stderr, f = runTrapped(t, func() {
+			cmdSendMessage([]string{"0:0000.0000.002A", "--data", "hello", "--count", "3", "--no-resend"})
+		})
+	})
+	if f == nil || f.Code != "connection_failed" || !strings.HasPrefix(f.Message, "1 of 3 messages") {
+		t.Fatalf("send = %+v, want connection_failed for 1 of 3 messages", f)
+	}
+	results := errorResults(t, stderr)
+	if len(results) != 3 {
+		t.Fatalf("results = %v, want 3", results)
+	}
+	for _, i := range []int{0, 2} {
+		if r := results[i]; r["ack"] != "ACK TEXT 5 bytes" || r["message_id"] == nil {
+			t.Errorf("message %d = %v, want acknowledged with its message_id", i, r)
+		}
+	}
+	if e, _ := results[1]["error"].(string); !strings.Contains(e, "cannot connect") || !strings.Contains(e, "dial timeout") {
+		t.Errorf("message 1 = %v, want the dial failure", results[1])
+	}
+}
+
+// A single message that fails says which message it was: the error envelope
+// carries its result, message_id included, as a --count run's does, so the
+// caller can look for it in the receiver's inbox or for a reply naming it.
+func TestSendMessageFailureReportsTheMessageID(t *testing.T) {
+	for name, tc := range map[string]struct {
+		args   []string
+		answer func(calls int) string
+		check  func(r map[string]interface{}) bool
+	}{
+		"not acknowledged": {
+			args:   []string{"--no-resend"},
+			answer: func(int) string { return dxDropConnection },
+			check:  func(r map[string]interface{}) bool { return r["ack_error"] != nil },
+		},
+		"retry not acknowledged": {
+			answer: func(calls int) string {
+				if calls == 1 {
+					return dxDropConnection
+				}
+				return dxCutAck
+			},
+			check: func(r map[string]interface{}) bool { return r["retried"] == true && r["ack_error"] != nil },
+		},
+		"refused by the receiver": {
+			answer: func(int) string { return "ERR TEXT save failed: no space left on device" },
+			check: func(r map[string]interface{}) bool {
+				return r["ack"] == "ERR TEXT save failed: no space left on device"
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sd := newStreamDaemon(t)
+			sd.useDaemonNoRegistry(t)
+			// fatalResults is a package global; one left by another test
+			// would pass for this one's.
+			fatalResults = nil
+			t.Cleanup(func() { fatalResults = nil })
+			calls := 0
+			newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string {
+				calls++
+				return tc.answer(calls)
+			})
+
+			var stderr string
+			var f *trappedFatal
+			withJSON(func() {
+				_, stderr, f = runTrapped(t, func() {
+					cmdSendMessage(append([]string{"0:0000.0000.002A", "--data", "hello"}, tc.args...))
+				})
+			})
+			if f == nil {
+				t.Fatal("send succeeded")
+			}
+			results := errorResults(t, stderr)
+			if len(results) != 1 {
+				t.Fatalf("error envelope results = %v, want the message's result\n%s", results, stderr)
+			}
+			r := results[0]
+			if id, _ := r["message_id"].(string); !dataexchange.ValidMessageID(id) || !tc.check(r) {
+				t.Errorf("result = %v", r)
+			}
+		})
+	}
 }
 
 // A message whose first ack was lost and whose retry was acknowledged was

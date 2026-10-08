@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pilot-protocol/common/driver"
 	"github.com/pilot-protocol/common/ipcutil"
 	"github.com/pilot-protocol/common/protocol"
 )
@@ -418,8 +420,97 @@ func TestCmdDgramReportsTheDaemonsRefusal(t *testing.T) {
 	if failure == nil {
 		t.Fatal("dgram succeeded although the daemon refused the send")
 	}
-	if failure.Code != "connection_failed" || !strings.Contains(failure.Message, "not allowed by network 0 policy") || strings.Count(failure.Message, "sendto:") != 1 {
-		t.Errorf("failure = %+v, want connection_failed naming the daemon's reason", failure)
+	if failure.Code != "permission_denied" || !strings.Contains(failure.Message, "not allowed by network 0 policy") || strings.Count(failure.Message, "sendto:") != 1 {
+		t.Errorf("failure = %+v, want permission_denied naming the daemon's reason", failure)
+	}
+}
+
+// Each kind of refusal gets the code that says whether sending again can
+// help. Every one of them used to be connection_failed, which the error-code
+// list calls retryable.
+func TestDgramErrorCode(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{errors.New("daemon: sendto: port 9999 not allowed by network 0 policy"), "permission_denied"},
+		{errors.New("daemon: sendto: marshal: payload too large: 70000 bytes (max 65535)"), "invalid_argument"},
+		{errors.New("daemon: sendto: write udp [::]:4000->192.0.2.1:4000: sendto: message too long"), "invalid_argument"},
+		{errors.New("ipc frame too large: 1048600 bytes"), "invalid_argument"},
+		{errors.New("broadcast address requires admin token: use Driver.Broadcast"), "invalid_argument"},
+		{errors.New("daemon: sendto: broadcast address requires admin token: use BroadcastDatagram"), "invalid_argument"},
+		{errors.New("daemon: sendto: resolve node 42: node 42: not found"), "not_found"},
+		{errors.New("daemon: sendto: resolve node 42: dial tcp 192.0.2.1:9000: connection refused"), "connection_failed"},
+		{errors.New("daemon: sendto: node 42 has no real address"), "connection_failed"},
+		{errors.New("daemon: sendto: no tunnel to node 42"), "connection_failed"},
+		{errors.New("daemon: sendto: pending queue full: newest packet dropped to preserve ordered prefix while key exchange pending"), "connection_failed"},
+		{errors.New("daemon: sendto: too many pending key exchanges"), "connection_failed"},
+		{errors.New("daemon: sendto: ephemeral ports exhausted"), "connection_failed"},
+		{errors.New("daemon disconnected"), "connection_failed"},
+		{driver.ErrConfirmTimeout, "timeout"},
+		{driver.ErrConfirmQueueTimeout, "timeout"},
+		{fmt.Errorf("send: %w", driver.ErrConfirmQueueTimeout), "timeout"},
+	} {
+		if got := dgramErrorCode(tc.err); got != tc.want {
+			t.Errorf("dgramErrorCode(%q) = %s, want %s", tc.err, got, tc.want)
+		}
+	}
+}
+
+// Through cmdDgram, with the daemon's answer: the code follows the reason.
+func TestCmdDgramErrorCodes(t *testing.T) {
+	for refusal, want := range map[string]string{
+		"sendto: port 7 not allowed by network 1 policy":              "permission_denied",
+		"sendto: marshal: payload too large: 65536 bytes (max 65535)": "invalid_argument",
+		"sendto: resolve node 42: node 42: not found":                 "not_found",
+		"sendto: no tunnel to node 42":                                "connection_failed",
+	} {
+		t.Run(want, func(t *testing.T) {
+			sd := newStreamDaemon(t)
+			sd.useDaemonNoRegistry(t)
+			sd.dgramAnswer.Store(&refusal)
+
+			var failure *trappedFatal
+			withJSON(func() {
+				_, _, failure = runTrapped(t, func() {
+					cmdDgram([]string{"0:0000.0000.002A", "9999", "--data", "udp-msg"})
+				})
+			})
+			if failure == nil || failure.Code != want || !strings.Contains(failure.Message, refusal) {
+				t.Errorf("failure = %+v, want %s with the daemon's reason", failure, want)
+			}
+		})
+	}
+}
+
+// The daemon accepts at most 65535 bytes. A larger --data is refused before
+// the daemon is contacted; it used to go to the daemon, which refused it as
+// connection_failed.
+func TestCmdDgramRefusesAnOversizeDatagram(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	var failure *trappedFatal
+	withJSON(func() {
+		_, _, failure = runTrapped(t, func() {
+			cmdDgram([]string{"0:0000.0000.002A", "9999", "--data", strings.Repeat("x", 65536)})
+		})
+	})
+	if failure == nil || failure.Code != "invalid_argument" || !strings.Contains(failure.Message, "65535") {
+		t.Fatalf("failure = %+v, want invalid_argument naming the limit", failure)
+	}
+	sd.mu.Lock()
+	contacted := len(sd.received)
+	sd.mu.Unlock()
+	if contacted != 0 {
+		t.Errorf("the daemon got %d requests before the datagram was refused", contacted)
+	}
+
+	// The largest payload the daemon accepts is passed on to it.
+	out := captureStdout(t, func() {
+		withJSON(func() { cmdDgram([]string{"0:0000.0000.002A", "9999", "--data", strings.Repeat("x", 65535)}) })
+	})
+	if !strings.Contains(out, `"bytes":65535`) || sd.dgramCount.Load() != 1 {
+		t.Errorf("65535-byte datagram: %s (daemon saw %d)", out, sd.dgramCount.Load())
 	}
 }
 
@@ -797,6 +888,88 @@ func TestCmdBenchSmall(t *testing.T) {
 	data := env["data"].(map[string]interface{})
 	if data["sent_bytes"].(float64) < 1 {
 		t.Errorf("sent_bytes = %v", data["sent_bytes"])
+	}
+	if data["complete"] != true || data["recv_bytes"] != data["sent_bytes"] {
+		t.Errorf("result = %v, want complete with everything echoed", data)
+	}
+}
+
+// echoUpTo makes the daemon echo only the first n bytes written to each
+// connection. With end, it then ends the stream, as a peer that closes it
+// does; without, the stream stays open and silent.
+func echoUpTo(sd *streamDaemon, n int, end bool) {
+	var mu sync.Mutex
+	echoed := map[uint32]int{}
+	sd.on(tdCmdSend, func(frame []byte) [][]byte {
+		if len(frame) < 5 {
+			return nil
+		}
+		connID, payload := frame[1:5], frame[5:]
+		mu.Lock()
+		defer mu.Unlock()
+		id := binary.BigEndian.Uint32(connID)
+		left := n - echoed[id]
+		if left <= 0 {
+			return nil
+		}
+		if len(payload) > left {
+			payload = payload[:left]
+		}
+		echoed[id] += len(payload)
+		out := [][]byte{append(append([]byte{tdCmdRecv}, connID...), payload...)}
+		if end && echoed[id] == n {
+			out = append(out, append([]byte{tdCmdCloseOK}, connID...))
+		}
+		return out
+	})
+}
+
+// The echo stops short of what was sent. bench used to print "status":"ok"
+// with 4096 of 10485 bytes received and a round-trip rate computed from the
+// full size. It now fails, with the partial figures in the error: timeout
+// when --timeout cut it, connection_failed when the echo stream ended.
+func TestCmdBenchFailsOnAPartialEcho(t *testing.T) {
+	for name, tc := range map[string]struct {
+		end  bool
+		code string
+	}{
+		"cut by --timeout":   {false, "timeout"},
+		"echo stream closed": {true, "connection_failed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sd := newStreamDaemon(t)
+			sd.useDaemonNoRegistry(t)
+			echoUpTo(sd, 4096, tc.end)
+			fatalResults = nil
+			t.Cleanup(func() { fatalResults = nil })
+
+			var stderr string
+			var f *trappedFatal
+			withJSON(func() {
+				_, stderr, f = runTrapped(t, func() { cmdBench([]string{"0:0000.0000.002A", "0.01", "--timeout", "300ms"}) })
+			})
+			if f == nil || f.Code != tc.code || !strings.Contains(f.Message, "4.0 KB of 10.2 KB") {
+				t.Fatalf("bench = %+v, want %s naming what came back", f, tc.code)
+			}
+			results := errorResults(t, stderr)
+			if len(results) != 1 {
+				t.Fatalf("error results = %v, want the partial figures", results)
+			}
+			r := results[0]
+			if r["complete"] != false || r["sent_bytes"] != 10485.0 || r["recv_bytes"] != 4096.0 {
+				t.Fatalf("result = %v", r)
+			}
+			// The round-trip rate is what came back over the time it took
+			// (measurable here only when the wait ran to --timeout).
+			ms, _ := r["total_duration_ms"].(float64)
+			mbps, _ := r["total_mbps"].(float64)
+			if want := 4096.0 / (ms / 1000) / 1024 / 1024; ms >= 100 && (mbps < want*0.95 || mbps > want*1.05) {
+				t.Errorf("total_mbps = %v, want about %v (4096 bytes in %v ms)", mbps, want, ms)
+			}
+			if tc.code == "timeout" && ms < 300 {
+				t.Errorf("total_duration_ms = %v, want at least the 300ms --timeout", ms)
+			}
+		})
 	}
 }
 
