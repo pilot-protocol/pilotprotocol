@@ -4,6 +4,7 @@ package routing
 
 import (
 	"net"
+	"time"
 )
 
 // SetRelayPeer marks a peer as needing relay through the beacon. Pinning
@@ -177,6 +178,33 @@ func (m *Manager) PeerStateEntries() int {
 	return len(m.relayPeers) + len(m.relayPinned) + len(m.lastOutboundSend) +
 		len(m.firstOutboundSend) + len(m.sendErrCount) + len(m.lastDirectRecv) +
 		len(m.blackholeMissCount) + len(m.directClearCount)
+}
+
+// PeerIDs lists every node this manager holds per-peer state for.
+func (m *Manager) PeerIDs() []uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	seen := make(map[uint32]struct{}, len(m.lastOutboundSend))
+	for _, t := range []map[uint32]time.Time{m.lastOutboundSend, m.firstOutboundSend, m.lastDirectRecv} {
+		for id := range t {
+			seen[id] = struct{}{}
+		}
+	}
+	for _, b := range []map[uint32]bool{m.relayPeers, m.relayPinned} {
+		for id := range b {
+			seen[id] = struct{}{}
+		}
+	}
+	for _, c := range []map[uint32]int{m.sendErrCount, m.blackholeMissCount, m.directClearCount} {
+		for id := range c {
+			seen[id] = struct{}{}
+		}
+	}
+	ids := make([]uint32, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // RemovePeer wipes per-peer L4 state.

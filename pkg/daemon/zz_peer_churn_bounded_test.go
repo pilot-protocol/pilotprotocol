@@ -244,3 +244,46 @@ func TestPendingQueueForSilentPeerDoesNotOutliveIt(t *testing.T) {
 		t.Fatal("forgetPeer left the tunnel entry")
 	}
 }
+
+// Per-peer state for a node with no tunnel entry is reaped too: a path
+// reset that cannot re-resolve its peer leaves the relay flag it restored
+// (and whatever else the peer had), which the loop over tunnel peers never
+// visits. State with recent contact stays; state with none recorded gets
+// peerReapIdleTimeout from when the sweep first finds it.
+func TestReaperForgetsOrphanedPeerState(t *testing.T) {
+	d := churnDaemon(t)
+	now := time.Now()
+	const flagOnly, longQuiet, recent = 0x00500001, 0x00500002, 0x00500003
+	d.tunnels.SetRelayPeer(flagOnly, true) // what a failed path reset leaves
+	d.tunnels.SetRelayPeer(longQuiet, true)
+	d.tunnels.routing.RecordOutboundSend(longQuiet, now.Add(-10*time.Minute))
+	d.tunnels.kx.SetLastInboundDecryptForTest(longQuiet, now.Add(-10*time.Minute))
+	d.tunnels.routing.RecordOutboundSend(recent, now)
+
+	d.reapStalePeers()
+	if d.tunnels.IsRelayPeer(longQuiet) {
+		t.Fatal("state for a node with no tunnel, quiet for 10 minutes, was kept")
+	}
+	if _, ok := d.tunnels.LastInboundDecrypt(longQuiet); ok {
+		t.Fatal("key-exchange state for the quiet orphan was kept")
+	}
+	if !d.tunnels.IsRelayPeer(flagOnly) {
+		t.Fatal("an orphan with no recorded contact was dropped the first time it was seen")
+	}
+	if _, ok := d.tunnels.LastOutboundSend(recent); !ok {
+		t.Fatal("state with contact just now was dropped")
+	}
+
+	// peerReapIdleTimeout after it was first seen, the flag-only orphan goes.
+	d.orphanSeen[flagOnly] = now.Add(-peerReapIdleTimeout - time.Second)
+	d.reapStalePeers()
+	if d.tunnels.IsRelayPeer(flagOnly) {
+		t.Fatal("an orphaned relay flag outlived peerReapIdleTimeout")
+	}
+	if ids := d.tunnels.routing.PeerIDs(); len(ids) != 1 || ids[0] != recent {
+		t.Fatalf("routing holds state for %v, want only the recent node %d", ids, recent)
+	}
+	if len(d.orphanSeen) != 0 {
+		t.Fatalf("orphanSeen still holds %d entries", len(d.orphanSeen))
+	}
+}

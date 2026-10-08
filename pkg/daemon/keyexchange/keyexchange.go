@@ -753,6 +753,39 @@ func (m *Manager) PeerStateEntries() int {
 	return n
 }
 
+// PeerIDs lists every node this manager holds per-peer state for, except
+// rekeyGaveUp, which expires on its own.
+func (m *Manager) PeerIDs() []uint32 {
+	seen := map[uint32]struct{}{}
+	m.pubKeysMu.RLock()
+	for id := range m.peerPubKeys {
+		seen[id] = struct{}{}
+	}
+	for id := range m.negPubKeys {
+		seen[id] = struct{}{}
+	}
+	m.pubKeysMu.RUnlock()
+	m.rkPendingMu.Lock()
+	for id := range m.pendingRekey {
+		seen[id] = struct{}{}
+	}
+	for id := range m.lastInboundDecrypt {
+		seen[id] = struct{}{}
+	}
+	for id := range m.lastKeyExchangeReply {
+		seen[id] = struct{}{}
+	}
+	for id := range m.keyRequestDue {
+		seen[id] = struct{}{}
+	}
+	m.rkPendingMu.Unlock()
+	ids := make([]uint32, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // RemovePeer wipes per-peer L5 state (called from TunnelManager.RemovePeer).
 func (m *Manager) RemovePeer(nodeID uint32) {
 	m.pubKeysMu.Lock()

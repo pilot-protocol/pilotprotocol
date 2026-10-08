@@ -579,6 +579,11 @@ type Daemon struct {
 	netPolicyMu sync.RWMutex
 	netPolicies map[uint16][]uint16
 
+	// orphanSeen records when reapOrphanedPeerState first found per-peer
+	// state, with no contact ever recorded, for a node with no tunnel
+	// entry. Only the idle sweep (reapStalePeers) touches it.
+	orphanSeen map[uint32]time.Time
+
 	// gaveUpResetMu guards lastGaveUpReset, the per-peer cooldown for
 	// rekey-gave-up-triggered path resets (onRekeyGaveUp).
 	gaveUpResetMu   sync.Mutex
@@ -6451,14 +6456,30 @@ func (d *Daemon) restoreRegistryState(nodeID uint32, trust bool) bool {
 	return complete
 }
 
+// peerReapIdleTimeout is how long a peer with no open connection may go
+// without contact before reapStalePeers forgets it.
+const peerReapIdleTimeout = 5 * time.Minute
+
+// lastPeerContact is the latest frame either way with a peer: our last
+// send, its last direct packet, or any authenticated inbound frame (relayed
+// ones too, which LastDirectRecv skips). Zero when none was ever recorded.
+func (d *Daemon) lastPeerContact(nodeID uint32) time.Time {
+	latest := d.tunnels.LastDirectRecv(nodeID)
+	if lastOutbound, ok := d.tunnels.LastOutboundSend(nodeID); ok && lastOutbound.After(latest) {
+		latest = lastOutbound
+	}
+	if lastIn, ok := d.tunnels.LastInboundDecrypt(nodeID); ok && lastIn.After(latest) {
+		latest = lastIn
+	}
+	return latest
+}
+
 // reapStalePeers removes tunnel peers that have no active connections
 // and haven't been contacted for peerReapIdleTimeout. Called periodically
 // from idleSweepLoop to prevent unbounded growth of per-peer maps
 // (tm.peers, routing relay/blackhole/send-err maps, keyexchange
 // pubkey/rekey state) in long-running daemons with peer churn.
 func (d *Daemon) reapStalePeers() {
-	const peerReapIdleTimeout = 5 * time.Minute
-
 	active := d.ports.ActiveNodeIDs()
 	now := time.Now()
 	peers := d.tunnels.PeerList()
@@ -6468,20 +6489,10 @@ func (d *Daemon) reapStalePeers() {
 			continue // has active connection — keep
 		}
 
-		lastDirect := d.tunnels.LastDirectRecv(p.NodeID)
-		lastOutbound, ok := d.tunnels.LastOutboundSend(p.NodeID)
-
-		// Find the latest known contact. Any authenticated inbound frame
-		// counts, relayed ones too (LastDirectRecv skips those): a peer
-		// still talking to us is not stale, and dropping it would only
-		// make its next frame trigger a rekey.
-		latest := lastDirect
-		if ok && lastOutbound.After(latest) {
-			latest = lastOutbound
-		}
-		if lastIn, ok := d.tunnels.LastInboundDecrypt(p.NodeID); ok && lastIn.After(latest) {
-			latest = lastIn
-		}
+		// Any authenticated inbound frame counts as contact, relayed ones
+		// too: a peer still talking to us is not stale, and dropping it
+		// would only make its next frame trigger a rekey.
+		latest := d.lastPeerContact(p.NodeID)
 
 		if latest.IsZero() {
 			// Never contacted — fresh peer entry, don't reap yet.
@@ -6493,6 +6504,57 @@ func (d *Daemon) reapStalePeers() {
 				"last_contact", latest.Round(time.Second),
 				"has_encryption", p.Encrypted)
 			d.forgetPeer(p.NodeID)
+		}
+	}
+	d.reapOrphanedPeerState(now, active)
+}
+
+// reapOrphanedPeerState forgets routing, key-exchange and session state
+// held for a node that has no tunnel entry, so the loop above never sees
+// it. A path reset leaves such state when the peer cannot be re-resolved:
+// it removes the peer, puts its relay flag back for the recovery PILA, and
+// re-adds the peer only if the registry answers. The orphaned relay flag
+// then kept the node in the 15 s direct-upgrade loop and counted against
+// MaxRelayPeers for the daemon's lifetime (a local soak: 875 relay flags
+// for 381 peers after 23 minutes). State with no contact recorded at all
+// is given peerReapIdleTimeout from when this sweep first finds it.
+func (d *Daemon) reapOrphanedPeerState(now time.Time, active map[uint32]bool) {
+	ids := map[uint32]struct{}{}
+	for _, id := range d.tunnels.routing.PeerIDs() {
+		ids[id] = struct{}{}
+	}
+	for _, id := range d.tunnels.kx.PeerIDs() {
+		ids[id] = struct{}{}
+	}
+	for _, id := range d.tunnels.envelope.PeerIDs() {
+		ids[id] = struct{}{}
+	}
+	if d.orphanSeen == nil {
+		d.orphanSeen = make(map[uint32]time.Time)
+	}
+	for id := range d.orphanSeen {
+		if _, ok := ids[id]; !ok {
+			delete(d.orphanSeen, id)
+		}
+	}
+	for id := range ids {
+		if active[id] || d.tunnels.HasPeer(id) {
+			delete(d.orphanSeen, id)
+			continue
+		}
+		latest := d.lastPeerContact(id)
+		if latest.IsZero() {
+			first, seen := d.orphanSeen[id]
+			if !seen {
+				d.orphanSeen[id] = now
+				continue
+			}
+			latest = first
+		}
+		if now.Sub(latest) > peerReapIdleTimeout {
+			slog.Debug("reaping orphaned peer state", "node_id", id, "last_contact", latest.Round(time.Second))
+			d.forgetPeer(id)
+			delete(d.orphanSeen, id)
 		}
 	}
 }
@@ -6677,6 +6739,11 @@ func (d *Daemon) relayProbeLoop() {
 				if idle(nodeID) {
 					// An upgrade costs a registry lookup, a beacon punch
 					// and five probes; nobody is using this path.
+					continue
+				}
+				if !d.tunnels.HasPeer(nodeID) {
+					// A relay flag with no tunnel behind it (see
+					// reapOrphanedPeerState): no session to upgrade.
 					continue
 				}
 				go d.tryDirectUpgrade(nodeID)

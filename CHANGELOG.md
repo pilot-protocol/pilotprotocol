@@ -374,6 +374,14 @@ Detailed per-release notes are on the
   peers. The reset now runs only for a peer with an open connection or
   application traffic in the last 2 minutes. A path reset also keeps the
   record of when the peer was last used.
+- **State left behind for a node with no tunnel is reaped too.** A path
+  reset that could not re-resolve its peer left the peer's relay flag (and
+  whatever else it had) with no tunnel entry, which the stale-peer reaper,
+  walking tunnel peers, never visited: the flag kept the node in the 15 s
+  direct-upgrade loop and counted against the 4,096 relay peers a daemon
+  admits, for as long as the daemon ran. Such state now goes 5 minutes
+  after the last frame with the node, and the upgrade loop skips nodes with
+  no tunnel.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps
