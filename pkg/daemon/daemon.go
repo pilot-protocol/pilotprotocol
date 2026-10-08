@@ -579,6 +579,10 @@ type Daemon struct {
 	netPolicyMu sync.RWMutex
 	netPolicies map[uint16][]uint16
 
+	// upgradeInFlight holds the peers with a direct-upgrade attempt
+	// running (nodeID → struct{}); see relayProbeTick.
+	upgradeInFlight sync.Map
+
 	// orphanSeen records when reapOrphanedPeerState first found per-peer
 	// state, with no contact ever recorded, for a node with no tunnel
 	// entry. Only the idle sweep (reapStalePeers) touches it.
@@ -6734,21 +6738,43 @@ func (d *Daemon) relayProbeLoop() {
 		case <-d.stopCh:
 			return
 		case <-ticker.C:
-			idle := d.tunnels.idleFilter(time.Now())
-			for _, nodeID := range d.tunnels.RelayPeerIDs() {
-				if idle(nodeID) {
-					// An upgrade costs a registry lookup, a beacon punch
-					// and five probes; nobody is using this path.
-					continue
-				}
-				if !d.tunnels.HasPeer(nodeID) {
-					// A relay flag with no tunnel behind it (see
-					// reapOrphanedPeerState): no session to upgrade.
-					continue
-				}
-				go d.tryDirectUpgrade(nodeID)
-			}
+			d.relayProbeTick(time.Now())
 		}
+	}
+}
+
+// directUpgradePeer runs one direct-upgrade attempt; tests swap it.
+var directUpgradePeer = func(d *Daemon, nodeID uint32) { d.tryDirectUpgrade(nodeID) }
+
+// relayProbeTick starts a direct-upgrade attempt for each relayed peer in
+// use, unless one for that peer is still running. An attempt that has to
+// resolve the peer waits for the registry, and with the registry slow
+// (or a pooled connection half-open) a new attempt every
+// RelayProbeInterval stacked up behind the old ones: goroutines grew with
+// how long the registry stayed slow, not with the number of peers, and Go
+// keeps a goroutine's descriptor for the life of the process, so the heap
+// stayed up after the backlog drained. With the guard, at most one attempt
+// per peer waits.
+func (d *Daemon) relayProbeTick(now time.Time) {
+	idle := d.tunnels.idleFilter(now)
+	for _, nodeID := range d.tunnels.RelayPeerIDs() {
+		if idle(nodeID) {
+			// An upgrade costs a registry lookup, a beacon punch
+			// and five probes; nobody is using this path.
+			continue
+		}
+		if !d.tunnels.HasPeer(nodeID) {
+			// A relay flag with no tunnel behind it (see
+			// reapOrphanedPeerState): no session to upgrade.
+			continue
+		}
+		if _, running := d.upgradeInFlight.LoadOrStore(nodeID, struct{}{}); running {
+			continue
+		}
+		go func(nodeID uint32) {
+			defer d.upgradeInFlight.Delete(nodeID)
+			directUpgradePeer(d, nodeID)
+		}(nodeID)
 	}
 }
 
@@ -6778,9 +6804,11 @@ func (d *Daemon) tryDirectUpgrade(nodeID uint32) {
 		if rc == nil {
 			return
 		}
-		r, err := withRegistryDeadline(registryCallDeadline, func() (map[string]interface{}, error) {
-			return rc.Resolve(nodeID, d.NodeID())
-		})
+		// Waited for in full, not cut off at registryCallDeadline: this
+		// runs in its own goroutine, and relayProbeTick starts no other
+		// attempt for the peer until this one returns. Cutting it off left
+		// the call running anyway, and the next tick added another.
+		r, err := rc.Resolve(nodeID, d.NodeID())
 		if err != nil {
 			return
 		}

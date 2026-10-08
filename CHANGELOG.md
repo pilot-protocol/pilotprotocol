@@ -382,6 +382,15 @@ Detailed per-release notes are on the
   admits, for as long as the daemon ran. Such state now goes 5 minutes
   after the last frame with the node, and the upgrade loop skips nodes with
   no tunnel.
+- **A slow registry no longer piles up goroutines.** Every 15 s the daemon
+  tries to move each relayed peer to a direct path, and an attempt that
+  must resolve the peer waits for the registry. It gave up waiting after
+  8 s but left the call running, and the next round started another, so
+  while the registry was slow the waiting calls grew by one per relayed
+  peer every 15 s. A local soak test reached 21,000 goroutines, and since
+  Go keeps a goroutine's descriptor for the life of the process, the heap
+  stayed ~30 MB higher afterwards. A peer now has at most one attempt
+  running.
 - **The tunnel socket asks the kernel for 4 MB buffers** in each direction
   instead of the default (about 200 KB on Linux). Every tunnel shares the one
   socket, and several streams sending at once overflowed it. The kernel caps

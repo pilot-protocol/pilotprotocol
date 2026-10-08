@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"net"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -285,5 +286,56 @@ func TestReaperForgetsOrphanedPeerState(t *testing.T) {
 	}
 	if len(d.orphanSeen) != 0 {
 		t.Fatalf("orphanSeen still holds %d entries", len(d.orphanSeen))
+	}
+}
+
+// While a peer's direct-upgrade attempt is still running (its registry
+// resolve is waiting on a slow registry), later ticks start no other for
+// it: attempts are bounded by relayed peers, not by how long the registry
+// stays slow. Before, every tick added one per relayed peer.
+func TestRelayProbeTickRunsOneUpgradePerPeer(t *testing.T) {
+	release := make(chan struct{})
+	var running, started atomic.Int32
+	prev := directUpgradePeer
+	directUpgradePeer = func(_ *Daemon, _ uint32) {
+		started.Add(1)
+		running.Add(1)
+		<-release // a registry that does not answer
+		running.Add(-1)
+	}
+	t.Cleanup(func() { directUpgradePeer = prev })
+
+	d := churnDaemon(t)
+	const peers = 25
+	addr := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 10), Port: 4000}
+	for i := uint32(0); i < peers; i++ {
+		id := 0x00600000 + i
+		d.tunnels.AddPeer(id, addr)
+		d.tunnels.SetRelayPeer(id, true)
+		d.tunnels.noteAppActivity(id) // in use
+	}
+	for tick := 0; tick < 8; tick++ { // two minutes of RelayProbeInterval ticks
+		d.relayProbeTick(time.Now())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for running.Load() < peers && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := started.Load(); got != peers {
+		t.Fatalf("%d upgrade attempts after 8 ticks with the registry stuck; want one per relayed peer (%d)", got, peers)
+	}
+	close(release)
+	deadline = time.Now().Add(2 * time.Second)
+	for running.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Once they finish, the next tick tries again.
+	d.relayProbeTick(time.Now())
+	deadline = time.Now().Add(2 * time.Second)
+	for started.Load() < 2*peers && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := started.Load(); got != 2*peers {
+		t.Fatalf("after the attempts finished, a tick started %d more; want %d", got-peers, peers)
 	}
 }
