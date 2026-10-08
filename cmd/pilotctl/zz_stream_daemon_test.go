@@ -483,7 +483,7 @@ func TestCmdDgramErrorCodes(t *testing.T) {
 	}
 }
 
-// A datagram carries at most 65535 bytes. A larger --data is refused before
+// The daemon accepts at most 65535 bytes. A larger --data is refused before
 // the daemon is contacted; it used to go to the daemon, which refused it as
 // connection_failed.
 func TestCmdDgramRefusesAnOversizeDatagram(t *testing.T) {
@@ -505,7 +505,7 @@ func TestCmdDgramRefusesAnOversizeDatagram(t *testing.T) {
 		t.Errorf("the daemon got %d requests before the datagram was refused", contacted)
 	}
 
-	// The largest datagram is sent.
+	// The largest payload the daemon accepts is passed on to it.
 	out := captureStdout(t, func() {
 		withJSON(func() { cmdDgram([]string{"0:0000.0000.002A", "9999", "--data", strings.Repeat("x", 65535)}) })
 	})

@@ -1232,6 +1232,51 @@ func TestSendMessageReuseConnReportsAFailedRedialAndGoesOn(t *testing.T) {
 	}
 }
 
+// Without --reuse-conn every message dials its own connection. One whose
+// dial fails is recorded against that message, as with --reuse-conn: the run
+// used to exit at once with no results, losing the message IDs of the ones
+// already delivered, and a caller sending them all again duplicated those.
+func TestSendMessageCountReportsAFailedDialAndGoesOn(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	fatalResults = nil
+	t.Cleanup(func() { fatalResults = nil })
+	sd.mu.Lock()
+	accept := sd.handlers[tdCmdDial]
+	sd.mu.Unlock()
+	var attempts atomic.Int32
+	sd.on(tdCmdDial, func(frame []byte) [][]byte {
+		if attempts.Add(1) == 2 {
+			return [][]byte{append([]byte{tdCmdError, 0, 1}, "dial timeout"...)}
+		}
+		return accept(frame)
+	})
+	newDXReceiver(sd, func(uint32, []byte, *dataexchange.Frame) string { return "ACK TEXT 5 bytes" })
+
+	var stderr string
+	var f *trappedFatal
+	withJSON(func() {
+		_, stderr, f = runTrapped(t, func() {
+			cmdSendMessage([]string{"0:0000.0000.002A", "--data", "hello", "--count", "3", "--no-resend"})
+		})
+	})
+	if f == nil || f.Code != "connection_failed" || !strings.HasPrefix(f.Message, "1 of 3 messages") {
+		t.Fatalf("send = %+v, want connection_failed for 1 of 3 messages", f)
+	}
+	results := errorResults(t, stderr)
+	if len(results) != 3 {
+		t.Fatalf("results = %v, want 3", results)
+	}
+	for _, i := range []int{0, 2} {
+		if r := results[i]; r["ack"] != "ACK TEXT 5 bytes" || r["message_id"] == nil {
+			t.Errorf("message %d = %v, want acknowledged with its message_id", i, r)
+		}
+	}
+	if e, _ := results[1]["error"].(string); !strings.Contains(e, "cannot connect") || !strings.Contains(e, "dial timeout") {
+		t.Errorf("message 1 = %v, want the dial failure", results[1])
+	}
+}
+
 // A single message that fails says which message it was: the error envelope
 // carries its result, message_id included, as a --count run's does, so the
 // caller can look for it in the receiver's inbox or for a reply naming it.

@@ -1411,7 +1411,9 @@ have no ACK, no retry and no ordering guarantee. The local daemon does say
 whether it sent the datagram: if it could not (no route to the node, port
 policy, payload too large) the command fails with its reason. "confirmed":
 false means the daemon is too old to say, and the datagram was sent anyway.
-A datagram carries at most 65535 bytes.
+The daemon refuses a payload over 65535 bytes, and less fits in practice:
+the datagram and its headers must fit one UDP packet, about 65400 bytes on a
+direct path and less relayed. Use send-message for anything large.
 
 The error code says whether sending again can help: permission_denied (the
 network's port policy), invalid_argument (too large), not_found (no such
@@ -4508,9 +4510,11 @@ func cmdDgram(args []string) {
 		fatalCode("invalid_argument", "--data is required")
 	}
 	// A packet's payload length is 16 bits: the daemon refuses anything
-	// larger, so say so before contacting it.
+	// larger, so say so before contacting it. Headers take some of the UDP
+	// packet, so slightly smaller payloads can still fail to send; the
+	// daemon reports those.
 	if len(data) > maxDatagramBytes {
-		fatalCode("invalid_argument", "datagram is %d bytes; one datagram can carry at most %d (use send-message for larger payloads)", len(data), maxDatagramBytes)
+		fatalCode("invalid_argument", "datagram is %d bytes; the daemon refuses more than %d, and less fits after headers (use send-message for larger payloads)", len(data), maxDatagramBytes)
 	}
 
 	d := connectDriver()
@@ -4553,8 +4557,9 @@ func cmdDgram(args []string) {
 	}
 }
 
-// maxDatagramBytes is the most one datagram can carry: a packet's payload
-// length field is 16 bits.
+// maxDatagramBytes is the largest payload the daemon accepts for a
+// datagram: a packet's payload length field is 16 bits. What fits one UDP
+// packet with the headers is somewhat less.
 const maxDatagramBytes = 0xFFFF
 
 // dgramErrorCode is the exit code for a datagram the daemon could not send,
@@ -5102,6 +5107,11 @@ func cmdSendMessage(args []string) {
 	// redial dials like dialOnce but returns the error: when sendOne's
 	// retry after a lost ack cannot connect, the first attempt stands.
 	redial := func() (*dataexchange.Client, error) { return dataexchange.Dial(d, target) }
+	// dialFailed is the result of a message of a multi-send whose dial
+	// failed after earlier messages went out.
+	dialFailed := func(seq int, err error) map[string]interface{} {
+		return map[string]interface{}{"seq": seq, "error": fmt.Sprintf("cannot connect to %s (data exchange port %d): %v", target, protocol.PortDataExchange, err)}
+	}
 
 	// Set below when --wait is given. Declared here so sendOne can register
 	// each request's message ID with it before the request leaves.
@@ -5446,7 +5456,7 @@ func cmdSendMessage(args []string) {
 			if cl == nil {
 				c, err := redial()
 				if err != nil {
-					results = append(results, map[string]interface{}{"seq": i, "error": fmt.Sprintf("cannot connect to %s (data exchange port %d): %v", target, protocol.PortDataExchange, err)})
+					results = append(results, dialFailed(i, err))
 					continue
 				}
 				cl, carried = c, false
@@ -5469,13 +5479,26 @@ func cmdSendMessage(args []string) {
 		// baseline — measures true per-message cost including dial overhead.
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
-			result, cl := sendOne(dialOnce(), i, false, redial)
+			if i > 0 {
+				time.Sleep(50 * time.Millisecond)
+			}
+			// The first dial fails the command, as for one message. A
+			// later one is recorded against its message, so the results
+			// still list the messages already delivered.
+			var c *dataexchange.Client
+			if i == 0 {
+				c = dialOnce()
+			} else {
+				var err error
+				if c, err = redial(); err != nil {
+					results = append(results, dialFailed(i, err))
+					continue
+				}
+			}
+			result, cl := sendOne(c, i, false, redial)
 			results = append(results, result)
 			if cl != nil {
 				_ = cl.Close()
-			}
-			if i < sendCount-1 {
-				time.Sleep(50 * time.Millisecond)
 			}
 		}
 		failIfUndelivered(target.String(), results)
