@@ -5048,17 +5048,25 @@ func cmdSendMessage(args []string) {
 	// each request's message ID with it before the request leaves.
 	var watch *inboxWatch
 
-	// sendOne sends one message on cl and returns timing/ack metadata.
-	// reused=true is recorded when the connection was dialled on a prior call.
-	// redial opens a new connection to the same receiver, for the one retry
-	// after a lost ack (below).
+	// sendOne sends one message on cl and returns timing/ack metadata, and
+	// the connection the next message can go on. reused=true says cl carried
+	// an earlier message. redial opens a new connection to the same
+	// receiver, for the one retry after a lost ack (below).
+	//
+	// sendOne takes cl over. It returns cl, or the retry's connection when
+	// the ack on cl was lost, and closes the connections it does not return.
+	// It returns nil when neither can carry another message: the next one
+	// needs a new connection. A failed ack read means the connection is
+	// gone. No read deadline is set, so the read failed because the
+	// connection ended, and later writes to it would still succeed (the
+	// driver only notices a local close) and be dropped.
 	//
 	// Every send carries a new message ID, so the receiver can tell a
 	// re-delivery from a new message and a reply can name the request it
 	// answers (reply_to). Client.Send delivers the message without the ID to
 	// a receiver too old to know it: such a receiver stores nothing for the
 	// tagged frame, says so, and gets the plain frame on the same connection.
-	sendOne := func(cl *dataexchange.Client, seq int, reused bool, redial func() (*dataexchange.Client, error)) map[string]interface{} {
+	sendOne := func(cl *dataexchange.Client, seq int, reused bool, redial func() (*dataexchange.Client, error)) (map[string]interface{}, *dataexchange.Client) {
 		messageID := dataexchange.NewMessageID()
 		if watch != nil {
 			watch.addID(messageID)
@@ -5066,6 +5074,13 @@ func cmdSendMessage(args []string) {
 		sentAtNs := time.Now().UnixNano()
 		frame := messageFrame(innerType, []byte(data), messageID, replyTo, traceTime, sentAtNs)
 		res, sendErr := cl.Send(frame)
+		next := cl
+		if res == nil {
+			// Not answered: the write failed, or the ack read did. Either way
+			// cl cannot carry another message.
+			_ = cl.Close()
+			next = nil
+		}
 		retried := false
 		if res == nil && isAckReadError(sendErr) && !noResend && !traceTime {
 			// The frame was written but no ack came back, so whether it was
@@ -5090,13 +5105,20 @@ func cmdSendMessage(args []string) {
 				res2, err2 := c2.Send(frame)
 				switch {
 				case res2 != nil, isAckReadError(err2):
-					res, sendErr = res2, err2
+					// The retry's outcome is the message's, on a connection
+					// that carried nothing before.
+					res, sendErr, reused = res2, err2, false
 				default:
 					// The retry was not written: the first attempt, written
 					// but unacknowledged, is what happened to the message.
 					sendErr = fmt.Errorf("%w; sending again failed: %v", sendErr, err2)
 				}
-				_ = c2.Close()
+				if res2 != nil {
+					// Answered, so still open: the next message goes on it.
+					next = c2
+				} else {
+					_ = c2.Close()
+				}
 			}
 		}
 		ackRecvAtNs := time.Now().UnixNano()
@@ -5112,7 +5134,7 @@ func cmdSendMessage(args []string) {
 			slog.Debug("send-message ACK read failed", "err", sendErr)
 			ackErr = sendErr
 		default:
-			return map[string]interface{}{"seq": seq, "error": sendErr.Error(), "message_id": messageID}
+			return map[string]interface{}{"seq": seq, "error": sendErr.Error(), "message_id": messageID}, next
 		}
 		if res != nil && res.Tagged && watch != nil {
 			watch.markTagged()
@@ -5167,7 +5189,7 @@ func cmdSendMessage(args []string) {
 				}
 			}
 		}
-		return r
+		return r, next
 	}
 	tracef("dial+send")
 
@@ -5211,8 +5233,10 @@ func cmdSendMessage(args []string) {
 				"cannot connect to %s (data exchange port %d)", target, protocol.PortDataExchange)
 		}
 		tracef("dataexchange.Dial")
-		defer cl.Close()
-		r := sendOne(cl, 0, false, redial)
+		r, cl := sendOne(cl, 0, false, redial)
+		if cl != nil {
+			defer cl.Close()
+		}
 		ackAt := time.Now()
 		// Every receiver answers a stored message with an ACK frame. No ACK
 		// means the message was not stored, or was never sent — the daemon
@@ -5285,8 +5309,10 @@ func cmdSendMessage(args []string) {
 						if err != nil {
 							return time.Time{}, err
 						}
-						defer c.Close()
-						rr := sendOne(c, 1, false, func() (*dataexchange.Client, error) { return dataexchange.Dial(rd, target) })
+						rr, c := sendOne(c, 1, false, func() (*dataexchange.Client, error) { return dataexchange.Dial(rd, target) })
+						if c != nil {
+							_ = c.Close()
+						}
 						if e, failed := rr["error"].(string); failed {
 							return time.Time{}, errors.New(e)
 						}
@@ -5332,16 +5358,33 @@ func cmdSendMessage(args []string) {
 	} else if reuseConn {
 		// --reuse-conn: one dial shared across all N sends. Seq 0 pays dial
 		// cost; seqs 1+ skip it. Savings ≈ one relay RTT (~70ms) per msg.
+		// A connection whose ack was lost is gone: the messages after it go
+		// on the retry's connection, or on a new one.
 		cl := dialOnce()
 		tracef("dataexchange.Dial (shared)")
-		defer cl.Close()
+		defer func() {
+			if cl != nil {
+				_ = cl.Close()
+			}
+		}()
+		carried := false // cl carried an earlier message
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
-			result := sendOne(cl, i, i > 0, redial)
-			results = append(results, result)
-			if i < sendCount-1 {
+			if i > 0 {
 				time.Sleep(50 * time.Millisecond)
 			}
+			if cl == nil {
+				c, err := redial()
+				if err != nil {
+					results = append(results, map[string]interface{}{"seq": i, "error": fmt.Sprintf("cannot connect to %s (data exchange port %d): %v", target, protocol.PortDataExchange, err)})
+					continue
+				}
+				cl, carried = c, false
+			}
+			var result map[string]interface{}
+			result, cl = sendOne(cl, i, carried, redial)
+			results = append(results, result)
+			carried = cl != nil
 		}
 		failIfUndelivered(target.String(), results)
 		outputOK(map[string]interface{}{
@@ -5356,10 +5399,11 @@ func cmdSendMessage(args []string) {
 		// baseline — measures true per-message cost including dial overhead.
 		var results []map[string]interface{}
 		for i := 0; i < sendCount; i++ {
-			cl := dialOnce()
-			result := sendOne(cl, i, false, redial)
+			result, cl := sendOne(dialOnce(), i, false, redial)
 			results = append(results, result)
-			cl.Close()
+			if cl != nil {
+				_ = cl.Close()
+			}
 			if i < sendCount-1 {
 				time.Sleep(50 * time.Millisecond)
 			}

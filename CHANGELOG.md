@@ -393,6 +393,17 @@ Detailed per-release notes are on the
   reconnect and full re-registration a recovery has just done. A recovery
   whose re-registration failed, or that restored the node's visibility,
   hostname or trust pairs only in part, does not count as done.
+- **`pilotctl send-message --count N --reuse-conn` carries on after a lost
+  ack.** A lost ack means the shared connection is gone, but the messages
+  after it were still written into it. The driver only notices a connection
+  it closed itself, so those writes appeared to succeed and were dropped. Each
+  later message then lost its ack too and was sent again on a new connection:
+  every message showed `"retried": true`, and with `--no-resend` every
+  message after the lost one failed. The messages after it now go on the
+  retry's connection, or on a new one when there was no retry. `reused` is
+  true only when the connection had carried an earlier message. A later
+  message whose new connection cannot be dialled is reported as failed, and
+  the run goes on.
 - **A bulk transfer no longer hangs when the receiver's application falls
   behind.** When a receiver's application stops reading for a second, the
   receiver parks the next in-order segment in its reorder buffer and keeps
