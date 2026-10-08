@@ -97,6 +97,22 @@ func TestOnlyApplicationTrafficCountsAsActivity(t *testing.T) {
 		t.Fatal("peer should be idle")
 	}
 
+	// Our pong to the peer's path probe is upkeep too: counting it made
+	// every peer with a path watchdog active again 55 s after it went quiet.
+	_ = tm.Send(peer, &protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    protocol.FlagACK,
+		Protocol: protocol.ProtoControl,
+		Src:      protocol.Addr{Node: 0xAA000002},
+		Dst:      protocol.Addr{Node: peer},
+		SrcPort:  protocol.PortPing,
+		DstPort:  protocol.PortPing,
+		Payload:  []byte("probe"),
+	})
+	if !tm.PeerIdle(peer) {
+		t.Fatal("answering the peer's path probe counted as application activity")
+	}
+
 	// Application traffic: any packet sent through Send.
 	_ = tm.Send(peer, &protocol.Packet{
 		Version:  protocol.Version,
