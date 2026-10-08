@@ -1652,6 +1652,21 @@ func (d *Daemon) stopping() bool {
 	}
 }
 
+// sleepOrStop waits for wait, or until Stop is called, whichever comes
+// first. Reports whether the whole wait passed. Background work that backs
+// off uses it instead of time.Sleep: Stop gives that work only 5 s to
+// return before it carries on without it.
+func (d *Daemon) sleepOrStop(wait time.Duration) bool {
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-d.stopCh:
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 func (d *Daemon) Stop() error {
 	// Idempotent: only the first caller runs shutdown; others wait and return nil.
 	d.stopOnce.Do(func() {
@@ -2414,6 +2429,11 @@ func (d *Daemon) dialRegistryClient() (*registry.Client, error) {
 	registryDialBackoff := 500 * time.Millisecond
 	dialOpts := d.registryDialOptions()
 	for attempt := 1; attempt <= maxRegistryDialAttempts; attempt++ {
+		// A recovery redialling a registry that refuses us would otherwise
+		// keep at it for the whole backoff, about 47 s, long after Stop.
+		if d.stopping() {
+			return nil, errDaemonStopping
+		}
 		if d.config.RegistryTLS {
 			trust := d.config.RegistryTrust
 			if trust == "" {
@@ -2448,7 +2468,9 @@ func (d *Daemon) dialRegistryClient() (*registry.Client, error) {
 		slog.Warn("registry dial failed, retrying",
 			"attempt", attempt, "max", maxRegistryDialAttempts,
 			"backoff", registryDialBackoff, "error", err)
-		time.Sleep(registryDialBackoff)
+		if !d.sleepOrStop(registryDialBackoff) {
+			return nil, errDaemonStopping
+		}
 		if registryDialBackoff < 5*time.Second {
 			registryDialBackoff *= 2
 		}
@@ -5779,7 +5801,9 @@ func (d *Daemon) trustRepublishLoop() {
 				if consecutiveFailures >= HeartbeatReregThresh {
 					// Backoff with jitter before attempting re-registration.
 					jitter := time.Duration(rand.Int63n(int64(reregBackoff) / 2))
-					time.Sleep(reregBackoff + jitter)
+					if !d.sleepOrStop(reregBackoff + jitter) {
+						return
+					}
 
 					slog.Info("attempting re-registration", "backoff", reregBackoff)
 					_ = d.reRegisterSerialised() // logs its own failure; the next heartbeat tells

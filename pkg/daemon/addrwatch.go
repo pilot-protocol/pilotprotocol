@@ -561,25 +561,15 @@ func (d *Daemon) recoverFromAddrChange(reason, previous, current string, announc
 // otherwise relay to the old address until the next keepalive, up to a
 // minute later.
 func (d *Daemon) addrAnnounceFollowUp(started time.Time) {
-	sleep := func(wait time.Duration) bool {
-		t := time.NewTimer(wait)
-		defer t.Stop()
-		select {
-		case <-d.stopCh:
-			return false
-		case <-t.C:
-			return true
-		}
-	}
 	for _, wait := range addrAnnounceRetryDelays {
-		if !sleep(wait) {
+		if !d.sleepOrStop(wait) {
 			return
 		}
 		if d.announceToPeers(started) == 0 {
 			break
 		}
 	}
-	if !sleep(time.Until(started.Add(addrBeaconReregisterDelay))) {
+	if !d.sleepOrStop(time.Until(started.Add(addrBeaconReregisterDelay))) {
 		return
 	}
 	d.tunnels.RegisterWithBeacon()
