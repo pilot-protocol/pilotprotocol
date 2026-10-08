@@ -291,8 +291,10 @@ func (d *Daemon) reestablishedRecently(full bool) (time.Duration, bool) {
 	return age, age >= 0 && age < reestablishCoalesce
 }
 
-// noteReestablished records a re-registration the registry accepted, full
-// or endpoint-only. The caller holds reestablishMu.
+// noteReestablished records a re-registration the registry accepted: full
+// when the registry also took back all of this node's state (visibility,
+// hostname, every trust pair), so that a full one after it would repeat it.
+// The caller holds reestablishMu.
 func (d *Daemon) noteReestablished(full bool) {
 	d.reestablishOKWall = time.Now().UnixNano()
 	d.reestablishOKFull = full
@@ -312,9 +314,11 @@ func (d *Daemon) reestablishTransport(cause string, o reestablishOpts) bool {
 	d.reestablishMu.Lock()
 	defer d.reestablishMu.Unlock()
 
-	// The beacon registration is one datagram and runs every time: the
-	// recent run that lets the registry half be skipped may be the
-	// heartbeat's re-registration, which does not register with the beacon.
+	// The beacon registration is one datagram and runs every time, also
+	// when the registry half below is skipped as recently done: an
+	// endpoint-only re-registration does not register with the beacon, and
+	// the rx watchdog's soft recovery counts on the beacon's reply as
+	// inbound traffic.
 	d.tunnels.RegisterWithBeacon()
 	if age, ok := d.reestablishedRecently(!o.endpointOnly); ok && !o.always {
 		slog.Info("registry re-registered moments ago — not repeating it", "cause", cause,
@@ -330,14 +334,17 @@ func (d *Daemon) reestablishTransport(cause string, o reestablishOpts) bool {
 			return false
 		}
 	}
-	register := d.reRegister
+	full := false
+	var err error
 	if o.endpointOnly {
-		register = d.reRegisterEndpoint
+		err = d.reRegisterEndpoint()
+	} else {
+		full, err = d.reRegisterFull()
 	}
-	if err := register(); err != nil {
+	if err != nil {
 		return false // registerEndpoint logs what the registry answered
 	}
-	d.noteReestablished(!o.endpointOnly)
+	d.noteReestablished(full)
 	return true
 }
 

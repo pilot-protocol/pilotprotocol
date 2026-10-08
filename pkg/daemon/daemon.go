@@ -5775,6 +5775,7 @@ func (d *Daemon) trustRepublishLoop() {
 			if rc == nil {
 				continue
 			}
+			callStart := time.Now()
 			_, err := withRegistryDeadline(registryCallDeadline, func() (map[string]interface{}, error) {
 				return rc.Heartbeat(d.NodeID())
 			})
@@ -5783,15 +5784,15 @@ func (d *Daemon) trustRepublishLoop() {
 				if errors.Is(err, errRegistryCallTimedOut) {
 					slog.Warn("heartbeat timed out — registry connection likely half-open, forcing reconnect",
 						"consecutive_failures", consecutiveFailures, "deadline", registryCallDeadline)
-					reconnected, rcErr := d.reconnectRegistrySerialised(rc)
+					rereg, rcErr := d.reconnectRegistrySerialised(rc, callStart)
 					switch {
 					case rcErr != nil:
 						slog.Warn("registry force-reconnect failed", "error", rcErr)
-					case reconnected:
+					case rereg:
 						consecutiveFailures = HeartbeatReregThresh
 					default:
 						// A recovery has replaced the connection the call
-						// waited on, and re-registers over the new one.
+						// waited on, and re-registered over the new one.
 						slog.Info("registry connection already replaced by a recovery — not reconnecting again")
 					}
 				}
@@ -5844,12 +5845,16 @@ func (d *Daemon) trustRepublishLoop() {
 // connection again, and the re-registration after it would repeat the full
 // restore, one ReportTrust per trusted peer included. So the reconnect
 // replaces stale, the connection the call timed out on, only while it is
-// still the current one, and reports whether it did.
-func (d *Daemon) reconnectRegistrySerialised(stale *registry.Client) (bool, error) {
+// still the current one.
+//
+// It reports whether the heartbeat should re-register now: after its own
+// reconnect, and also when a recovery replaced the connection but nothing
+// has registered since callStart (the recovery's re-registration failed).
+func (d *Daemon) reconnectRegistrySerialised(stale *registry.Client, callStart time.Time) (bool, error) {
 	d.reestablishMu.Lock()
 	defer d.reestablishMu.Unlock()
 	if d.reg() != stale {
-		return false, nil
+		return d.reestablishOKWall < callStart.UnixNano(), nil
 	}
 	if err := d.forceReconnectRegistry(); err != nil {
 		return false, err
@@ -5859,7 +5864,8 @@ func (d *Daemon) reconnectRegistrySerialised(stale *registry.Client) (bool, erro
 
 // reRegisterSerialised re-registers in full, unless a full re-registration
 // the registry accepted finished less than reestablishCoalesce ago. Its own
-// counts the same way for a recovery right after it.
+// counts the same way for a recovery right after it, if it restored all of
+// this node's state.
 func (d *Daemon) reRegisterSerialised() error {
 	d.reestablishMu.Lock()
 	defer d.reestablishMu.Unlock()
@@ -5868,10 +5874,11 @@ func (d *Daemon) reRegisterSerialised() error {
 			"age", age.Truncate(time.Millisecond).String())
 		return nil
 	}
-	if err := d.reRegister(); err != nil {
+	full, err := d.reRegisterFull()
+	if err != nil {
 		return err
 	}
-	d.noteReestablished(true)
+	d.noteReestablished(full)
 	return nil
 }
 
@@ -6020,12 +6027,20 @@ func (d *Daemon) publishHeartbeatEvent() {
 // registry did not accept the registration; the restore steps after it are
 // best-effort and only logged.
 func (d *Daemon) reRegister() error {
+	_, err := d.reRegisterFull()
+	return err
+}
+
+// reRegisterFull is reRegister, and also reports whether the registry took
+// back all of this node's state. A write that failed is only logged; the
+// recoveries count such a run as endpoint-only (noteReestablished), so the
+// next full re-registration is not skipped as recently done.
+func (d *Daemon) reRegisterFull() (bool, error) {
 	nodeID, _, err := d.registerEndpoint()
 	if err != nil {
-		return err
+		return false, err
 	}
-	d.restoreRegistryState(nodeID, true)
-	return nil
+	return d.restoreRegistryState(nodeID, true), nil
 }
 
 // endpointOnlyRegistryFresh bounds when reRegisterEndpoint trusts the
@@ -6153,41 +6168,53 @@ func (d *Daemon) registerEndpoint() (uint32, map[string]interface{}, error) {
 
 // restoreRegistryState re-applies what a registry that lost this node also
 // lost: visibility and hostname, and with trust set the local trust pairs
-// and the beacon registration. Best-effort; failures are logged.
-func (d *Daemon) restoreRegistryState(nodeID uint32, trust bool) {
+// and the beacon registration. Best-effort; failures are logged. Reports
+// whether every write succeeded.
+func (d *Daemon) restoreRegistryState(nodeID uint32, trust bool) bool {
 	if d.stopping() {
-		return
+		return false
 	}
+	complete := true
 
 	// Restore visibility and hostname after re-registration
 	if d.config.Public {
 		if _, err := d.reg().SetVisibility(nodeID, true); err != nil {
 			slog.Warn("re-registration: failed to restore visibility", "error", err)
+			complete = false
 		}
 	}
 	if d.config.Hostname != "" {
 		if _, err := d.reg().SetHostname(nodeID, d.config.Hostname); err != nil {
 			slog.Warn("re-registration: failed to restore hostname", "error", err)
+			complete = false
 		}
 	}
 
-	if d.stopping() || !trust {
-		return
+	if d.stopping() {
+		return false
+	}
+	if !trust {
+		return complete
 	}
 
 	// Re-sync local trust pairs to registry (trust survives disconnection locally
 	// but the registry may have lost and re-loaded state)
 	if d.handshakes != nil {
 		peers := d.handshakes.TrustedPeers()
+		failed := 0
 		for _, rec := range peers {
 			if d.stopping() {
-				return
+				return false
 			}
 			if _, err := d.reg().ReportTrust(nodeID, rec.NodeID); err != nil {
 				slog.Debug("re-registration: failed to re-sync trust pair", "peer", rec.NodeID, "error", err)
+				failed++
 			}
 		}
-		if len(peers) > 0 {
+		if failed > 0 {
+			slog.Warn("re-registration: some trust pairs not re-synced", "synced", len(peers)-failed, "failed", failed)
+			complete = false
+		} else if len(peers) > 0 {
 			slog.Info("re-synced trust pairs", "count", len(peers))
 		}
 	}
@@ -6196,6 +6223,7 @@ func (d *Daemon) restoreRegistryState(nodeID uint32, trust bool) {
 	if d.config.BeaconAddr != "" {
 		d.tunnels.RegisterWithBeacon()
 	}
+	return complete
 }
 
 // reapStalePeers removes tunnel peers that have no active connections

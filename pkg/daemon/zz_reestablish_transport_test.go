@@ -335,7 +335,7 @@ func TestHeartbeatRegistryCallsWaitForARecovery(t *testing.T) {
 	d := newRegistryTestDaemon(t, addr, Config{})
 
 	reconnect := func() error {
-		_, err := d.reconnectRegistrySerialised(d.reg())
+		_, err := d.reconnectRegistrySerialised(d.reg(), time.Now())
 		return err
 	}
 	for _, call := range []struct {
@@ -395,17 +395,18 @@ func TestHeartbeatDoesNotRepeatARecovery(t *testing.T) {
 	fs.trustedRecs = []HandshakeTrustRecord{{NodeID: 41}, {NodeID: 42}}
 
 	stale := d.reg() // the heartbeat's call is waiting on this connection
+	callStart := time.Now()
 	if !d.reestablishTransport("resume", reestablishOpts{freshConn: true}) {
 		t.Fatal("resume recovery failed")
 	}
 	fresh := d.reg()
 
 	// The call times out: the heartbeat reconnects, then re-registers.
-	reconnected, err := d.reconnectRegistrySerialised(stale)
+	rereg, err := d.reconnectRegistrySerialised(stale, callStart)
 	if err != nil {
 		t.Fatalf("heartbeat reconnect: %v", err)
 	}
-	if reconnected || d.reg() != fresh {
+	if rereg || d.reg() != fresh {
 		t.Fatal("the heartbeat replaced the connection the recovery had just opened")
 	}
 	if err := d.reRegisterSerialised(); err != nil {
@@ -429,5 +430,89 @@ func TestHeartbeatDoesNotRepeatARecovery(t *testing.T) {
 	}
 	if log.get("register") != 1 || d.reg() != fresh {
 		t.Fatalf("heartbeat then resume sent %v and replaced the connection: %v, want one register", log.count, d.reg() != fresh)
+	}
+}
+
+// A recovery that replaced the connection the heartbeat's call waited on,
+// but whose re-registration failed, does not stand for one: the heartbeat
+// re-registers over the new connection at once, as it would have after its
+// own reconnect.
+func TestHeartbeatReregistersWhenTheRecoveryDidNot(t *testing.T) {
+	t.Parallel()
+	var failRegister atomic.Bool
+	addr, stop := serveFakeRegistry(t, func(req map[string]interface{}) map[string]interface{} {
+		typ, _ := req["type"].(string)
+		if typ == "register" {
+			if failRegister.Load() {
+				return map[string]interface{}{"type": "error", "error": "registry overloaded"}
+			}
+			return registerOK("")
+		}
+		return map[string]interface{}{"type": typ + "_ok"}
+	})
+	defer stop()
+	d := newRegistryTestDaemon(t, addr, Config{})
+
+	stale := d.reg()
+	callStart := time.Now()
+	failRegister.Store(true)
+	if d.reestablishTransport("resume", reestablishOpts{freshConn: true}) {
+		t.Fatal("the resume's re-registration was refused, yet it reported success")
+	}
+	if d.reg() == stale {
+		t.Fatal("the resume did not replace the connection; nothing to test")
+	}
+	rereg, err := d.reconnectRegistrySerialised(stale, callStart)
+	if err != nil {
+		t.Fatalf("heartbeat reconnect: %v", err)
+	}
+	if !rereg {
+		t.Fatal("nothing registered since the heartbeat's call began, yet it would not re-register")
+	}
+}
+
+// A full re-registration whose trust re-sync partly failed does not count
+// as full: the heartbeat's re-registration right after it runs, and re-syncs
+// the trust pairs, instead of being skipped as recently done.
+func TestPartialRestoreDoesNotCountAsFull(t *testing.T) {
+	t.Parallel()
+	var log registryLog
+	var failTrust atomic.Bool
+	failTrust.Store(true)
+	addr, stop := serveFakeRegistry(t, func(req map[string]interface{}) map[string]interface{} {
+		typ, _ := req["type"].(string)
+		log.add(typ)
+		switch {
+		case typ == "register":
+			return registerOK("")
+		case typ == "report_trust" && failTrust.Load():
+			return map[string]interface{}{"type": "error", "error": "registry overloaded"}
+		}
+		return map[string]interface{}{"type": typ + "_ok"}
+	})
+	defer stop()
+	d := newRegistryTestDaemon(t, addr, Config{})
+	fs := installFakeHandshake(d)
+	fs.trustedRecs = []HandshakeTrustRecord{{NodeID: 41}, {NodeID: 42}}
+
+	if !d.reestablishTransport("resume", reestablishOpts{}) {
+		t.Fatal("resume recovery failed")
+	}
+	failTrust.Store(false)
+	log.reset()
+	if err := d.reRegisterSerialised(); err != nil {
+		t.Fatalf("heartbeat re-register: %v", err)
+	}
+	if log.get("register") != 1 || log.get("report_trust") != 2 {
+		t.Fatalf("heartbeat after a partial restore sent %v, want a register and both trust pairs again", log.count)
+	}
+
+	// Now complete, it counts: a resume right after it skips the registry.
+	log.reset()
+	if !d.reestablishTransport("resume", reestablishOpts{}) {
+		t.Fatal("resume recovery failed")
+	}
+	if log.get("register") != 0 {
+		t.Fatalf("resume right after a complete re-registration sent %v, want none", log.count)
 	}
 }
