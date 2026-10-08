@@ -198,6 +198,14 @@ type Config struct {
 	// full daemon restart. Default false (watchdog on).
 	DisablePathWatch bool
 
+	// DisableAddrWatch turns off the own-address watcher (addrwatch.go).
+	// The watcher notices this host's IP address changing under the daemon
+	// (or the public IP the beacon sees it at) and re-announces the node to
+	// the beacon, the registry and every tunnel peer at once, instead of
+	// leaving peers to find the new address through their own timeouts.
+	// Default false (watcher on).
+	DisableAddrWatch bool
+
 	// Telemetry consent gate. When set to the telemetry endpoint URL,
 	// the daemon initialises a telemetry client that emits signed events
 	// (install, usage, view, review). When empty (default), the client
@@ -417,6 +425,10 @@ type Daemon struct {
 	// IPC calls are NOT throttled.
 	autoHandshakeLastAttempt sync.Map
 
+	// hsPoll schedules relayed-handshake polls: the 60s baseline plus the
+	// bounded fast, on-demand and poke-triggered polls (handshakepoll.go).
+	hsPoll *handshakePollSched
+
 	// outbound records the peers this node recently dialed or sent a
 	// trust handshake to, so the private-node SYN gate can admit their
 	// dial-back replies (see replywindow.go).
@@ -435,6 +447,18 @@ type Daemon struct {
 	// signature) from "whole network unreachable" (restart just loops).
 	lastRegistryOKNano atomic.Int64
 
+	// reestablishMu serialises registry reconnects and re-registrations:
+	// reestablishTransport (the resume handler, the rx watchdog and the
+	// address watcher) and the heartbeat's own in trustRepublishLoop. They
+	// can all want one at once, and one caller's forceReconnectRegistry
+	// closes the connection another is mid-request on. reestablishOKWall
+	// (wall-clock unix nanos, under the mutex) is when the last
+	// reestablishTransport run the registry accepted finished, and
+	// reestablishOKFull whether it was a full re-registration.
+	reestablishMu     sync.Mutex
+	reestablishOKWall int64
+	reestablishOKFull bool
+
 	// lastDialOKNano / consecutiveDialTimeouts feed the rx watchdog's
 	// PARTIAL-wedge detector. A daemon can be "up" with rx trickling —
 	// a couple of keepalive packets from existing peers keep PktsRecv
@@ -447,7 +471,12 @@ type Daemon struct {
 	// it. consecutiveDialTimeouts counts back-to-back dial timeouts
 	// (reset to 0 on any successful dial); a run of them to distinct
 	// peers means our outbound path is wedged, not that one peer is dead.
+	// A timeout is not counted when another dial succeeded while it ran
+	// (see dialConnectionLocked): dialOKSeq counts completed dials, and a
+	// dial compares it with the count it saw when it started. A counter,
+	// not lastDialOKNano, so a wall-clock step cannot hide timeouts.
 	lastDialOKNano          atomic.Int64
+	dialOKSeq               atomic.Uint64
 	consecutiveDialTimeouts atomic.Uint64
 
 	startTime       time.Time
@@ -480,7 +509,7 @@ type Daemon struct {
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 
-	lanAddrs []string // LAN addresses for same-network peer detection
+	lanAddrs []string // LAN addresses for same-network peer detection; guarded by addrMu once Start has spawned the loops
 
 	// Endpoint cache: nodeID -> last-known endpoint (peer resilience)
 	epCacheMu sync.RWMutex
@@ -635,6 +664,7 @@ func New(cfg Config) *Daemon {
 		tunnels:         NewTunnelManager(),
 		ports:           NewPortManager(),
 		stopCh:          make(chan struct{}),
+		hsPoll:          newHandshakePollSched(),
 		synTokens:       cfg.synRateLimit(),
 		synLastFill:     time.Now(),
 		perSrcSYN:       make(map[uint32]*srcSYNBucket),
@@ -1040,6 +1070,7 @@ func (d *Daemon) Start() error {
 	// the race under §4.8 stress with -race). d.bus is constructed in
 	// New() so it's safe to publish here.
 	d.tunnels.SetEventBus(d.bus)
+	d.tunnels.SetBeaconNotifyHandler(d.handshakePoke)
 
 	// 3. Start UDP listener for tunnel traffic. Compat-mode daemons
 	// skip this — the WSS transport is dialed after register, once we
@@ -1338,6 +1369,12 @@ func (d *Daemon) Start() error {
 	d.bgWG.Add(1)
 	go func() { defer d.bgWG.Done(); d.pathWatchLoop() }()
 
+	// 8d. Start the address watcher (L4). Notices this host's own address
+	// changing and re-announces to the beacon, the registry and every
+	// tunnel peer at once — see addrwatch.go.
+	d.bgWG.Add(1)
+	go func() { defer d.bgWG.Done(); d.addrWatchLoop() }()
+
 	// 9. Start idle connection sweeper
 	d.bgWG.Add(1)
 	go func() { defer d.bgWG.Done(); d.idleSweepLoop() }()
@@ -1628,6 +1665,10 @@ func (d *Daemon) Stop() error {
 }
 
 func (d *Daemon) doStop() {
+	// The background goroutines and a relayed-handshake poll in flight
+	// share one deadline.
+	drainDeadline := time.Now().Add(5 * time.Second)
+
 	// Wait for all daemon-scoped background goroutines to notice
 	// stopCh and exit before tearing down shared infrastructure.
 	// Use a 5-second timeout to prevent a hung goroutine (e.g.
@@ -1640,7 +1681,7 @@ func (d *Daemon) doStop() {
 	}()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(time.Until(drainDeadline)):
 		slog.Warn("timed out waiting for background goroutines to exit", "leaked", true)
 	}
 
@@ -1694,6 +1735,13 @@ func (d *Daemon) doStop() {
 	}
 	if len(conns) > 0 {
 		slog.Info("closed active connections", "count", len(conns))
+	}
+
+	// A relayed-handshake poll in flight finishes first, while the handshake
+	// manager can still act on and save what it brings back, and no new one
+	// starts: the registry empties the inbox as it answers.
+	if !d.hsPoll.shutdown(drainDeadline) {
+		slog.Warn("relayed-handshake poll still running at shutdown; stopping without its results")
 	}
 
 	// Wait for background handshake RPCs to drain
@@ -2298,6 +2346,18 @@ func (d *Daemon) HandshakeSendRequest(nodeID uint32, reason string) error {
 	}
 	defer d.handshakeInFlight.Delete(nodeID)
 	return d.handshakes.SendRequest(nodeID, reason)
+}
+
+// handshakeRequestSent starts fast polling for the answer to a handshake
+// request that just left. The answer of a private peer comes back through
+// the registry whichever way the request went, so this does not need to
+// know whether the request was relayed. A peer that is already trusted
+// (auto-approved over a direct connection) starts nothing.
+func (d *Daemon) handshakeRequestSent(nodeID uint32, explicit bool) {
+	if d.handshakes == nil || d.handshakes.IsTrusted(nodeID) {
+		return
+	}
+	d.hsPoll.requestSent(nodeID, explicit)
 }
 
 // RegisterHandshakeService installs the daemon-wide HandshakeService
@@ -3392,7 +3452,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Process peer's receive window from SYN (H9 fix: always update, including Window==0)
 		conn.RetxMu.Lock()
 		prevWin := conn.PeerRecvWin
-		conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
+		conn.PeerRecvWin = int(pkt.Window) * SendSegmentSize
 		// prevWin==-1 is the sentinel (no advertisement yet); don't signal
 		// window-opened on the first transition (unknown→zero would fire).
 		winOpened := prevWin != -1 && conn.PeerRecvWin > prevWin && conn.WindowAvailable()
@@ -3481,7 +3541,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Process peer's receive window from SYN-ACK (H9 fix: always update)
 		conn.RetxMu.Lock()
 		prevWin := conn.PeerRecvWin
-		conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
+		conn.PeerRecvWin = int(pkt.Window) * SendSegmentSize
 		winOpened := prevWin != -1 && conn.PeerRecvWin > prevWin && conn.WindowAvailable()
 		conn.RetxMu.Unlock()
 		if winOpened && conn.WindowCh != nil {
@@ -3595,7 +3655,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Update peer's receive window (H9 fix: always update, honor Window==0)
 		conn.RetxMu.Lock()
 		prevPeerWin := conn.PeerRecvWin
-		conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
+		conn.PeerRecvWin = int(pkt.Window) * SendSegmentSize
 		peerWinOpened := prevPeerWin != -1 && conn.PeerRecvWin > prevPeerWin && conn.WindowAvailable()
 		conn.RetxMu.Unlock()
 		if peerWinOpened && conn.WindowCh != nil {
@@ -3661,13 +3721,24 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 				conn.AckMu.Unlock()
 				d.sendDelayedACK(conn)
 			} else {
-				// Delayed ACK: batch up to 2 segments or 40ms
+				// Delayed ACK: every second segment at once, a lone one at
+				// once while the quick-ACK budget lasts, otherwise after
+				// DelayedACKTimeout.
 				conn.PendingACKs++
 				if conn.PendingACKs >= DelayedACKThreshold {
 					conn.AckMu.Unlock()
 					d.sendDelayedACK(conn)
+				} else if conn.QuickACKs > 0 {
+					conn.QuickACKs--
+					conn.AckMu.Unlock()
+					d.sendDelayedACK(conn)
 				} else if conn.ACKTimer == nil {
 					conn.ACKTimer = time.AfterFunc(DelayedACKTimeout, func() {
+						// Nothing followed the lone segment: its sender is
+						// probably waiting for this ACK before sending more.
+						conn.AckMu.Lock()
+						conn.QuickACKs = QuickACKBudget
+						conn.AckMu.Unlock()
 						d.sendDelayedACK(conn)
 					})
 					conn.AckMu.Unlock()
@@ -3868,6 +3939,7 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	dialsOKAtStart := d.dialOKSeq.Load()
 
 	// Enforce outbound port policy: prevent dialing ports blocked by the network
 	if !d.evaluatePortPolicy(PolicyEventDial, dstAddr.Network, dstPort, dstAddr.Node, 0, "") {
@@ -3940,7 +4012,11 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 			// effort, just like before. ErrHandshakeInFlight short-circuit
 			// is the dedup hit, which is the success case.
 			if d.shouldAutoHandshake(dstAddr.Node) {
-				go func() { _ = d.HandshakeSendRequest(dstAddr.Node, "") }()
+				go func() {
+					if d.HandshakeSendRequest(dstAddr.Node, "") == nil {
+						d.handshakeRequestSent(dstAddr.Node, false)
+					}
+				}()
 			}
 		}
 	}
@@ -4055,6 +4131,7 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 			// A completed handshake proves the outbound path is alive —
 			// clears the rx-watchdog's partial-wedge signal.
 			d.lastDialOKNano.Store(time.Now().UnixNano())
+			d.dialOKSeq.Add(1)
 			d.consecutiveDialTimeouts.Store(0)
 			return conn, nil, true
 		}
@@ -4163,7 +4240,19 @@ func (d *Daemon) dialConnectionLocked(ctx context.Context, dstAddr protocol.Addr
 				// Full direct+relay retry budget exhausted with no SYN-ACK.
 				// Feeds the rx-watchdog's partial-wedge detector: a run of
 				// these to distinct peers means our outbound is wedged.
-				d.consecutiveDialTimeouts.Add(1)
+				// Not when another dial completed while this one ran: that
+				// SYN reached its peer and the SYN-ACK came back, so our
+				// outbound path worked during this dial and this one was
+				// declined (a peer's SYN limiter under a burst of our own
+				// dials, a full accept path). Traffic merely received from
+				// the peer is no evidence — its keepalives still arrive
+				// when it is our outbound path that is dead.
+				if d.dialOKSeq.Load() != dialsOKAtStart {
+					slog.Debug("dial timed out while another dial succeeded; not counted as a transport wedge",
+						"peer_node_id", dstAddr.Node, "dst_port", dstPort)
+				} else {
+					d.consecutiveDialTimeouts.Add(1)
+				}
 				if keyMissing {
 					// Not one SYN left this node: the peer never completed
 					// the key exchange. Say so, so callers can tell "busy
@@ -4201,40 +4290,70 @@ const NagleTimeout = 40 * time.Millisecond
 
 // DelayedACKTimeout is the max time to delay an ACK (RFC 1122 suggests 500ms max).
 //
-// It is also how long a write can stall with both ends idle. Nagle holds a
-// short write — a frame's body after its header, the tail of a large write —
-// until the data before it is ACKed, and the ACK of a lone or odd segment
-// waits for this timer. At 40ms that was 40ms on the first exchange of every
+// It is also how long a sender that waits for an ACK before it sends more
+// can stall with both ends idle: a short write behind another short write
+// (see nagleHoldsTail), once the receiver's quick-ACK budget is spent (see
+// QuickACKBudget). At 40ms, and with every short tail held until all the
+// data before it was ACKed, that was 40ms on the first exchange of every
 // connection and one stall per 48KB file chunk (about 1.5 MB/s on any link).
 //
-// The timer is shortened rather than removed from the path. ACKing short
-// segments at once, or sending tails without waiting, takes the pause between
-// writes away entirely; several streams then burst into the peer's socket
-// buffer faster than a stock kernel's can hold, and four concurrent 20MB
-// transfers measured 34-40s instead of 1.4s.
+// An earlier attempt to take the pause between writes away entirely had
+// several streams burst into the peer's socket buffer faster than a stock
+// kernel's can hold: four concurrent 20MB transfers measured 34-40s instead
+// of 1.4s. Two things changed since. A sender keeps at most
+// MaxSegmentsOutstanding segments unacknowledged, which bounds the burst,
+// and a burst of losses is repaired on the ACK clock instead of one
+// retransmission timeout per segment. With no pause between writes the same
+// four transfers take 1.4s under a stock kernel's limit (rmem_max 212992).
 const DelayedACKTimeout = 5 * time.Millisecond
 
 // DelayedACKThreshold is the number of segments to receive before sending an ACK immediately.
 const DelayedACKThreshold = 2
+
+// QuickACKBudget is how many lone segments are acknowledged at once, without
+// the delayed-ACK timer, at the start of a connection and again after each
+// time the timer has had to fire.
+//
+// A sender that holds its next small write until the previous one is
+// acknowledged (Nagle) sends one segment and waits. Each of those is a lone
+// segment here, and delaying its ACK stalls that sender for the whole timer.
+// The usual case is the first exchange on a connection — a frame header, then
+// its body. The costly one is a peer up to v1.14.1 relaying what it reads:
+// it reads this node's 1152-byte segments, writes each back as a write below
+// its own 4096-byte segment size, and waits for the ACK of every one. bench
+// against such a peer took 3.2s for 1 MB at 5ms a segment.
+//
+// While the budget lasts every arriving segment is acknowledged on its own.
+// A bulk transfer uses it up within its first 32 segments and from then on
+// is acknowledged every second segment as before: the timer, which restores
+// the budget, only fires when a segment arrives and nothing follows it.
+const QuickACKBudget = 32
 
 // SendData sends data over an established connection.
 // Implements Nagle's algorithm: small writes are coalesced into MSS-sized
 // segments unless NoDelay is set. Large writes (>= MSS) are sent immediately.
 // ErrSendBufFull is returned by SendData when the per-connection
 // NagleBuf would exceed MaxNagleBuf if the caller's write were
-// appended. Callers must back off and retry — typically by waiting
-// for a webhook or polling the connection's send-buffer state.
+// appended. It bounds the daemon's memory per connection.
 //
-// This error replaces the silent unbounded-growth behavior that
-// could OOM the daemon when an application wrote faster than the
-// network drained. Pinned by TestSendDataNagleBufGrowsUnbounded.
+// SendData returns it only before any byte of the write has been buffered,
+// so retrying the whole write is safe. With one write at a time per
+// connection (WriteMu) and large writes fed through in pieces that drain
+// before the next is taken, the buffer holds at most a held tail and one
+// piece, so in practice it is not returned at all.
 var ErrSendBufFull = errors.New("send buffer full")
 
 func (d *Daemon) SendData(conn *Connection, data []byte) error {
-	conn.Mu.Lock()
-	st := conn.State
-	conn.Mu.Unlock()
-	if st != StateEstablished {
+	if !connEstablished(conn) {
+		return fmt.Errorf("connection not established")
+	}
+
+	// One write at a time per connection: the pieces of a large write
+	// below must not interleave with another writer's bytes.
+	conn.WriteMu.Lock()
+	defer conn.WriteMu.Unlock()
+	// The connection may have been closed while this writer queued.
+	if !connEstablished(conn) {
 		return fmt.Errorf("connection not established")
 	}
 
@@ -4243,6 +4362,73 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 		return d.sendDataImmediate(conn, data)
 	}
 
+	// A write of a segment or more takes its tail with it: it is the end of
+	// a message, not one of a run of small writes that would coalesce.
+	// Decided once, from the whole write, not from each piece.
+	tailNow := len(data) >= SendSegmentSize
+
+	// A write larger than the send buffer can never fit in it, so it used
+	// to be refused outright with ErrSendBufFull — and since an IPC send has
+	// no reply, the client never knew: a message over MaxNagleBuf (256 KB)
+	// was dropped while the sender reported success. Feed a large write
+	// through the buffer in whole-segment pieces instead. Each piece is
+	// flushed before the next is taken (sendSegment blocks on the window),
+	// and WriteMu keeps other writers out, so the buffer never holds more
+	// than a held tail and one piece of this write.
+	for len(data) > nagleWritePiece {
+		if err := d.sendDataPiece(conn, data[:nagleWritePiece], tailNow); err != nil {
+			if err := d.drainAfterSendError(conn, err, tailNow); err != nil {
+				return err
+			}
+		}
+		data = data[nagleWritePiece:]
+		// Closed while this write waited on the window: send no more of
+		// it, nothing may follow the FIN.
+		if !connEstablished(conn) {
+			return protocol.ErrConnClosed
+		}
+	}
+	return d.sendDataPiece(conn, data, tailNow)
+}
+
+// connEstablished reports whether conn is still open for sending.
+func connEstablished(conn *Connection) bool {
+	conn.Mu.Lock()
+	defer conn.Mu.Unlock()
+	return conn.State == StateEstablished
+}
+
+// drainAfterSendError finishes flushing a piece of a large write after a
+// send error, so the rest of the write can follow it.
+//
+// A tunnel send error does not lose the segment: it was given its sequence
+// number and tracked before the send, and the retransmit loop resends it.
+// Stopping the write there instead dropped the pieces not yet buffered — they
+// never got sequence numbers — and the connection's next write landed in
+// their place in the stream. Every failed attempt still commits a segment, so
+// this ends (or blocks on the window like any write). It gives up only when
+// the connection is gone.
+func (d *Daemon) drainAfterSendError(conn *Connection, err error, tailNow bool) error {
+	for err != nil {
+		if errors.Is(err, protocol.ErrConnClosed) || errors.Is(err, ErrSendBufFull) || !connEstablished(conn) {
+			return err
+		}
+		slog.Debug("stream send failed; the segment will be retransmitted", "conn_id", conn.ID, "err", err)
+		_, err = d.flushNagle(conn, tailNow, false)
+	}
+	return nil
+}
+
+// nagleWritePiece is how much of one large write SendData buffers at a time:
+// a whole number of SendSegmentSize segments, so only the last piece of a
+// write can end in a short segment, and well under MaxNagleBuf.
+const nagleWritePiece = 56 * SendSegmentSize
+
+// sendDataPiece buffers one write of at most nagleWritePiece bytes (or any
+// smaller caller write) and flushes it under Nagle's algorithm. tailNow sends
+// a short remainder at once instead of letting Nagle hold it. Caller holds
+// conn.WriteMu.
+func (d *Daemon) sendDataPiece(conn *Connection, data []byte, tailNow bool) error {
 	conn.NagleMu.Lock()
 	// v1.9.1: cap NagleBuf at MaxNagleBuf. Without this, slow peers /
 	// full cwnd / packet loss caused the buffer to grow without bound,
@@ -4256,91 +4442,187 @@ func (d *Daemon) SendData(conn *Connection, data []byte) error {
 	conn.NagleBuf = append(conn.NagleBuf, data...)
 	conn.NagleMu.Unlock()
 
-	return d.nagleFlush(conn)
+	_, err := d.flushNagle(conn, tailNow, false)
+	return err
 }
 
-// nagleFlush sends buffered data according to Nagle's algorithm:
-// - Full MSS segments are always sent
-// - Sub-MSS data is sent only if no unacknowledged data exists or timeout
+// nagleFlush sends what Nagle's algorithm allows from the connection's
+// buffer: every full segment, and the short remainder unless it is held.
+//
+// A remainder is held when the write that left it was shorter than a
+// segment and an earlier short segment is still unacknowledged (see
+// nagleHoldsTail). It stays in the buffer, where the next write joins it, and
+// flushHeldTail sends it once that segment is acknowledged or NagleTimeout
+// has passed. The caller does not wait for that.
+//
+// It used to: this function returned only once the buffer was empty. A
+// writer whose short write was held could not write again until it went out,
+// so nothing ever joined it, and a stream of short writes moved at one write
+// per round trip — a node echoing back 4 KB writes it had received as three
+// full segments and a tail managed 136 KB/s at 30ms. IPC sends are handled
+// inline in the client's read loop, so everything else that client asked
+// for waited as well.
+//
+// SendData does not hold the remainder of a write of a segment or more.
 func (d *Daemon) nagleFlush(conn *Connection) error {
+	_, err := d.flushNagle(conn, false, false)
+	return err
+}
+
+// flushNagle is nagleFlush with two switches: force sends the remainder even
+// if Nagle would hold it, and asFlusher marks the call as coming from
+// flushHeldTail.
+//
+// flushHeldTail sends only a held remainder, and sends it without waiting for
+// the window: it is less than one segment, and a goroutine that waited here
+// would hold SendMu for as long as the window stayed shut, with the
+// connection unable to close in order behind it. It does not start another
+// copy of itself, and its bookkeeping (Connection.tailFlusher) is cleared
+// here, under NagleMu, at the moment nothing is left for it to send — so a
+// writer that holds a new remainder right afterwards finds no flusher and
+// starts one.
+//
+// SendMu is held from taking bytes out of the buffer until they are handed
+// on to be sent, so segments leave in the order the bytes were written
+// whichever goroutine sends them.
+func (d *Daemon) flushNagle(conn *Connection, force, asFlusher bool) (held bool, err error) {
+	conn.SendMu.Lock()
+	defer conn.SendMu.Unlock()
+
 	for {
 		conn.NagleMu.Lock()
 		if len(conn.NagleBuf) == 0 {
+			if asFlusher {
+				conn.tailFlusher = false
+			}
 			conn.NagleMu.Unlock()
-			return nil
+			return false, nil
 		}
 
 		// If we have at least MSS bytes, send a full segment
-		if len(conn.NagleBuf) >= MaxSegmentSize {
-			segment := make([]byte, MaxSegmentSize)
-			copy(segment, conn.NagleBuf[:MaxSegmentSize])
-			conn.NagleBuf = conn.NagleBuf[MaxSegmentSize:]
+		if len(conn.NagleBuf) >= SendSegmentSize {
+			if asFlusher {
+				// A writer has added to the buffer and is on its way here
+				// to send it; full segments wait for the window, which is
+				// the writer's place to wait, not this goroutine's.
+				conn.NagleMu.Unlock()
+				return true, nil
+			}
+			segment := make([]byte, SendSegmentSize)
+			copy(segment, conn.NagleBuf[:SendSegmentSize])
+			conn.NagleBuf = conn.NagleBuf[SendSegmentSize:]
 			conn.NagleMu.Unlock()
 
 			if err := d.sendSegment(conn, segment); err != nil {
-				return err
+				return false, err
 			}
 			continue
 		}
 
 		// Sub-MSS data: check if we can send now (check under NagleMu).
-		// Use BytesInFlight() rather than len(Unacked): SACKed entries
-		// stay in Unacked until cumulative ACK removes them, but they
-		// are already at the peer and should not delay a flush.
 		conn.RetxMu.Lock()
-		hasUnacked := conn.BytesInFlight() > 0
+		hold := !force && conn.nagleHoldsTail()
 		conn.RetxMu.Unlock()
 
-		if !hasUnacked {
-			// No data in flight — send immediately (Nagle allows this)
-			segment := make([]byte, len(conn.NagleBuf))
-			copy(segment, conn.NagleBuf)
-			conn.NagleBuf = conn.NagleBuf[:0]
+		if hold {
+			if !asFlusher && !conn.tailFlusher {
+				conn.tailFlusher = true
+				go d.flushHeldTail(conn)
+			}
 			conn.NagleMu.Unlock()
-
-			return d.sendSegment(conn, segment)
-		}
-		conn.NagleMu.Unlock()
-
-		// Data in flight — wait for ACK or timeout
-		nagleTimer := time.NewTimer(NagleTimeout)
-		select {
-		case <-conn.NagleCh:
-			nagleTimer.Stop()
-			// All data ACKed — flush now
-		case <-nagleTimer.C:
-			// Timeout — flush regardless
-		case <-conn.RetxStop:
-			nagleTimer.Stop()
-			return protocol.ErrConnClosed
-		}
-
-		// Re-check under lock after waking
-		conn.NagleMu.Lock()
-		if len(conn.NagleBuf) == 0 {
-			conn.NagleMu.Unlock()
-			return nil
-		}
-
-		// Send whatever we have (might have reached MSS now)
-		if len(conn.NagleBuf) >= MaxSegmentSize {
-			conn.NagleMu.Unlock()
-			continue // loop back to send full segments
+			return true, nil
 		}
 
 		segment := make([]byte, len(conn.NagleBuf))
 		copy(segment, conn.NagleBuf)
 		conn.NagleBuf = conn.NagleBuf[:0]
+		if asFlusher {
+			conn.tailFlusher = false
+		}
 		conn.NagleMu.Unlock()
 
-		return d.sendSegment(conn, segment)
+		if asFlusher {
+			return false, d.transmitSegment(conn, segment)
+		}
+		return false, d.sendSegment(conn, segment)
+	}
+}
+
+// flushHeldTail sends a remainder that nagleFlush left held: as soon as the
+// short segment ahead of it is acknowledged (NagleCh), and regardless once
+// NagleTimeout has passed since it was first held. One runs per connection
+// at most, and only while something is held.
+func (d *Daemon) flushHeldTail(conn *Connection) {
+	timer := time.NewTimer(NagleTimeout)
+	defer timer.Stop()
+	force := false
+	for {
+		select {
+		case <-conn.NagleCh:
+			// May be a signal left over from an earlier ACK; flushNagle
+			// looks again and keeps holding if it must.
+		case <-timer.C:
+			// Held long enough. If a writer turns out to be sending the
+			// buffer itself, look again after another interval.
+			force = true
+			timer.Reset(NagleTimeout)
+		case <-conn.RetxStop:
+			conn.NagleMu.Lock()
+			conn.tailFlusher = false
+			conn.NagleMu.Unlock()
+			return
+		}
+		if held, _ := d.flushNagle(conn, force, true); !held {
+			return
+		}
+	}
+}
+
+// sendHeldTailBeforeClose sends a remainder Nagle is still holding, so that it
+// is on the wire with a sequence number below the FIN's. It does not wait
+// for the window — a close must not block on a peer that has stopped
+// reading, and the remainder is less than one segment.
+//
+// SendMu is what orders this against flushHeldTail, which holds it only for
+// the instant it takes to hand a remainder on. A writer can hold it for as
+// long as the window stays shut; a close does not wait for that, and goes
+// ahead as it always has.
+func (d *Daemon) sendHeldTailBeforeClose(conn *Connection) {
+	conn.Mu.Lock()
+	established := conn.State == StateEstablished
+	conn.Mu.Unlock()
+	if !established {
+		return
+	}
+	locked := conn.SendMu.TryLock()
+	for i := 0; !locked && i < 20; i++ {
+		time.Sleep(time.Millisecond)
+		locked = conn.SendMu.TryLock()
+	}
+	if !locked {
+		return
+	}
+	defer conn.SendMu.Unlock()
+	conn.NagleMu.Lock()
+	tail := conn.NagleBuf
+	conn.NagleBuf = nil
+	conn.NagleMu.Unlock()
+	for len(tail) > 0 {
+		n := len(tail)
+		if n > SendSegmentSize {
+			n = SendSegmentSize
+		}
+		if err := d.transmitSegment(conn, tail[:n]); err != nil {
+			return
+		}
+		tail = tail[n:]
 	}
 }
 
 // sendDataImmediate sends data in MSS-sized segments without Nagle coalescing.
 func (d *Daemon) sendDataImmediate(conn *Connection, data []byte) error {
 	for offset := 0; offset < len(data); {
-		end := offset + MaxSegmentSize
+		end := offset + SendSegmentSize
 		if end > len(data) {
 			end = len(data)
 		}
@@ -4437,6 +4719,12 @@ func (d *Daemon) sendSegment(conn *Connection, data []byte) error {
 		}
 	}
 
+	return d.transmitSegment(conn, data)
+}
+
+// transmitSegment puts one segment on the wire and tracks it for
+// retransmission, without consulting the window.
+func (d *Daemon) transmitSegment(conn *Connection, data []byte) error {
 	// v1.9.1: reserve seq atomically with the read — pre-incrementing SendSeq
 	// inside the same Mu critical section prevents two concurrent sendSegment
 	// callers from reading the same SendSeq and emitting packets with identical
@@ -4554,15 +4842,17 @@ func (d *Daemon) retxLoop(conn *Connection) {
 	}
 }
 
-// unackedHasData returns true if conn.Unacked contains any non-FIN,
-// non-SACKed entry. Used by retxLoop to decide whether the FinWait
-// state still has work to do (real DATA still in flight) or just
-// the FIN sentinel (no useful retx left).
+// unackedHasData returns true if conn.Unacked contains any data entry,
+// SACKed or not. Used by retxLoop to decide whether the FinWait state
+// still has work to do (data not yet cumulatively acknowledged) or just
+// the FIN sentinel (no useful retx left). SACKed data counts: the
+// receiver may be holding it in its reorder buffer without delivering it,
+// and only the timeout in retransmitUnacked gets it delivered.
 func (d *Daemon) unackedHasData(conn *Connection) bool {
 	conn.RetxMu.Lock()
 	defer conn.RetxMu.Unlock()
 	for _, e := range conn.Unacked {
-		if e.isFIN || e.sacked {
+		if e.isFIN {
 			continue
 		}
 		return true
@@ -4583,6 +4873,25 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 	// Only retransmit one segment per RTO period (like real TCP).
 	if !conn.LastRetxTime.IsZero() && now.Sub(conn.LastRetxTime) < conn.RTO {
 		return
+	}
+
+	// RFC 2018 §5.1: a SACK is advice, not an acknowledgement. The oldest
+	// unacknowledged segment marked SACKed means the receiver does not hold
+	// it where it counts: a receiver that holds the segment at its
+	// cumulative ACK delivers it and moves the ACK on. A receiver whose
+	// application stopped reading parks that segment in its reorder buffer
+	// when delivery times out, keeps SACKing it, and only delivers it when
+	// it arrives again (v1.15.0 and later do this). Skipping SACKed
+	// segments, as the loop below does, then never resent it: the transfer
+	// stood still until the application gave up — about one in ten bulk
+	// transfers into a v1.15.0 node over the relay. Once the head has gone
+	// an RTO since it was last sent, forget the marks so the timeout
+	// resends from the cumulative ACK (Linux's SACK-reneging check does the
+	// same); a receiver that really holds the data says so in its next ACK.
+	if first := conn.Unacked[0]; first.sacked && now.Sub(first.sentAt) > conn.RTO {
+		for _, e := range conn.Unacked {
+			e.sacked = false
+		}
 	}
 
 	// Find the first non-SACKed unacked segment that has timed out
@@ -4727,6 +5036,7 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	// concurrent sendSegment cannot read the same value and produce a data
 	// segment with the same seq as the FIN sentinel (iter 24 fix, same
 	// pattern as the sendSegment pre-increment fix in iter 23).
+	d.sendHeldTailBeforeClose(conn)
 	conn.Mu.Lock()
 	st := conn.State
 	sendSeq := conn.SendSeq
@@ -5332,7 +5642,7 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	isLoopback := realIP != nil && realIP.IsLoopback()
 	if !isLoopback {
 		if lanAddrs, ok := resp["lan_addrs"].([]interface{}); ok && len(lanAddrs) > 0 {
-			if lanAddr := matchLANSubnet(d.lanAddrs, lanAddrs); lanAddr != "" {
+			if lanAddr := matchLANSubnet(d.currentLANAddrs(), lanAddrs); lanAddr != "" {
 				if !d.addrFamilyMismatch(lanAddr) {
 					targetAddr = lanAddr
 					slog.Info("same-LAN peer detected, using LAN address", "node_id", nodeID, "lan_addr", lanAddr)
@@ -5438,7 +5748,7 @@ func (d *Daemon) trustRepublishLoop() {
 				if errors.Is(err, errRegistryCallTimedOut) {
 					slog.Warn("heartbeat timed out — registry connection likely half-open, forcing reconnect",
 						"consecutive_failures", consecutiveFailures, "deadline", registryCallDeadline)
-					if rcErr := d.forceReconnectRegistry(); rcErr != nil {
+					if rcErr := d.reconnectRegistrySerialised(); rcErr != nil {
 						slog.Warn("registry force-reconnect failed", "error", rcErr)
 					} else {
 						consecutiveFailures = HeartbeatReregThresh
@@ -5459,7 +5769,7 @@ func (d *Daemon) trustRepublishLoop() {
 					time.Sleep(reregBackoff + jitter)
 
 					slog.Info("attempting re-registration", "backoff", reregBackoff)
-					d.reRegister()
+					_ = d.reRegisterSerialised() // logs its own failure; the next heartbeat tells
 					consecutiveFailures = 0
 
 					// Exponential backoff: 100ms → 200ms → 400ms → ... → 30s max.
@@ -5478,6 +5788,22 @@ func (d *Daemon) trustRepublishLoop() {
 			}
 		}
 	}
+}
+
+// reconnectRegistrySerialised and reRegisterSerialised are the heartbeat's
+// own registry reconnect and re-registration, under reestablishMu like the
+// recoveries' (reestablishTransport): run at the same time as one, either
+// would replace or use the registry connection under the other's requests.
+func (d *Daemon) reconnectRegistrySerialised() error {
+	d.reestablishMu.Lock()
+	defer d.reestablishMu.Unlock()
+	return d.forceReconnectRegistry()
+}
+
+func (d *Daemon) reRegisterSerialised() error {
+	d.reestablishMu.Lock()
+	defer d.reestablishMu.Unlock()
+	return d.reRegister()
 }
 
 // tunnelKeepaliveLoop (L4) refreshes the daemon's beacon registration so the
@@ -5508,21 +5834,77 @@ func (d *Daemon) tunnelKeepaliveLoop() {
 // Owns no transport state. Independent of trustRepublishLoop's failure
 // tracking — handshake polling is best-effort and survives transient
 // registry hiccups on its own.
+//
+// The keepalive-interval tick is the baseline and the only thing an idle
+// node runs. A second timer is armed only while a request this node sent is
+// unanswered, or a beacon poke is owed a poll (see handshakepoll.go), and is
+// stopped again as soon as neither holds.
 func (d *Daemon) handshakePollLoop() {
-	// Independent jitter so this loop does not align with the others.
-	time.Sleep(time.Duration(rand.Int63n(int64(5 * time.Second))))
-
-	ticker := time.NewTicker(d.config.keepaliveInterval())
-	defer ticker.Stop()
+	// Independent jitter so this loop does not align with the others. The
+	// baseline ticker starts once it has passed; requests, pokes and Stop
+	// are served during it.
+	// #nosec G404 -- startup-jitter scheduling only, not a security decision
+	jitter := time.NewTimer(time.Duration(rand.Int63n(int64(5 * time.Second))))
+	defer jitter.Stop()
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	extra := time.NewTimer(time.Hour)
+	extra.Stop()
+	defer extra.Stop()
+	extraArmed := false
+	trusted := func(nodeID uint32) bool {
+		return d.handshakes != nil && d.handshakes.IsTrusted(nodeID)
+	}
 	for {
 		select {
 		case <-d.stopCh:
 			return
-		case <-ticker.C:
-			if d.reg() == nil {
-				continue
+		case <-jitter.C:
+			ticker = time.NewTicker(d.config.keepaliveInterval())
+			tick = ticker.C
+		case <-tick:
+			d.pollHandshakes(0, 0)
+		case <-extra.C:
+			extraArmed = false
+			// The timer was armed for a poke or a request in flight; poll
+			// only if one of them is still owed. A request answered while
+			// the timer ran needs nothing more.
+			due, wait := d.hsPoll.pokeWait()
+			if (due && wait == 0) || d.hsPoll.fastActive(trusted) {
+				d.pollHandshakes(handshakeOnDemandGap-handshakePollSlack, 0)
 			}
-			d.pollRelayedHandshakes()
+		case <-d.hsPoll.wake:
+			if due, wait := d.hsPoll.pokeWait(); due && wait == 0 {
+				d.pollHandshakes(handshakeOnDemandGap, 0)
+			}
+		}
+
+		// Arm the extra timer for whichever comes first: a poll owed to a
+		// poke, or the next fast poll while a request is outstanding.
+		next := time.Duration(-1)
+		if due, wait := d.hsPoll.pokeWait(); due {
+			next = wait
+		}
+		if d.hsPoll.fastActive(trusted) && (next < 0 || handshakeFastPollInterval < next) {
+			next = handshakeFastPollInterval
+		}
+		switch {
+		case next < 0 && extraArmed:
+			if !extra.Stop() {
+				select {
+				case <-extra.C:
+				default:
+				}
+			}
+			extraArmed = false
+		case next >= 0 && !extraArmed:
+			extra.Reset(next)
+			extraArmed = true
 		}
 	}
 }
@@ -5562,11 +5944,67 @@ func (d *Daemon) publishHeartbeatEvent() {
 	})
 }
 
-// reRegister re-registers with the registry after a connection loss or registry restart.
-// Checks d.stopCh between regConn calls to avoid racing with Stop().
-func (d *Daemon) reRegister() {
+// reRegister re-registers with the registry after a connection loss or
+// registry restart, and restores everything the registry may have lost with
+// it: visibility, hostname and the trust pairs. Checks d.stopCh between
+// regConn calls to avoid racing with Stop(). Returns an error when the
+// registry did not accept the registration; the restore steps after it are
+// best-effort and only logged.
+func (d *Daemon) reRegister() error {
+	nodeID, _, err := d.registerEndpoint()
+	if err != nil {
+		return err
+	}
+	d.restoreRegistryState(nodeID, true)
+	return nil
+}
+
+// endpointOnlyRegistryFresh bounds when reRegisterEndpoint trusts the
+// registry to still hold this node: it must have answered us within this
+// long. The registry reaps a node after 30 minutes without a heartbeat, and
+// a reaped node comes back without its visibility or hostname.
+const endpointOnlyRegistryFresh = 5 * time.Minute
+
+// reRegisterEndpoint is the re-registration an address change needs. The
+// registry still holds this node, its visibility, hostname and trust pairs;
+// only the endpoint is out of date, so only the endpoint is sent. The full
+// reRegister would also write SetVisibility, SetHostname and one ReportTrust
+// per trusted peer (hundreds of signed writes for a node that trusts the
+// service fleet) for state the registry never lost.
+//
+// It falls back to the full restore when the registry may have dropped the
+// node after all: no answer from it for endpointOnlyRegistryFresh, a reply
+// under a different node ID, or a reply without the configured hostname
+// (the registry echoes a node's hostname on every registration).
+func (d *Daemon) reRegisterEndpoint() error {
+	if ok := d.lastRegistryOKNano.Load(); ok == 0 || time.Since(time.Unix(0, ok)) > endpointOnlyRegistryFresh {
+		return d.reRegister()
+	}
+	before := d.NodeID()
+	nodeID, resp, err := d.registerEndpoint()
+	if err != nil {
+		return err
+	}
+	if nodeID != before {
+		d.restoreRegistryState(nodeID, true)
+		return nil
+	}
+	if host, _ := resp["hostname"].(string); d.config.Hostname != "" && host != d.config.Hostname {
+		d.restoreRegistryState(nodeID, false)
+	}
+	return nil
+}
+
+// registerEndpoint sends this node's current endpoint and LAN addresses to
+// the registry and applies the reply. Returns the node ID the registry
+// answered with, and the reply.
+func (d *Daemon) registerEndpoint() (uint32, map[string]interface{}, error) {
 	if d.stopping() {
-		return
+		return 0, nil, errDaemonStopping
+	}
+	rc := d.reg()
+	if rc == nil {
+		return 0, nil, errors.New("re-registration: no registry connection")
 	}
 
 	var registrationAddr string
@@ -5592,34 +6030,34 @@ func (d *Daemon) reRegister() {
 	d.identityMu.RLock()
 	pubKeyB64 := crypto.EncodePublicKey(d.identity.PublicKey)
 	d.identityMu.RUnlock()
-	resp, err := d.reg().RegisterWithKeyOpts(registry.RegisterOpts{
+	resp, err := rc.RegisterWithKeyOpts(registry.RegisterOpts{
 		ListenAddr: registrationAddr,
 		PublicKey:  pubKeyB64,
 		Owner:      d.config.Owner,
-		LANAddrs:   d.lanAddrs,
+		LANAddrs:   d.currentLANAddrs(),
 		Version:    d.config.Version,
 		RelayOnly:  d.config.RelayOnly, // task 32
 	})
 	if err != nil {
 		slog.Error("re-registration failed", "error", err)
-		return
+		return 0, nil, fmt.Errorf("re-registration: %w", err)
 	}
 
 	nodeIDVal, ok := resp["node_id"].(float64)
 	if !ok {
 		slog.Error("re-registration: missing node_id in response")
-		return
+		return 0, nil, errors.New("re-registration: missing node_id in response")
 	}
 	newNodeID := uint32(nodeIDVal)
 	addrStr, ok := resp["address"].(string)
 	if !ok {
 		slog.Error("re-registration: missing address in response")
-		return
+		return 0, nil, errors.New("re-registration: missing address in response")
 	}
 	newAddr, err := protocol.ParseAddr(addrStr)
 	if err != nil {
 		slog.Error("re-registration: invalid address", "address", addrStr, "error", err)
-		return
+		return 0, nil, fmt.Errorf("re-registration: invalid address %q: %w", addrStr, err)
 	}
 
 	d.addrMu.Lock()
@@ -5641,7 +6079,13 @@ func (d *Daemon) reRegister() {
 		"node_id":      nodeID,
 		"reregistered": true,
 	})
+	return nodeID, resp, nil
+}
 
+// restoreRegistryState re-applies what a registry that lost this node also
+// lost: visibility and hostname, and with trust set the local trust pairs
+// and the beacon registration. Best-effort; failures are logged.
+func (d *Daemon) restoreRegistryState(nodeID uint32, trust bool) {
 	if d.stopping() {
 		return
 	}
@@ -5658,7 +6102,7 @@ func (d *Daemon) reRegister() {
 		}
 	}
 
-	if d.stopping() {
+	if d.stopping() || !trust {
 		return
 	}
 
@@ -6348,9 +6792,18 @@ func (d *Daemon) lookupPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 }
 
 // pollRelayedHandshakes checks the registry for handshake requests and
-// responses relayed to this node and processes them.
+// responses relayed to this node and processes them. It runs on the poll
+// goroutine started by pollHandshakes.
 func (d *Daemon) pollRelayedHandshakes() {
-	resp, err := d.reg().PollHandshakes(d.NodeID())
+	rc, nodeID := d.reg(), d.NodeID()
+	if rc == nil {
+		return
+	}
+	// No deadline of our own. The registry empties this node's handshake
+	// inbox as it answers; walking away from a slow reply would drop the
+	// requests and approvals in it. The client's own read deadline bounds
+	// the call, and callers that cannot wait stop waiting (pollHandshakes).
+	resp, err := rc.PollHandshakes(nodeID)
 	if err != nil {
 		slog.Debug("poll handshakes failed", "error", err)
 		return
@@ -6391,6 +6844,7 @@ func (d *Daemon) pollRelayedHandshakes() {
 		}
 		fromNodeID := uint32(fromIDVal)
 		accept, _ := respMsg["accept"].(bool)
+		d.hsPoll.answered(fromNodeID)
 
 		if accept {
 			slog.Info("relayed handshake approval received", "from_node_id", fromNodeID)

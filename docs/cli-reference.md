@@ -43,7 +43,7 @@ Communication commands:
   pilotctl send <address|hostname> <port> --data <msg> [--timeout <dur>]
   pilotctl recv <port> [--count <n>] [--timeout <dur>]
   pilotctl send-file <address|hostname> <filepath>
-  pilotctl send-message <address|hostname> --data <text> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
+  pilotctl send-message <address|hostname> --data <text> | --data - | --data-file <path> [--type text|json|binary] [--count <n>] [--reuse-conn] [--wait <dur>]
   pilotctl dgram <address|hostname> <port> --data <msg>
   pilotctl subscribe <address|hostname> <topic> [--count <n>] [--timeout <dur>]
   pilotctl publish <address|hostname> <topic> --data <message>
@@ -90,7 +90,9 @@ Agent tool discovery:
 App store (install + call local capability apps; full help: pilotctl appstore help):
   pilotctl appstore catalogue                         list apps available for one-command install
   pilotctl appstore view <id> [--all-changelog]       app detail page (description, methods, permissions)
-  pilotctl appstore install <app-id> [--force]        install by catalogue ID (fetch + verify + extract)
+  pilotctl appstore install <app-id> [--force] [--no-wait | --wait <dur>]
+                                                      install by catalogue ID (fetch + verify + extract)
+                                                      and wait up to 20s for the app's first start
   pilotctl appstore list                              list installed apps + their IPC methods
   pilotctl appstore call <id> <method> [json-args]    dispatch an IPC call into an app
   pilotctl appstore status|caps|audit|restart|uninstall <id>

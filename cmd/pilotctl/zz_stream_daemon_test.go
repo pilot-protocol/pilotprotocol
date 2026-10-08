@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,8 +64,13 @@ type streamDaemon struct {
 	// sendCount counts cmdSend frames received (atomic).
 	sendCount atomic.Int64
 
-	// dgramCount counts cmdSendTo frames received (atomic).
+	// dgramCount counts cmdSendTo and cmdSendToConfirm frames received
+	// (atomic).
 	dgramCount atomic.Int64
+
+	// dgramAnswer, when set, is the error text the daemon answers a
+	// confirmed send with instead of OK.
+	dgramAnswer atomic.Pointer[string]
 
 	// broadcastCount counts cmdBroadcast frames received.
 	broadcastCount atomic.Int64
@@ -141,6 +147,14 @@ func newStreamDaemon(t *testing.T) *streamDaemon {
 	d.on(tdCmdSendTo, func(_ []byte) [][]byte {
 		sd.dgramCount.Add(1)
 		return nil
+	})
+	// SendToConfirm — count, answer OK or the configured error.
+	d.on(tdCmdSendToConfirm, func(_ []byte) [][]byte {
+		sd.dgramCount.Add(1)
+		if msg := sd.dgramAnswer.Load(); msg != nil {
+			return [][]byte{append([]byte{tdCmdError, 0, 1}, *msg...)}
+		}
+		return [][]byte{{tdCmdSendToOK}}
 	})
 
 	// Close — fire-and-forget; daemon optionally pushes CmdCloseOK
@@ -361,10 +375,11 @@ func TestCmdDgramJSON(t *testing.T) {
 	if data["bytes"].(float64) != float64(len("udp-msg")) {
 		t.Errorf("bytes = %v", data["bytes"])
 	}
-	// SendTo is fire-and-forget; the daemon may or may not have processed
-	// the frame by the time cmdDgram returns. Give it a brief window via
-	// a follow-up RPC (Info) that forces a round-trip through the IPC.
-	_, _ = (&dummyForceRT{sd: sd}).Force()
+	if data["confirmed"] != true {
+		t.Errorf("confirmed = %v, want true from a daemon that confirms sends", data["confirmed"])
+	}
+	// The confirmed send is answered, so the daemon has seen the frame by
+	// the time cmdDgram returns.
 	if sd.dgramCount.Load() < 1 {
 		t.Errorf("daemon never saw cmdSendTo (count=%d)", sd.dgramCount.Load())
 	}
@@ -381,6 +396,59 @@ func TestCmdDgramText(t *testing.T) {
 	})
 	if !strings.Contains(out, "sent") {
 		t.Errorf("text dgram missing 'sent': %q", out)
+	}
+}
+
+// The daemon could not send the datagram: dgram used to report success
+// anyway, because the send it used was fire-and-forget.
+func TestCmdDgramReportsTheDaemonsRefusal(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	refusal := "sendto: port 9999 not allowed by network 0 policy"
+	sd.dgramAnswer.Store(&refusal)
+
+	var failure *trappedFatal
+	_ = captureStdout(t, func() {
+		withJSON(func() {
+			failure = runTrappingFatal(func() {
+				cmdDgram([]string{"0:0000.0000.002A", "9999", "--data", "udp-msg"})
+			})
+		})
+	})
+	if failure == nil {
+		t.Fatal("dgram succeeded although the daemon refused the send")
+	}
+	if failure.Code != "connection_failed" || !strings.Contains(failure.Message, "not allowed by network 0 policy") || strings.Count(failure.Message, "sendto:") != 1 {
+		t.Errorf("failure = %+v, want connection_failed naming the daemon's reason", failure)
+	}
+}
+
+// A daemon from before confirmed sends answers "unknown command"; dgram then
+// sends the datagram the old way and says the outcome is unconfirmed.
+func TestCmdDgramOnADaemonThatCannotConfirm(t *testing.T) {
+	sd := newStreamDaemon(t)
+	sd.useDaemonNoRegistry(t)
+	unknown := fmt.Sprintf("unknown command: 0x%02X", tdCmdSendToConfirm)
+	sd.dgramAnswer.Store(&unknown)
+
+	out := captureStdout(t, func() {
+		withJSON(func() {
+			cmdDgram([]string{"0:0000.0000.002A", "9999", "--data", "udp-msg"})
+		})
+	})
+	var env map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("json: %v\n%s", err, out)
+	}
+	if data := env["data"].(map[string]interface{}); data["confirmed"] != false {
+		t.Errorf("confirmed = %v, want false from a daemon that cannot confirm", data["confirmed"])
+	}
+	// The legacy send that follows the probe is not answered: wait for it.
+	for deadline := time.Now().Add(2 * time.Second); sd.dgramCount.Load() < 2 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := sd.dgramCount.Load(); n != 2 {
+		t.Errorf("daemon saw %d datagram frames, want the probe and the legacy send", n)
 	}
 }
 

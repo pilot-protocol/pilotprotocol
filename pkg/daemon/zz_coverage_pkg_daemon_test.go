@@ -799,13 +799,15 @@ func TestUnackedHasDataOnlyFINReturnsFalse(t *testing.T) {
 	}
 }
 
-func TestUnackedHasDataOnlySackedReturnsFalse(t *testing.T) {
+// SACKed data is not acknowledged: the receiver may hold it without
+// delivering it, so FinWait keeps retransmitting until it is.
+func TestUnackedHasDataOnlySackedReturnsTrue(t *testing.T) {
 	t.Parallel()
 	d := &Daemon{}
 	conn := &Connection{}
 	conn.Unacked = []*retxEntry{{seq: 1, sacked: true}, {seq: 2, sacked: true}}
-	if d.unackedHasData(conn) {
-		t.Fatal("all-sacked Unacked should report no data")
+	if !d.unackedHasData(conn) {
+		t.Fatal("all-sacked Unacked still holds data that is not cumulatively acknowledged")
 	}
 }
 

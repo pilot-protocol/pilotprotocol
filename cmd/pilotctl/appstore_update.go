@@ -279,7 +279,11 @@ func cmdAppStoreUpgrade(args []string) {
 		// state (keys, data.db, secrets, cap-state, audit log) is carried into
 		// the new install and the replaced dir is kept as a backup — see
 		// appstore_state.go. This is the path the hourly updater drives.
-		install := func() { cmdAppStoreInstall([]string{o.ID, "--force"}) }
+		// --no-wait: upgrade does not watch the app start. A failed start
+		// would be reported as "was not upgraded and stays at <old>", which
+		// is not what happened, and the hourly `upgrade --all` would spend
+		// the wait on every app.
+		install := func() { cmdAppStoreInstall([]string{o.ID, "--force", "--no-wait"}) }
 		if len(targets) == 1 {
 			install()
 			continue

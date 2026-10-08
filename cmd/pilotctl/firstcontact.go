@@ -29,12 +29,14 @@ package main
 // first-contact reply does not show up, and say which step failed.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pilot-protocol/common/driver"
@@ -153,15 +155,85 @@ func dialFailureHint(target string, err error, attempts int, elapsed time.Durati
 // inboxWatch finds the reply to one request in the inbox. It snapshots
 // the files present before the request is sent, so a reply to an
 // earlier request (or the late duplicate some services send) that is
-// already sitting in the inbox is never taken for this one, and it
-// returns the oldest new file from the peer rather than whichever one
-// the directory listing happens to put first.
+// already sitting in the inbox is never taken for this one.
+//
+// Which new message is the reply:
+//
+//   - Every request is sent with a message ID (addID). A message from the
+//     peer whose reply_to is one of our IDs is the reply, whatever else
+//     arrived before it.
+//   - A message whose reply_to names some other request is never taken: it
+//     answers another send-message --wait to the same peer.
+//   - A message without reply_to comes from a peer that does not echo the
+//     ID (every responder older than this, and old daemons, which drop the
+//     ID). The oldest such message from the peer is taken, as before IDs
+//     existed. Two concurrent requests to such a peer, or anything else it
+//     sends in the window, still cannot be told apart.
+//   - From a peer known to echo IDs, an untagged message can instead be the
+//     answer to someone else's untagged request, with our own tagged reply
+//     still on its way. A peer is known to echo when one of its earlier
+//     messages in the inbox carries a reply_to (peerEchoedBefore, which runs
+//     beside the send and is waited for only when an untagged message
+//     arrives). If our request reached the receiver with its ID
+//     (markTagged), an untagged message from such a peer is held until
+//     untaggedReplyGrace after it arrived, and taken only if no reply naming
+//     our request arrives meanwhile (or when the wait ends). Holding replies
+//     from peers with no such history would only delay them: no service
+//     responder echoes IDs yet.
+//   - Once the peer has been seen naming another request in reply_to during
+//     this wait, it evidently echoes IDs, and only a reply naming ours is
+//     taken.
 type inboxWatch struct {
 	dir    string
 	from   string
 	cutoff time.Time
 	seen   map[string]bool
+
+	// The echo-history scan newInboxWatch starts: echoedBefore is its
+	// result, valid once echoDone is closed (nil when no scan was started).
+	echoDone     chan struct{}
+	echoedBefore bool
+
+	mu     sync.Mutex
+	ids    map[string]bool // message IDs of our request (and of its re-send)
+	tagged bool            // a request of ours reached the receiver with its ID
+
+	// Used only by the goroutine that polls.
+	peerEchoes bool                   // the peer named another request in reply_to
+	held       map[string]interface{} // untagged message held back (see untaggedReply)
+	heldSince  time.Time
+	holdFrom   time.Time // our request's acknowledgement; no hold starts earlier
 }
+
+// untaggedReplyGrace is how long an untagged message from a peer known to
+// echo IDs is held back, after our request reached the receiver with its
+// ID, in case the reply that names our request follows. Replies from such
+// a peer normally name our request and are not delayed at all. awaitReply
+// polls early so the hold ends on time. The send-message help quotes this
+// value.
+const untaggedReplyGrace = 750 * time.Millisecond
+
+// replyPollInterval is how often awaitReply looks at the inbox.
+const replyPollInterval = 250 * time.Millisecond
+
+// The look for a peer's echo history reads only the newest inbox records:
+// at most echoHistoryFiles files and echoHistoryBytes bytes, and no further
+// than echoHistoryPeerRecords records from the peer. A record over
+// echoHistoryRecordBytes is a large message rather than an answer worth
+// reading, and is skipped. A record's sender is only known once it is read,
+// and the inbox holds up to 256 MiB. A peer whose last reply_to lies further
+// back is treated as not echoing, which is how every peer was treated
+// before.
+const (
+	echoHistoryPeerRecords = 200
+	echoHistoryFiles       = 1000
+	echoHistoryBytes       = 16 << 20
+	echoHistoryRecordBytes = 1 << 20
+)
+
+// peerEchoScan is peerEchoedBefore; tests replace it to see that the send
+// does not wait for it.
+var peerEchoScan = peerEchoedBefore
 
 func inboxDirPath() (string, error) {
 	home, err := os.UserHomeDir()
@@ -184,11 +256,150 @@ func newInboxWatch(from string) *inboxWatch {
 		for _, e := range entries {
 			w.seen[e.Name()] = true
 		}
+		// The scan reads files, tens of milliseconds on a full inbox, and
+		// its answer matters only once an untagged message arrives: run it
+		// beside the send instead of before it.
+		w.echoDone = make(chan struct{})
+		scan := peerEchoScan
+		go func() {
+			defer close(w.echoDone)
+			w.echoedBefore = scan(dir, entries, from)
+		}()
 	}
 	return w
 }
 
-// poll returns the oldest reply that arrived since the snapshot.
+// knownToEcho reports whether the peer is known to echo IDs from its
+// messages already in the inbox, waiting for newInboxWatch's scan if it is
+// still running.
+func (w *inboxWatch) knownToEcho() bool {
+	if w.echoDone == nil {
+		return false
+	}
+	<-w.echoDone
+	return w.echoedBefore
+}
+
+// inboxNameKey orders inbox files by arrival. Their names are
+// {TYPE}-{timestamp}-{seq}.json, so the part after the type sorts by time
+// whatever the message types.
+func inboxNameKey(name string) string {
+	if i := strings.Index(name, "-"); i >= 0 {
+		return name[i:]
+	}
+	return name
+}
+
+// peerEchoedBefore reports whether one of the newest records in entries
+// (the inbox at dir) from peer carries a reply_to: the peer has answered a
+// message by naming its ID, so it is known to echo IDs. The scan is bounded
+// by the echoHistory constants.
+func peerEchoedBefore(dir string, entries []os.DirEntry, peer string) bool {
+	if peer == "" {
+		return false
+	}
+	files := make([]os.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			files = append(files, e)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool { return inboxNameKey(files[i].Name()) > inboxNameKey(files[j].Name()) })
+	if len(files) > echoHistoryFiles {
+		files = files[:echoHistoryFiles]
+	}
+	// The daemon writes records with encoding/json, without spaces, so these
+	// byte patterns find the sender and a reply_to without parsing the
+	// record; only a record that has both is parsed to be sure.
+	fromPattern := []byte(`"from":"` + peer + `"`)
+	replyToPattern := []byte(`"reply_to":"`)
+	var read int64
+	fromPeer := 0
+	for _, e := range files {
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() || info.Size() > echoHistoryRecordBytes {
+			continue // a FIFO or device would block the read
+		}
+		if read += info.Size(); read > echoHistoryBytes {
+			break
+		}
+		body, err := os.ReadFile(filepath.Join(dir, e.Name())) // #nosec G304 -- a regular file listed in this node's own inbox directory
+		if err != nil {
+			continue
+		}
+		if !bytes.Contains(body, fromPattern) {
+			continue
+		}
+		if bytes.Contains(body, replyToPattern) {
+			var rec struct {
+				From    string `json:"from"`
+				ReplyTo string `json:"reply_to"`
+			}
+			if json.Unmarshal(body, &rec) == nil && rec.From == peer && rec.ReplyTo != "" {
+				return true
+			}
+		}
+		if fromPeer++; fromPeer == echoHistoryPeerRecords {
+			break
+		}
+	}
+	return false
+}
+
+// addID registers the message ID of a request this watch waits on. The
+// re-sent request has an ID of its own; a reply to either one is ours.
+func (w *inboxWatch) addID(id string) {
+	if id == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ids == nil {
+		w.ids = map[string]bool{}
+	}
+	w.ids[id] = true
+}
+
+// markTagged records that a request reached the receiver with its message
+// ID (SendResult.Tagged), so the peer can name it in reply_to. Until then
+// an untagged message is taken at once even from a peer known to echo: a
+// receiver that predates IDs dropped ours, and the peer can never name our
+// request.
+func (w *inboxWatch) markTagged() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.tagged = true
+}
+
+// replyKind says how a message's reply_to relates to this watch's requests.
+type replyKind int
+
+const (
+	replyUntagged replyKind = iota // no reply_to: only sender and time to go by
+	replyOurs                      // reply_to is one of our message IDs
+	replyOther                     // reply_to names somebody else's request
+)
+
+func (w *inboxWatch) classify(msg map[string]interface{}) replyKind {
+	replyTo, _ := msg["reply_to"].(string)
+	if replyTo == "" {
+		return replyUntagged
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.ids) == 0 {
+		// A caller that sent without an ID has nothing to compare with.
+		return replyUntagged
+	}
+	if w.ids[replyTo] {
+		return replyOurs
+	}
+	return replyOther
+}
+
+// poll returns the reply that arrived since the snapshot: the message that
+// names one of our requests in reply_to, else the oldest one from the peer
+// that names none, subject to untaggedReply.
 func (w *inboxWatch) poll() (map[string]interface{}, error) {
 	if w.dir == "" {
 		dir, err := inboxDirPath()
@@ -204,16 +415,9 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 		}
 		return nil, fmt.Errorf("read inbox: %w", err)
 	}
-	// Inbox files are {TYPE}-{timestamp}-{seq}.json: order by the part
-	// after the type so the oldest new message wins.
-	sort.Slice(entries, func(i, j int) bool {
-		ni, nj := entries[i].Name(), entries[j].Name()
-		di, dj := strings.Index(ni, "-"), strings.Index(nj, "-")
-		if di < 0 || dj < 0 {
-			return ni < nj
-		}
-		return ni[di:] < nj[dj:]
-	})
+	// Oldest first, so the oldest new message wins.
+	sort.Slice(entries, func(i, j int) bool { return inboxNameKey(entries[i].Name()) < inboxNameKey(entries[j].Name()) })
+	var untagged map[string]interface{}
 	for _, e := range entries {
 		if e.IsDir() || w.seen[e.Name()] {
 			continue
@@ -235,9 +439,82 @@ func (w *inboxWatch) poll() (map[string]interface{}, error) {
 				continue
 			}
 		}
-		return msg, nil
+		switch w.classify(msg) {
+		case replyOurs:
+			return msg, nil
+		case replyOther:
+			// Another request's answer, not taken. Every poll reads it
+			// again, so an ID added later (the re-send's) is still
+			// checked against it.
+			w.peerEchoes = true
+		case replyUntagged:
+			if untagged == nil {
+				untagged = msg
+			}
+		}
 	}
-	return nil, nil
+	return w.untaggedReply(untagged, time.Now()), nil
+}
+
+// untaggedReply decides whether msg, the oldest untagged message from the
+// peer (nil if there is none), is taken as the reply now. It is when our
+// request went out without its ID, or when the peer is not known to echo
+// IDs (as before IDs existed). From a peer with an echo history it is held
+// back until untaggedReplyGrace after it arrived (its received_at, or the
+// poll that first saw it), so a reply naming our request that arrives
+// meanwhile wins; and it is never taken from a peer seen naming another
+// request during this wait.
+func (w *inboxWatch) untaggedReply(msg map[string]interface{}, now time.Time) map[string]interface{} {
+	if msg == nil {
+		w.held = nil
+		return nil
+	}
+	w.mu.Lock()
+	tagged := w.tagged
+	w.mu.Unlock()
+	if !tagged || !w.peerEchoes && !w.knownToEcho() {
+		return msg
+	}
+	if w.held == nil {
+		w.heldSince = now
+		if ts, _ := msg["received_at"].(string); ts != "" {
+			if at, err := time.Parse(time.RFC3339Nano, ts); err == nil && at.Before(now) {
+				w.heldSince = at
+			}
+		}
+		// A message that arrived before our request was acknowledged is the
+		// least likely to be its reply: its hold starts at the ack.
+		if w.heldSince.Before(w.holdFrom) {
+			w.heldSince = w.holdFrom
+		}
+	}
+	w.held = msg
+	if w.peerEchoes || now.Sub(w.heldSince) < untaggedReplyGrace {
+		return nil
+	}
+	return msg
+}
+
+// heldReply returns the untagged message untaggedReply is holding back, if
+// it may still be taken. awaitReply takes it when the wait runs out before
+// its grace period does, rather than report no reply at all.
+func (w *inboxWatch) heldReply() map[string]interface{} {
+	if w.peerEchoes {
+		return nil
+	}
+	return w.held
+}
+
+// holdLeft is how much of the grace period a held message has left at now,
+// or 0 when nothing is held that may still be taken.
+func (w *inboxWatch) holdLeft(now time.Time) time.Duration {
+	if w.heldReply() == nil {
+		return 0
+	}
+	if left := w.heldSince.Add(untaggedReplyGrace).Sub(now); left > 0 {
+		return left
+	}
+	return 0
 }
 
 // replyWait configures awaitReply.
@@ -275,6 +552,7 @@ func awaitReply(w *inboxWatch, ackAt time.Time, cfg replyWait) (replyOutcome, er
 		err   error
 	}
 	var out replyOutcome
+	w.holdFrom = ackAt
 	deadline := ackAt.Add(cfg.wait)
 	var resendCh chan resendResult // non-nil while the re-send is in flight
 	lastObserve := time.Time{}
@@ -308,7 +586,9 @@ func awaitReply(w *inboxWatch, ackAt time.Time, cfg replyWait) (replyOutcome, er
 			default:
 			}
 		}
-		if !out.resent && cfg.resend != nil && cfg.resendAfter > 0 && now.Sub(ackAt) >= cfg.resendAfter && now.Before(deadline) {
+		// No re-send while an untagged message is held back: something did
+		// arrive, and it is most likely the reply.
+		if !out.resent && cfg.resend != nil && cfg.resendAfter > 0 && now.Sub(ackAt) >= cfg.resendAfter && now.Before(deadline) && w.heldReply() == nil {
 			out.resent = true
 			resendCh = make(chan resendResult, 1)
 			go func(ch chan<- resendResult) {
@@ -317,10 +597,19 @@ func awaitReply(w *inboxWatch, ackAt time.Time, cfg replyWait) (replyOutcome, er
 			}(resendCh)
 		}
 		if now.After(deadline) && resendCh == nil {
+			// The grace period for a held untagged message is bounded by
+			// the wait: when the wait ends first, it is the reply.
+			out.reply = w.heldReply()
 			out.waited = time.Since(ackAt)
 			return out, nil
 		}
-		time.Sleep(250 * time.Millisecond)
+		// Poll early when a held message's grace period ends sooner, so it
+		// is taken on time rather than up to a poll interval late.
+		sleep := replyPollInterval
+		if left := w.holdLeft(time.Now()); left > 0 && left < sleep {
+			sleep = left
+		}
+		time.Sleep(sleep)
 	}
 }
 

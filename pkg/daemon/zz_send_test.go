@@ -325,7 +325,7 @@ func TestSendDataImmediateSplitsIntoMSSSegments(t *testing.T) {
 	conn.RecvAck = 0
 
 	// Payload = 2 full MSS + a small tail.
-	payload := make([]byte, 2*MaxSegmentSize+10)
+	payload := make([]byte, 2*SendSegmentSize+10)
 	for i := range payload {
 		payload[i] = byte(i % 251)
 	}
@@ -356,7 +356,7 @@ func TestSendDataImmediateSplitsIntoMSSSegments(t *testing.T) {
 	if len(sizes) != 3 {
 		t.Fatalf("got %d segments, want 3; sizes=%v", len(sizes), sizes)
 	}
-	if sizes[0] != MaxSegmentSize || sizes[1] != MaxSegmentSize || sizes[2] != 10 {
+	if sizes[0] != SendSegmentSize || sizes[1] != SendSegmentSize || sizes[2] != 10 {
 		t.Fatalf("segment sizes = %v, want [MSS, MSS, 10]", sizes)
 	}
 }

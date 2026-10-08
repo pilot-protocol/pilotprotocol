@@ -474,13 +474,14 @@ func TestProcessAckThirdDupACKTriggersFastRetransmit(t *testing.T) {
 	}
 	// Multiplicative decrease: SSThresh = max(FlightSize/2, 2*SMSS).
 	// FlightSize = len("one") = 3; FlightSize/2 = 1 < 2*MSS = 8192 → floor applies.
-	// CongWin = SSThresh + 3*MSS (fast-recovery inflation).
+	// CongWin = SSThresh + three segments as sent (fast-recovery inflation:
+	// each duplicate ACK is one SendSegmentSize segment leaving the network).
 	wantSSThresh := 2 * MaxSegmentSize // max(3/2=1, 2*MSS=8192)
 	if c.SSThresh != wantSSThresh {
 		t.Fatalf("SSThresh = %d, want %d (max(FlightSize/2, 2*SMSS))", c.SSThresh, wantSSThresh)
 	}
-	if c.CongWin != wantSSThresh+3*MaxSegmentSize {
-		t.Fatalf("CongWin = %d, want %d", c.CongWin, wantSSThresh+3*MaxSegmentSize)
+	if c.CongWin != wantSSThresh+3*SendSegmentSize {
+		t.Fatalf("CongWin = %d, want %d", c.CongWin, wantSSThresh+3*SendSegmentSize)
 	}
 	if c.Stats.FastRetx != 1 {
 		t.Fatalf("Stats.FastRetx = %d, want 1", c.Stats.FastRetx)
@@ -725,4 +726,54 @@ func TestFastRetransmitNoUnackedIsNoop(t *testing.T) {
 	c.RetxMu.Lock()
 	c.fastRetransmit(0)
 	c.RetxMu.Unlock()
+}
+
+// A receiver whose application stopped reading parks the segment at
+// ExpectedSeq in its reorder buffer; the sender resends it and the resent
+// copy is delivered. The parked copy must go with it. It used to stay for
+// the life of the connection, and once the sequence space wrapped its stale
+// bytes were delivered as the continuation of the segment ending at its
+// sequence number, in place of the real data.
+func TestDeliverInOrderDropsTheParkedCopyOfADeliveredSegment(t *testing.T) {
+	t.Parallel()
+	c := &Connection{
+		RecvBuf:     make(chan []byte, 10),
+		ExpectedSeq: 1000,
+		// The parked copy, and a later segment still out of order.
+		OOOBuf: []*recvSegment{{seq: 1000, data: []byte("STALE")}, {seq: 1020, data: []byte("later")}},
+	}
+	if ack := c.DeliverInOrder(1000, []byte("fresh")); ack != 1005 {
+		t.Fatalf("ack = %d, want 1005", ack)
+	}
+	<-c.RecvBuf
+	for _, seg := range c.OOOBuf {
+		if seg.seq == 1000 {
+			t.Fatal("the parked copy of a delivered segment is still in the reorder buffer")
+		}
+	}
+	if len(c.OOOBuf) != 1 || c.OOOBuf[0].seq != 1020 {
+		t.Fatalf("reorder buffer = %d entries, want only the out-of-order segment at 1020", len(c.OOOBuf))
+	}
+
+	// What a stale copy did once the sequence space wrapped: a parked copy
+	// left over from a recovery, then the stream comes round to just
+	// before its number. The segment ending there must not pull the stale
+	// bytes after it.
+	c = &Connection{
+		RecvBuf:     make(chan []byte, 10),
+		ExpectedSeq: 1000,
+		OOOBuf:      []*recvSegment{{seq: 1000, data: []byte("STALE")}},
+	}
+	c.DeliverInOrder(1000, []byte("fresh"))
+	<-c.RecvBuf
+	c.ExpectedSeq = 995 // 4 GiB later
+	c.DeliverInOrder(995, []byte("12345"))
+	if got := string(<-c.RecvBuf); got != "12345" {
+		t.Fatalf("delivered %q, want the segment itself", got)
+	}
+	select {
+	case extra := <-c.RecvBuf:
+		t.Fatalf("delivered %q after it: stale bytes from the reorder buffer", extra)
+	default:
+	}
 }
