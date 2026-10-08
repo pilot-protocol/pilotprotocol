@@ -452,9 +452,9 @@ type Daemon struct {
 	// address watcher) and the heartbeat's own in trustRepublishLoop. They
 	// can all want one at once, and one caller's forceReconnectRegistry
 	// closes the connection another is mid-request on. reestablishOKWall
-	// (wall-clock unix nanos, under the mutex) is when the last
-	// reestablishTransport run the registry accepted finished, and
-	// reestablishOKFull whether it was a full re-registration.
+	// (wall-clock unix nanos, under the mutex) is when the last of their
+	// re-registrations the registry accepted finished, and
+	// reestablishOKFull whether it was a full one (noteReestablished).
 	reestablishMu     sync.Mutex
 	reestablishOKWall int64
 	reestablishOKFull bool
@@ -5783,10 +5783,16 @@ func (d *Daemon) trustRepublishLoop() {
 				if errors.Is(err, errRegistryCallTimedOut) {
 					slog.Warn("heartbeat timed out — registry connection likely half-open, forcing reconnect",
 						"consecutive_failures", consecutiveFailures, "deadline", registryCallDeadline)
-					if rcErr := d.reconnectRegistrySerialised(); rcErr != nil {
+					reconnected, rcErr := d.reconnectRegistrySerialised(rc)
+					switch {
+					case rcErr != nil:
 						slog.Warn("registry force-reconnect failed", "error", rcErr)
-					} else {
+					case reconnected:
 						consecutiveFailures = HeartbeatReregThresh
+					default:
+						// A recovery has replaced the connection the call
+						// waited on, and re-registers over the new one.
+						slog.Info("registry connection already replaced by a recovery — not reconnecting again")
 					}
 				}
 				// If the registry rejects our identity (node not found, or a
@@ -5831,16 +5837,42 @@ func (d *Daemon) trustRepublishLoop() {
 // own registry reconnect and re-registration, under reestablishMu like the
 // recoveries' (reestablishTransport): run at the same time as one, either
 // would replace or use the registry connection under the other's requests.
-func (d *Daemon) reconnectRegistrySerialised() error {
+//
+// Neither repeats what a recovery has just done. The heartbeat's call can
+// time out on a connection a recovery replaced while the call waited (a
+// resume whose own dial was slow); reconnecting would then replace the fresh
+// connection again, and the re-registration after it would repeat the full
+// restore, one ReportTrust per trusted peer included. So the reconnect
+// replaces stale, the connection the call timed out on, only while it is
+// still the current one, and reports whether it did.
+func (d *Daemon) reconnectRegistrySerialised(stale *registry.Client) (bool, error) {
 	d.reestablishMu.Lock()
 	defer d.reestablishMu.Unlock()
-	return d.forceReconnectRegistry()
+	if d.reg() != stale {
+		return false, nil
+	}
+	if err := d.forceReconnectRegistry(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
+// reRegisterSerialised re-registers in full, unless a full re-registration
+// the registry accepted finished less than reestablishCoalesce ago. Its own
+// counts the same way for a recovery right after it.
 func (d *Daemon) reRegisterSerialised() error {
 	d.reestablishMu.Lock()
 	defer d.reestablishMu.Unlock()
-	return d.reRegister()
+	if age, ok := d.reestablishedRecently(true); ok {
+		slog.Info("registry re-registered moments ago — heartbeat not repeating it",
+			"age", age.Truncate(time.Millisecond).String())
+		return nil
+	}
+	if err := d.reRegister(); err != nil {
+		return err
+	}
+	d.noteReestablished(true)
+	return nil
 }
 
 // tunnelKeepaliveLoop (L4) refreshes the daemon's beacon registration so the

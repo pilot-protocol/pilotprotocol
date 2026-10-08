@@ -334,11 +334,15 @@ func TestHeartbeatRegistryCallsWaitForARecovery(t *testing.T) {
 	defer stop()
 	d := newRegistryTestDaemon(t, addr, Config{})
 
+	reconnect := func() error {
+		_, err := d.reconnectRegistrySerialised(d.reg())
+		return err
+	}
 	for _, call := range []struct {
 		name string
 		fn   func() error
 	}{
-		{"reconnect", d.reconnectRegistrySerialised},
+		{"reconnect", reconnect},
 		{"re-register", d.reRegisterSerialised},
 	} {
 		before := d.reg()
@@ -365,5 +369,65 @@ func TestHeartbeatRegistryCallsWaitForARecovery(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("heartbeat %s never ran once the recovery let go", call.name)
 		}
+	}
+}
+
+// The heartbeat does not repeat a recovery that has just run. Its call can
+// time out on the connection a recovery replaced while the call waited (a
+// resume whose own dial was slow). It then replaced the fresh connection
+// again and re-registered in full a second time: two registers and two
+// ReportTrust per trusted peer. Its own re-registration counts for a
+// recovery right after it the same way.
+func TestHeartbeatDoesNotRepeatARecovery(t *testing.T) {
+	t.Parallel()
+	var log registryLog
+	addr, stop := serveFakeRegistry(t, func(req map[string]interface{}) map[string]interface{} {
+		typ, _ := req["type"].(string)
+		log.add(typ)
+		if typ == "register" {
+			return registerOK("")
+		}
+		return map[string]interface{}{"type": typ + "_ok"}
+	})
+	defer stop()
+	d := newRegistryTestDaemon(t, addr, Config{})
+	fs := installFakeHandshake(d)
+	fs.trustedRecs = []HandshakeTrustRecord{{NodeID: 41}, {NodeID: 42}}
+
+	stale := d.reg() // the heartbeat's call is waiting on this connection
+	if !d.reestablishTransport("resume", reestablishOpts{freshConn: true}) {
+		t.Fatal("resume recovery failed")
+	}
+	fresh := d.reg()
+
+	// The call times out: the heartbeat reconnects, then re-registers.
+	reconnected, err := d.reconnectRegistrySerialised(stale)
+	if err != nil {
+		t.Fatalf("heartbeat reconnect: %v", err)
+	}
+	if reconnected || d.reg() != fresh {
+		t.Fatal("the heartbeat replaced the connection the recovery had just opened")
+	}
+	if err := d.reRegisterSerialised(); err != nil {
+		t.Fatalf("heartbeat re-register: %v", err)
+	}
+	if log.get("register") != 1 || log.get("report_trust") != 2 {
+		t.Fatalf("resume then heartbeat sent %v, want one register and one report_trust per trusted peer", log.count)
+	}
+
+	// The other way round: a resume right after the heartbeat's own
+	// re-registration skips its registry half.
+	d.reestablishMu.Lock()
+	d.reestablishOKWall = time.Now().Add(-2 * reestablishCoalesce).UnixNano()
+	d.reestablishMu.Unlock()
+	log.reset()
+	if err := d.reRegisterSerialised(); err != nil {
+		t.Fatalf("heartbeat re-register: %v", err)
+	}
+	if !d.reestablishTransport("resume", reestablishOpts{freshConn: true}) {
+		t.Fatal("resume recovery failed")
+	}
+	if log.get("register") != 1 || d.reg() != fresh {
+		t.Fatalf("heartbeat then resume sent %v and replaced the connection: %v, want one register", log.count, d.reg() != fresh)
 	}
 }
