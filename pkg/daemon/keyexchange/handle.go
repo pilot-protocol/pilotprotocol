@@ -32,7 +32,11 @@ func (m *Manager) HandleAuthFrame(data []byte, from *net.UDPAddr, fromRelay bool
 
 	peerNodeID := binary.BigEndian.Uint32(data[0:4])
 	peerX25519PubKey := data[4:36]
-	peerEd25519PubKey := ed25519.PublicKey(data[36:68])
+	// Copied, not sliced: data is the socket's reused receive buffer, and
+	// this key outlives the frame (peer-key cache, post-install event).
+	// A slice would be overwritten by the next packet read.
+	peerEd25519PubKey := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	copy(peerEd25519PubKey, data[36:68])
 	signature := data[68:132]
 
 	// Encryption (X25519 priv) must be enabled.

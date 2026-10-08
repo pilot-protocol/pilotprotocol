@@ -490,9 +490,13 @@ func (m *Manager) PeerPubKeyCached(nodeID uint32) (ed25519.PublicKey, bool) {
 
 // SetPeerPubKey installs a cache entry directly. Used by handle paths
 // after verifying a packet-carried Ed25519 pubkey against the registry.
+// The key is copied, so a caller holding a slice of a packet buffer
+// cannot leave the cache pointing into memory the next read overwrites.
 func (m *Manager) SetPeerPubKey(nodeID uint32, pk ed25519.PublicKey) {
+	cp := make(ed25519.PublicKey, len(pk))
+	copy(cp, pk)
 	m.pubKeysMu.Lock()
-	m.peerPubKeys[nodeID] = pk
+	m.peerPubKeys[nodeID] = cp
 	m.pubKeysMu.Unlock()
 }
 

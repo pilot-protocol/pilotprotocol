@@ -31,6 +31,18 @@ func (m *Manager) SetRelayPeerPinned(nodeID uint32, relay bool) {
 	m.mu.Unlock()
 }
 
+// UnpinRelayPeer clears the pin on a peer and leaves its relay flag as it
+// is. Traffic keeps using the relay; ClearRelayOnDirect may now move the
+// peer back to direct once DirectClearsRequired direct packets arrive.
+// SetRelayPeerPinned(id, false) is not a substitute: it clears the relay
+// flag too, which sends traffic direct before anything has shown the
+// direct path works.
+func (m *Manager) UnpinRelayPeer(nodeID uint32) {
+	m.mu.Lock()
+	delete(m.relayPinned, nodeID)
+	m.mu.Unlock()
+}
+
 // IsRelayPeer reports whether the peer is currently in relay mode.
 func (m *Manager) IsRelayPeer(nodeID uint32) bool {
 	m.mu.RLock()
