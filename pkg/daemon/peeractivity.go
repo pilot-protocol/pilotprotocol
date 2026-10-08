@@ -112,8 +112,8 @@ func (tm *TunnelManager) idleFilter(now time.Time) func(nodeID uint32) bool {
 // application traffic within PeerIdleAfter. Unlike idleFilter, a peer with
 // no recorded activity is not in use: it is one this node only ever
 // exchanged upkeep with (a key request it never answered, a frame it could
-// not decrypt), or one a path reset has just re-keyed. With PeerIdleAfter
-// off every peer is in use, as before idleness was tracked.
+// not decrypt). With PeerIdleAfter off every peer is in use, as before
+// idleness was tracked.
 func (tm *TunnelManager) peerInUse(nodeID uint32, now time.Time) bool {
 	if PeerIdleAfter <= 0 || tm.activity == nil {
 		return true
