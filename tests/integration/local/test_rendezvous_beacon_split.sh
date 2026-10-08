@@ -52,7 +52,7 @@ trap cleanup EXIT
 $DC down -v >/dev/null 2>&1
 $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 for _ in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     if [ "$COUNT" -ge 2 ]; then break; fi
     sleep 1
 done
@@ -65,7 +65,7 @@ $DC exec -T agent-a pilotctl ping agent-b --count 2 --timeout 5s >/dev/null 2>&1
 log_test "block UDP/9001 on rendezvous (beacon dies, registry stays)"
 $DC exec -T rendezvous iptables -I INPUT -p udp --dport 9001 -m comment --comment pilot-beacon-split -j DROP >/dev/null 2>&1
 # Verify: registry still answers
-if $DC exec -T agent-a bash -c 'curl -fsS --max-time 3 http://$(getent hosts rendezvous | awk "{print \$1}"):8080/api/stats >/dev/null'; then
+if $DC exec -T agent-a bash -c 'curl -fsS --max-time 3 http://$(getent hosts rendezvous | awk "{print \$1}"):8080/api/public-stats >/dev/null'; then
     log_pass "registry HTTP still reachable"
 else
     log_fail "registry HTTP broken too — split did not isolate beacon"

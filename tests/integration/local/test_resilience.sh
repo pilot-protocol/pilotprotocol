@@ -20,7 +20,7 @@ echo "=========================================="
 
 $DC up -d rendezvous agent-a agent-b >/dev/null 2>&1
 for i in $(seq 1 60); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     [ "$COUNT" -ge 2 ] && break
     sleep 1
 done
@@ -97,13 +97,13 @@ log_test "restart rendezvous and confirm agents reconnect (≤4min)"
 $DC restart rendezvous >/dev/null 2>&1
 # Wait for health
 for i in $(seq 1 30); do
-    if $DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats >/dev/null 2>&1; then break; fi
+    if $DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats >/dev/null 2>&1; then break; fi
     sleep 1
 done
 # Poll for re-registration (up to 240s)
 RECONNECTED=0
 for i in $(seq 1 48); do
-    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null | jq -r '.total_nodes // 0')
+    COUNT=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null | jq -r '.total_nodes // 0')
     if [ "${COUNT:-0}" -ge 2 ]; then
         RECONNECTED=1
         break

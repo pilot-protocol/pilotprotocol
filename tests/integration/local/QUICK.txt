@@ -1,6 +1,6 @@
 # QUICK integration tier — tests that finish in ≤30s under -j 10 and
 # genuinely exercise live cross-process behavior (multi-daemon networking,
-# docker networking, NAT, partition, gateway proxy, etc.) that cannot be
+# docker networking, NAT, partition, etc.) that cannot be
 # covered by pkg/ unit tests.
 #
 # Excludes:
@@ -44,34 +44,15 @@ test_size_message_10mb_reject.sh
 
 # Policy (short)
 test_policy_connect_deny.sh
-test_policy_connect_score.sh
 test_policy_connect_tag.sh
 test_policy_datagram_deny.sh
 test_policy_datagram_score.sh
 test_policy_join_allow.sh
-test_policy_join_score.sh
 test_policy_cycle_evict.sh
 test_policy_cycle_fill_trust.sh
 test_policy_cycle_webhook.sh
 
 # Networks (short shipped-net subset)
-test_net_high_trust_society_shipped.sh
-test_net_data_exchange_policy_shipped.sh
-test_net_cold_shoulder_shipped.sh
-test_net_cooling_off_shipped.sh
-test_net_meritocracy_shipped.sh
-test_net_stable_state_shipped.sh
-
-# Gateway (short — excludes gateway_http_message which takes 90s)
-test_gateway_file.sh
-test_gateway_lookup.sh
-test_gateway_message.sh
-test_gateway_ping.sh
-test_gateway_pubsub_pub.sh
-test_gateway_pubsub_sub.sh
-test_gateway_register.sh
-test_gateway_rotate_key.sh
-test_gateway_trust_grant.sh
 
 # Observability + security (short)
 test_obs_log_peer_rekeyed.sh

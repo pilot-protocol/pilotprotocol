@@ -14,7 +14,7 @@ services:
       pilot-rendezvous -registry-addr "[::]:9000" -beacon-addr "[::]:9001"
       -http "[::]:8080" -log-level info
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://[::1]:8080/api/stats >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://[::1]:8080/api/public-stats >/dev/null || exit 1"]
       interval: 2s
       timeout: 2s
       retries: 10

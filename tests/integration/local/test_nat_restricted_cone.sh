@@ -16,7 +16,7 @@
 # accepts the STUN-discovered gateway IP as the registered endpoint.
 #
 # EXPECTED:
-#   - Both agents register with rendezvous (2 nodes in /api/stats).
+#   - Both agents register with rendezvous (2 nodes in /api/public-stats).
 #   - `pilotctl connect agent-b:7` from agent-a succeeds (echo works).
 #   - agent-a's registered endpoint is nat-gw's public IP (not the
 #     private 198.51.100.20), confirming STUN saw the NATed endpoint.
@@ -52,7 +52,7 @@ fi
 log_test "both agents register through NAT"
 REG=""
 for _ in $(seq 1 60); do
-    REG=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/stats 2>/dev/null \
+    REG=$($DC exec -T rendezvous curl -fsS http://127.0.0.1:8080/api/public-stats 2>/dev/null \
         | jq -r '.total_nodes // 0')
     [ "${REG:-0}" -ge 2 ] && break
     sleep 1
