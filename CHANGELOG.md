@@ -386,6 +386,11 @@ Detailed per-release notes are on the
   the oldest of them. After a parked segment was resent the timeout went from
   437 ms to 4.5 s. Following Karn's algorithm as Linux applies it, an ACK that
   newly acknowledges any resent segment gives no round-trip sample.
+- **Address-change recovery follow-ups:** registry retries no longer delay
+  the next address move (it waited up to 80 s, now 10 s); stopping the
+  daemon no longer waits up to 47 s for a recovery redialling a registry
+  that refuses connections; and the heartbeat no longer repeats the registry
+  reconnect and full re-registration a recovery has just done.
 - **A bulk transfer no longer hangs when the receiver's application falls
   behind.** When a receiver's application stops reading for a second, the
   receiver parks the next in-order segment in its reorder buffer and keeps
