@@ -452,6 +452,25 @@ Detailed per-release notes are on the
   command says where. The wallet (0.4.0) restores its key from there, or from
   its own copy in `~/.pilot/keys/io.pilot.wallet`, when it is installed
   again. If the dir cannot be moved, nothing is deleted.
+- **The daemon's log no longer repeats routine lines as warnings.** On a Mac
+  the log held 1,574 copies of `appstore skip io.pilot.wallet: read manifest:
+  … no such file or directory` in under an hour, and the Mac app listed them,
+  with two other routine lines, as warnings the daemon repeats:
+  - The app store rescans its install root every 2 s and logged a dir it
+    skipped every time. The wallet binary, run outside the daemon, keeps its
+    identity in `~/.pilot/apps/io.pilot.wallet`, a dir with no manifest. A
+    skipped dir is now logged once, and again only if the reason changes
+    (app-store v1.0.7); a dir with no manifest is left alone.
+  - The app store's lines had no level at all. They now go through the
+    daemon's logger: INFO for routine ones (`starting`, discovered and
+    removed apps, spawns), WARN for problems (crash loops, failed
+    verification, a manifest that does not parse or verify). A refused
+    downgrade, a rescan error, an uninstall and a reinstall no longer raise
+    repeated or spurious warnings.
+  - `tunnel bound to wildcard address` was a warning on every start of every
+    default install. Binding every interface is what a node does to hear its
+    peers, and the hint it gave (`-listen 127.0.0.1:0`) would cut the node
+    off; the address stays in the `tunnel listening` line.
 - **A write followed at once by a close no longer loses its end under
   loss.** A FIN that overtook a lost segment was acted on at once: the
   receiver closed the stream with the segment missing, and its FIN-ACK made

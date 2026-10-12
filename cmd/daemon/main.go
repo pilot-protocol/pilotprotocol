@@ -540,12 +540,12 @@ func main() {
 	)
 	if err := cataloguePins.Refresh(); err != nil {
 		if cataloguePins.LoadCache() {
-			log.Printf("appstore: catalogue refresh failed (%v); using %d cached publisher pin(s)", err, cataloguePins.Count())
+			slog.Warn(fmt.Sprintf("appstore: catalogue refresh failed (%v); using %d cached publisher pin(s)", err, cataloguePins.Count()))
 		} else {
-			log.Printf("appstore: catalogue refresh failed (%v) and no cache; catalogue apps fail closed until the next refresh succeeds", err)
+			slog.Warn(fmt.Sprintf("appstore: catalogue refresh failed (%v) and no cache; catalogue apps fail closed until the next refresh succeeds", err))
 		}
 	} else {
-		log.Printf("appstore: loaded %d catalogue publisher pin(s)", cataloguePins.Count())
+		slog.Info(fmt.Sprintf("appstore: loaded %d catalogue publisher pin(s)", cataloguePins.Count()))
 	}
 	// Refresh the pins periodically so newly-catalogued apps become spawnable
 	// without a daemon restart. Daemon-lifetime loop; the process exit stops it.
@@ -554,7 +554,8 @@ func main() {
 		defer t.Stop()
 		for range t.C {
 			if err := cataloguePins.Refresh(); err != nil {
-				log.Printf("appstore: catalogue pin refresh failed: %v (keeping previous pins)", err)
+				// Every 10 minutes while offline; the previous pins stay.
+				slog.Info(fmt.Sprintf("appstore: catalogue pin refresh failed: %v (keeping previous pins)", err))
 			}
 		}
 	}()
@@ -581,6 +582,11 @@ func main() {
 			// supervisor confirms each non-sideloaded app's manifest publisher
 			// against this before spawning. nil/unpinned => fail closed.
 			CataloguePublisher: cataloguePins.Publisher,
+			// The daemon's own logger, so the app store's lines carry a
+			// level (INFO routine, WARN problems) like the rest of the log.
+			// Through its default log.Logger they had none, and the Mac app
+			// counted every one of them as a warning.
+			Slog: slog.Default(),
 		}),
 	}); err != nil {
 		log.Fatalf("register appstore: %v", err)
