@@ -9,6 +9,15 @@ permissions:
   id-token: write          # PILOT-120: OIDC for SLSA attestation
   attestations: write      # PILOT-120: actions/attest-build-provenance
 
+# The Go toolchain the release binaries (daemon, pilotctl, updater) are built
+# and tested with. go.mod's go line stays at 1.25.13 so the modules that
+# require this one are not forced to raise theirs; the binaries are built with
+# a supported, patched toolchain instead (Go 1.25 is end of life, and
+# GO-2026-6809 in crypto/x509 is fixed only in 1.26.10 and 1.27.3).
+# security.yml's govulncheck scans with the same version: bump both together.
+env:
+  GO_VERSION: "1.27.3"
+
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -31,7 +40,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Vet
         run: go vet ./...
@@ -74,7 +83,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Build release binaries
         env:
@@ -89,6 +98,11 @@ jobs:
           for bin in $BINS; do
             echo "Building $bin for ${{ matrix.goos }}/${{ matrix.goarch }}..."
             go build -ldflags "$LDFLAGS" -o "dist/$bin" "./cmd/$bin"
+          done
+          # Every shipped binary must carry the pinned toolchain.
+          for bin in $BINS; do
+            go version "dist/$bin"
+            go version "dist/$bin" | grep -q ": go${GO_VERSION}\$"
           done
 
       # Ad-hoc codesign + drop quarantine on darwin builds so downloaded
