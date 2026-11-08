@@ -5,6 +5,7 @@ package keyexchange
 import (
 	"crypto/ed25519"
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"net"
 	"time"
@@ -90,6 +91,7 @@ func (m *Manager) HandleAuthFrame(data []byte, from *net.UDPAddr, fromRelay bool
 		return false
 	}
 	pc.Authenticated = true
+	pc.PeerEd25519 = peerEd25519PubKey
 
 	oldPC := m.env.Get(peerNodeID)
 	hadCrypto := oldPC != nil
@@ -221,9 +223,25 @@ func (m *Manager) HandleAuthFrame(data []byte, from *net.UDPAddr, fromRelay bool
 //
 //	[4 nodeID][32 X25519 pubkey]
 //
-// If we have an identity AND the peer has a registered pubkey, reject
-// the unauthenticated exchange and reply with our authenticated frame
-// instead.
+// A PILK proves nothing about who sent it: the sender names any node ID
+// and holds the X25519 key of the session that results, and that session
+// then decrypts frames from the named node ID. So a PILK opens a session
+// only when nothing better can exist for that node ID:
+//
+//   - A node in our trust store was trusted against its Ed25519 key, so
+//     it is refused whatever the registry says, and also before our own
+//     identity is set (the tunnel reads frames before registration).
+//   - With an identity, the registry must answer authoritatively that the
+//     peer has no key (ErrPeerHasNoKey). A peer with a key is refused and
+//     answered with our PILA, the key-request behaviour released daemons
+//     rely on (see KeyRequestAfterSends). A lookup that fails, or is
+//     negatively cached after failing, cannot tell the two apart, so it
+//     is refused without an answer.
+//   - It never replaces an authenticated session.
+//
+// Without an identity (before registration, or a test node) the PILK is
+// taken as before; SetIdentity reports the first identity so the caller
+// can drop those sessions.
 func (m *Manager) HandleUnauthFrame(data []byte, from *net.UDPAddr, fromRelay bool) bool {
 	if len(data) < 36 {
 		return false
@@ -237,20 +255,42 @@ func (m *Manager) HandleUnauthFrame(data []byte, from *net.UDPAddr, fromRelay bo
 		return false
 	}
 
-	// If we have identity, check if peer has a registered pubkey — if so,
-	// reject unauthenticated exchange and respond with authenticated.
 	hasIdentity := m.HasIdentity()
-	hadCryptoPre := m.env.Has(peerNodeID)
-	cryptoSize := m.env.Len()
+	trusted := m.inTrustStore(peerNodeID)
+	if trusted && !hasIdentity {
+		slog.Debug("rejecting unauthenticated key exchange for a trusted node ID (no identity yet)",
+			"peer_node_id", peerNodeID)
+		return false
+	}
 	if hasIdentity {
-		expectedPubKey, err := m.GetPeerPubKey(peerNodeID)
-		if err == nil && expectedPubKey != nil {
+		var expectedPubKey ed25519.PublicKey
+		var err error
+		if !trusted {
+			expectedPubKey, err = m.GetPeerPubKey(peerNodeID)
+		}
+		if trusted || (err == nil && len(expectedPubKey) > 0) {
 			slog.Warn("rejecting unauthenticated key exchange from peer with known identity",
-				"peer_node_id", peerNodeID)
+				"peer_node_id", peerNodeID, "trusted", trusted)
 			m.SendKeyExchangeToNode(peerNodeID)
 			return false
 		}
+		if err != nil && !errors.Is(err, ErrPeerHasNoKey) {
+			slog.Debug("rejecting unauthenticated key exchange: peer identity could not be checked",
+				"peer_node_id", peerNodeID, "error", err)
+			return false
+		}
+		// The registry says this node has no key: PILK is the only
+		// exchange it can make.
 	}
+	if hasIdentity {
+		if old := m.env.Get(peerNodeID); old != nil && old.Authenticated {
+			slog.Warn("rejecting unauthenticated key exchange over an authenticated session",
+				"peer_node_id", peerNodeID)
+			return false
+		}
+	}
+	hadCryptoPre := m.env.Has(peerNodeID)
+	cryptoSize := m.env.Len()
 
 	// Budget check BEFORE the expensive scalar multiplication. Without this,
 	// an attacker spraying unauth key-exchange frames at us can force CPU

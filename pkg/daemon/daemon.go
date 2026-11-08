@@ -39,6 +39,7 @@ import (
 	"github.com/pilot-protocol/pilotprotocol/internal/proxyconf"
 	"github.com/pilot-protocol/pilotprotocol/internal/transport/compat"
 	"github.com/pilot-protocol/pilotprotocol/internal/validate"
+	"github.com/pilot-protocol/pilotprotocol/pkg/daemon/keyexchange"
 	"github.com/pilot-protocol/pilotprotocol/pkg/daemon/routing"
 	"github.com/pilot-protocol/trustedagents"
 )
@@ -710,6 +711,7 @@ func New(cfg Config) *Daemon {
 	// peer trusted only through the registry now gets the redacted event,
 	// which is the conservative side.
 	d.tunnels.SetPeerTrustFn(d.handshakeTrusts)
+	d.wireTunnelTrustStore()
 	d.tunnels.SetOpenConnPeers(d.ports.ActiveNodeIDs)
 	d.ipc = NewIPCServer(cfg.SocketPath, d)
 	// HandshakeService is wired post-construction by the composition
@@ -3251,7 +3253,7 @@ func (d *Daemon) routeLoop() {
 			if !ok {
 				return
 			}
-			d.routePacketWithRecover(incoming.Packet, incoming.From)
+			d.routePacketWithRecover(incoming)
 		}
 	}
 }
@@ -3264,9 +3266,9 @@ func (d *Daemon) routeLoop() {
 // flows back via async work.
 //
 // L7 panic boundary (architecture-notes/03-INVARIANTS.md §8).
-func (d *Daemon) routePacketWithRecover(pkt *protocol.Packet, from *net.UDPAddr) {
+func (d *Daemon) routePacketWithRecover(in *IncomingPacket) {
 	defer recoverLayer("L7", "routeLoop", d.bus, nil)
-	d.handlePacket(pkt, from)
+	d.handleInbound(in.Packet, in.From, in.PeerKey)
 }
 
 func redactID(s string) string {
@@ -3311,6 +3313,50 @@ func (d *Daemon) handshakeTrusts(srcNode uint32) bool {
 	return kb.IsTrustedWithKey(srcNode, d.cachedPeerKeyB64(srcNode))
 }
 
+// handshakeTrustsSession is the handshake-trust check for a packet that
+// came in over the tunnel, used by the private-node SYN and datagram
+// gates. peerKey is the Ed25519 key that authenticated the session the
+// packet was decrypted under (IncomingPacket.PeerKey).
+//
+// With encryption on, that session is the only thing proving the
+// packet's source node ID. A session opened by an unauthenticated key
+// exchange (PILK) proves nothing: whoever sent the PILK chose the node
+// ID. So handshake trust needs an authenticated session, and the trust
+// store checks its binding against that session's key, never against an
+// empty key, which IsTrustedWithKey answers by node ID alone.
+//
+// In plaintext mode nothing on the wire proves a source at all, so the
+// node-ID answer (handshakeTrusts) is all there is.
+func (d *Daemon) handshakeTrustsSession(srcNode uint32, peerKey ed25519.PublicKey) bool {
+	if d.handshakes == nil {
+		return false
+	}
+	if d.tunnels == nil || !d.tunnels.encrypt {
+		return d.handshakeTrusts(srcNode)
+	}
+	if len(peerKey) == 0 {
+		return false
+	}
+	if kb, ok := d.handshakes.(keyBoundHandshakeService); ok {
+		return kb.IsTrustedWithKey(srcNode, base64.StdEncoding.EncodeToString(peerKey))
+	}
+	// A store without key binding answers by node ID, which the
+	// authenticated session has already tied to its registered key.
+	return d.handshakes.IsTrusted(srcNode)
+}
+
+// wireTunnelTrustStore lets the key-exchange layer see which node IDs are
+// in the handshake trust store, so it never opens an unauthenticated
+// (PILK) session under one of them. IsTrusted is a map lookup with no
+// side effects; d.handshakes is read per call because the handshake
+// plugin registers after New.
+func (d *Daemon) wireTunnelTrustStore() {
+	d.tunnels.SetTrustStoreFn(func(nodeID uint32) bool {
+		hs := d.handshakes
+		return hs != nil && hs.IsTrusted(nodeID)
+	})
+}
+
 func (d *Daemon) isTrustedPeer(srcNode uint32) bool {
 	trusted := d.handshakeTrusts(srcNode)
 	if !trusted && d.reg() != nil {
@@ -3330,7 +3376,17 @@ func (d *Daemon) admitDataPlanePeer(srcNode uint32) bool {
 	return d.isTrustedPeer(srcNode)
 }
 
+// handlePacket routes a packet handled outside the receive path, taking
+// the session currently installed for its source as the one it came in
+// on. routeLoop uses handleInbound with the packet's own session key.
 func (d *Daemon) handlePacket(pkt *protocol.Packet, from *net.UDPAddr) {
+	d.handleInbound(pkt, from, d.tunnels.sessionPeerKey(pkt.Src.Node))
+}
+
+// handleInbound routes one inbound packet. peerKey is the Ed25519 key
+// that authenticated the tunnel session it arrived on (nil if none); the
+// trust gates use it.
+func (d *Daemon) handleInbound(pkt *protocol.Packet, from *net.UDPAddr, peerKey ed25519.PublicKey) {
 	// D14 mitigation: when encryption is enabled, only auto-add peers that have an
 	// established crypto context (proving prior key exchange). This prevents peer table
 	// poisoning from spoofed packets. In plaintext mode, auto-add is safe since
@@ -3346,15 +3402,23 @@ func (d *Daemon) handlePacket(pkt *protocol.Packet, from *net.UDPAddr) {
 
 	switch pkt.Protocol {
 	case protocol.ProtoStream:
-		d.handleStreamPacket(pkt)
+		d.handleStreamPacketFrom(pkt, peerKey)
 	case protocol.ProtoDatagram:
-		d.handleDatagramPacket(pkt)
+		d.handleDatagramPacketFrom(pkt, peerKey)
 	case protocol.ProtoControl:
 		d.handleControlPacket(pkt)
 	}
 }
 
+// handleStreamPacket handles a stream packet outside the receive path;
+// see handlePacket.
 func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
+	d.handleStreamPacketFrom(pkt, d.tunnels.sessionPeerKey(pkt.Src.Node))
+}
+
+// handleStreamPacketFrom handles a stream packet that arrived over a
+// session authenticated by peerKey (nil if unauthenticated).
+func (d *Daemon) handleStreamPacketFrom(pkt *protocol.Packet, peerKey ed25519.PublicKey) {
 	// SYN — incoming connection request
 	if pkt.HasFlag(protocol.FlagSYN) && !pkt.HasFlag(protocol.FlagACK) {
 		ln := d.ports.GetListener(pkt.DstPort)
@@ -3428,7 +3492,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Runs before rate limiting so untrusted sources cannot waste rate-limit tokens.
 		if !d.config.Public {
 			srcNode := pkt.Src.Node
-			trusted := d.handshakeTrusts(srcNode)
+			trusted := d.handshakeTrustsSession(srcNode, peerKey)
 			if !trusted && d.replyWindowAdmits(srcNode, pkt.DstPort) {
 				// A reply to a request we sent (replywindow.go). Admitted
 				// without the synchronous registry trust check.
@@ -3992,7 +4056,15 @@ func (d *Daemon) sendDelayedACK(conn *Connection) {
 	d.tunnels.Send(conn.RemoteAddr.Node, ack)
 }
 
+// handleDatagramPacket handles a datagram outside the receive path; see
+// handlePacket.
 func (d *Daemon) handleDatagramPacket(pkt *protocol.Packet) {
+	d.handleDatagramPacketFrom(pkt, d.tunnels.sessionPeerKey(pkt.Src.Node))
+}
+
+// handleDatagramPacketFrom handles a datagram that arrived over a session
+// authenticated by peerKey (nil if unauthenticated).
+func (d *Daemon) handleDatagramPacketFrom(pkt *protocol.Packet, peerKey ed25519.PublicKey) {
 	if len(pkt.Payload) == 0 {
 		return
 	}
@@ -4000,7 +4072,7 @@ func (d *Daemon) handleDatagramPacket(pkt *protocol.Packet) {
 	// Trust gate: private nodes only accept datagrams from trusted or same-network peers
 	if !d.config.Public {
 		srcNode := pkt.Src.Node
-		trusted := d.handshakeTrusts(srcNode)
+		trusted := d.handshakeTrustsSession(srcNode, peerKey)
 		if !trusted && d.reg() != nil {
 			var err error
 			trusted, err = d.reg().CheckTrust(d.NodeID(), srcNode)
@@ -7238,8 +7310,15 @@ func (d *Daemon) lookupPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 	}
 
 	pubKeyB64, ok := resp["public_key"].(string)
-	if !ok || pubKeyB64 == "" {
-		return nil, fmt.Errorf("node %d has no public key", nodeID)
+	if !ok {
+		// The registry always sends the field (empty for a keyless
+		// node), so a reply without it says nothing about the key.
+		return nil, fmt.Errorf("node %d: lookup reply has no public key field", nodeID)
+	}
+	if pubKeyB64 == "" {
+		// The registry's own answer that the node has no key: the one
+		// answer that lets it use an unauthenticated key exchange.
+		return nil, fmt.Errorf("node %d has no public key: %w", nodeID, keyexchange.ErrPeerHasNoKey)
 	}
 
 	return crypto.DecodePublicKey(pubKeyB64)

@@ -237,6 +237,11 @@ type TunnelManager struct {
 type IncomingPacket struct {
 	Packet *protocol.Packet
 	From   *net.UDPAddr
+	// PeerKey is the Ed25519 key that authenticated the tunnel session
+	// this packet was decrypted under (see envelope.DecryptResult.PeerKey).
+	// Nil for plaintext packets and for sessions opened by an
+	// unauthenticated key exchange: nothing then proves Packet.Src.Node.
+	PeerKey ed25519.PublicKey
 }
 
 // maxPendingPerPeer limits how many packets can be queued per peer
@@ -805,8 +810,40 @@ func (tm *TunnelManager) loadNodeID() uint32 {
 
 // SetIdentity sets our Ed25519 identity for signing authenticated key
 // exchanges. Forwards to keyexchange.Manager (L5 owner of identity).
+//
+// The read loop runs before registration, and until the first identity
+// is set every PILK is taken without a registry check, under whatever
+// node ID it names. Those sessions, and the endpoints they taught us, are
+// forgotten here, so none of them outlives the window: a real peer
+// among them re-keys on its next send.
 func (tm *TunnelManager) SetIdentity(id *crypto.Identity) {
-	tm.kx.SetIdentity(id)
+	if !tm.kx.SetIdentity(id) {
+		return
+	}
+	for _, peer := range tm.kx.UnauthenticatedPeers() {
+		slog.Info("dropping session opened before this node had an identity", "peer_node_id", peer)
+		tm.RemovePeer(peer)
+	}
+}
+
+// SetTrustStoreFn installs the local trust-store membership check that
+// keeps PILK sessions away from trusted node IDs (see
+// keyexchange.Manager.HandleUnauthFrame).
+func (tm *TunnelManager) SetTrustStoreFn(fn func(nodeID uint32) bool) {
+	tm.kx.SetTrustStoreFn(fn)
+}
+
+// sessionPeerKey returns the Ed25519 key that authenticated the session
+// currently installed for nodeID, or nil when there is none or it came
+// from an unauthenticated key exchange. Inbound packets carry their own
+// session's key (IncomingPacket.PeerKey); this is for callers that
+// handle a packet outside the receive path.
+func (tm *TunnelManager) sessionPeerKey(nodeID uint32) ed25519.PublicKey {
+	c := tm.envelope.Get(nodeID)
+	if c == nil || !c.Authenticated {
+		return nil
+	}
+	return c.PeerEd25519
 }
 
 // SetPeerVerifyFunc sets a callback to fetch a peer's Ed25519 public
@@ -1963,7 +2000,7 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 	}
 
 	select {
-	case tm.recvCh <- &IncomingPacket{Packet: pkt, From: from}:
+	case tm.recvCh <- &IncomingPacket{Packet: pkt, From: from, PeerKey: res.PeerKey}:
 	case <-tm.done:
 	}
 }

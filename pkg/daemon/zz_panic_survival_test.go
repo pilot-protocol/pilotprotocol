@@ -283,7 +283,7 @@ func TestL7RoutePacketPanicSurvival(t *testing.T) {
 	defer d.Stop()
 
 	resetRecoveredPanicCountForTest()
-	d.routePacketWithRecover(nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1})
+	d.routePacketWithRecover(&IncomingPacket{From: &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}})
 
 	if RecoveredPanicCount() == 0 {
 		t.Fatal("L7 routePacketWithRecover did not catch nil-packet panic")

@@ -28,6 +28,7 @@
 package envelope
 
 import (
+	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"sync/atomic"
@@ -59,6 +60,14 @@ type DecryptResult struct {
 	// MaxRecvNonce is the recv-nonce high-water-mark observed under
 	// ReplayMu, captured for caller logging without re-locking.
 	MaxRecvNonce uint64
+
+	// PeerKey is the Ed25519 key that authenticated the session which
+	// opened this frame (Crypto.PeerEd25519), set on success only. Nil
+	// means the session came from an unauthenticated key exchange, so
+	// nothing proves PeerNodeID belongs to the sender. Taken from the
+	// Crypto that did the decrypt, so a rekey racing the caller cannot
+	// swap in another session's key.
+	PeerKey ed25519.PublicKey
 }
 
 // Framing-level errors. Pure verdicts on the wire-format / AEAD path —
@@ -206,12 +215,16 @@ func DecryptFrame(store *keyexchange.Store, data []byte) DecryptResult {
 	}
 	c.ReplayMu.Unlock()
 
-	return DecryptResult{
+	res := DecryptResult{
 		Plaintext:    plaintext,
 		PeerNodeID:   peerNodeID,
 		Counter:      recvCounter,
 		MaxRecvNonce: maxN,
 	}
+	if c.Authenticated {
+		res.PeerKey = c.PeerEd25519
+	}
+	return res
 }
 
 // rejectResult builds the DecryptResult for a nonce the replay window
