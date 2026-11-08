@@ -1947,7 +1947,8 @@ func (s *IPCServer) handleVerifyEnvelope(conn *ipcConn, reqID uint64, payload []
 		"node_id":      e.Node,
 		"address":      protocol.Addr{Network: e.Network, Node: e.Node}.String(),
 		"verified_via": verifiedVia,
-		"trusted":      s.daemon.handshakeTrusts(e.Node),
+		// Checked against the key that just verified the envelope.
+		"trusted": s.daemon.handshakeTrustsKey(e.Node, pub),
 	}
 	if req.CheckStanding {
 		s.addEnvelopeStanding(resp, e)

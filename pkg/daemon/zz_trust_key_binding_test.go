@@ -11,6 +11,8 @@ import (
 
 // keyBoundFakeHandshakeService implements HandshakeService plus the
 // optional IsTrustedWithKey half, recording what the daemon passed in.
+// It answers like the handshake plugin does: an unbound record by node
+// ID, a bound one only for its own key (an empty key does not pass it).
 type keyBoundFakeHandshakeService struct {
 	trusted     map[uint32]string // node ID → bound key ("" = unbound)
 	gotKeyFor   map[uint32]string
@@ -36,10 +38,10 @@ func (f *keyBoundFakeHandshakeService) IsTrustedWithKey(nodeID uint32, pubKeyB64
 	if !ok {
 		return false
 	}
-	if bound == "" || pubKeyB64 == "" {
+	if bound == "" {
 		return true
 	}
-	return bound == pubKeyB64
+	return pubKeyB64 != "" && bound == pubKeyB64
 }
 
 func (f *keyBoundFakeHandshakeService) TrustedPeers() []HandshakeTrustRecord      { return nil }
@@ -70,9 +72,10 @@ func testPubKey(t *testing.T, seed byte) (ed25519.PublicKey, string) {
 	return pk, base64.StdEncoding.EncodeToString(pk)
 }
 
-// The daemon hands the cached tunnel key to the trust store, so a node
-// ID whose key changed does not keep the previous holder's trust.
-func TestHandshakeTrustsPassesCachedPeerKey(t *testing.T) {
+// The tunnel.established naming check hands the cached tunnel key to the
+// trust store, so a node ID whose key changed does not keep the previous
+// holder's trust.
+func TestHandshakeTrustsCachedKeyPassesCachedPeerKey(t *testing.T) {
 	d := New(Config{})
 	pkA, pkAB64 := testPubKey(t, 1)
 	pkB, _ := testPubKey(t, 2)
@@ -82,7 +85,7 @@ func TestHandshakeTrustsPassesCachedPeerKey(t *testing.T) {
 	d.RegisterHandshakeService(svc)
 
 	d.tunnels.kx.SetPeerPubKey(42, pkA)
-	if !d.handshakeTrusts(42) {
+	if !d.handshakeTrustsCachedKey(42) {
 		t.Fatal("peer whose cached key matches the binding should be trusted")
 	}
 	if got := svc.gotKeyFor[42]; got != pkAB64 {
@@ -91,31 +94,60 @@ func TestHandshakeTrustsPassesCachedPeerKey(t *testing.T) {
 
 	// Same node ID, different key behind it.
 	d.tunnels.kx.SetPeerPubKey(42, pkB)
-	if d.handshakeTrusts(42) {
+	if d.handshakeTrustsCachedKey(42) {
 		t.Fatal("peer presenting a different key must not be trusted")
 	}
 }
 
-// With no key cached for the peer the daemon passes "", and the store
-// falls back to its node-ID-only answer.
-func TestHandshakeTrustsNoCachedKeyPassesEmpty(t *testing.T) {
+// With no key cached the daemon does not ask the trust store with an
+// empty key, which older plugin builds answered by node ID alone. The
+// answer is false: the event is redacted.
+func TestHandshakeTrustsCachedKeyNoCachedKeyIsNotTrusted(t *testing.T) {
 	d := New(Config{})
 
 	svc := newKeyBoundFake()
 	svc.trusted[42] = "some-bound-key"
 	d.RegisterHandshakeService(svc)
 
-	if !d.handshakeTrusts(42) {
-		t.Fatal("trust must not be denied just because no key is cached")
+	if d.handshakeTrustsCachedKey(42) {
+		t.Fatal("no cached key must not pass a key-bound record")
 	}
-	if got, ok := svc.gotKeyFor[42]; !ok || got != "" {
-		t.Fatalf("daemon passed %q, want empty string when no key is cached", got)
+	if svc.withKeyHits != 0 {
+		t.Fatalf("trust store asked %d times; never with an empty key", svc.withKeyHits)
+	}
+}
+
+// handshakeTrustsKey never passes an empty key to the store, and the
+// node-ID question has its own helper.
+func TestHandshakeTrustsKeyAndNodeID(t *testing.T) {
+	d := New(Config{})
+	pkA, pkAB64 := testPubKey(t, 5)
+	pkB, _ := testPubKey(t, 6)
+
+	svc := newKeyBoundFake()
+	svc.trusted[42] = pkAB64
+	d.RegisterHandshakeService(svc)
+
+	if d.handshakeTrustsKey(42, nil) {
+		t.Fatal("no key must not be trusted")
+	}
+	if svc.withKeyHits != 0 {
+		t.Fatal("the store must not be asked with an empty key")
+	}
+	if !d.handshakeTrustsKey(42, pkA) {
+		t.Fatal("the bound key should be trusted")
+	}
+	if d.handshakeTrustsKey(42, pkB) {
+		t.Fatal("another key must not be trusted")
+	}
+	if !d.handshakeTrustsNodeID(42) || d.handshakeTrustsNodeID(43) {
+		t.Fatal("handshakeTrustsNodeID answers by node ID alone")
 	}
 }
 
 // A handshake service without the key-bound check keeps working through
-// the node-ID-only path.
-func TestHandshakeTrustsFallsBackForServiceWithoutKeyCheck(t *testing.T) {
+// the node-ID-only path, given a key.
+func TestHandshakeTrustsKeyFallsBackForServiceWithoutKeyCheck(t *testing.T) {
 	d := New(Config{})
 
 	inner := newKeyBoundFake()
@@ -123,15 +155,13 @@ func TestHandshakeTrustsFallsBackForServiceWithoutKeyCheck(t *testing.T) {
 	d.RegisterHandshakeService(&nodeIDOnlyFakeHandshakeService{HandshakeService: inner})
 
 	pk, _ := testPubKey(t, 3)
-	d.tunnels.kx.SetPeerPubKey(42, pk)
-
-	if !d.handshakeTrusts(42) {
+	if !d.handshakeTrustsKey(42, pk) {
 		t.Fatal("node-ID-only service should still report trust")
 	}
 	if inner.withKeyHits != 0 {
 		t.Fatal("key-bound check should not have been reached")
 	}
-	if d.handshakeTrusts(43) {
+	if d.handshakeTrustsKey(43, pk) {
 		t.Fatal("unknown node should not be trusted")
 	}
 }
@@ -139,23 +169,8 @@ func TestHandshakeTrustsFallsBackForServiceWithoutKeyCheck(t *testing.T) {
 // A nil handshake service is not trusted and must not panic.
 func TestHandshakeTrustsNilServiceIsFalse(t *testing.T) {
 	d := New(Config{})
-	if d.handshakeTrusts(42) {
+	pk, _ := testPubKey(t, 7)
+	if d.handshakeTrustsKey(42, pk) || d.handshakeTrustsNodeID(42) || d.handshakeTrustsCachedKey(42) {
 		t.Fatal("no handshake service means no trust")
-	}
-}
-
-// cachedPeerKeyB64 never triggers a registry lookup, so it stays safe on
-// the packet path.
-func TestCachedPeerKeyB64IsCacheOnly(t *testing.T) {
-	d := New(Config{})
-
-	if got := d.cachedPeerKeyB64(42); got != "" {
-		t.Fatalf("uncached peer should yield empty string, got %q", got)
-	}
-
-	pk, b64 := testPubKey(t, 4)
-	d.tunnels.kx.SetPeerPubKey(42, pk)
-	if got := d.cachedPeerKeyB64(42); got != b64 {
-		t.Fatalf("cachedPeerKeyB64 = %q, want %q", got, b64)
 	}
 }

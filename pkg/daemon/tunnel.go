@@ -839,6 +839,9 @@ func (tm *TunnelManager) SetTrustStoreFn(fn func(nodeID uint32) bool) {
 // session's key (IncomingPacket.PeerKey); this is for callers that
 // handle a packet outside the receive path.
 func (tm *TunnelManager) sessionPeerKey(nodeID uint32) ed25519.PublicKey {
+	if tm == nil {
+		return nil
+	}
 	c := tm.envelope.Get(nodeID)
 	if c == nil || !c.Authenticated {
 		return nil

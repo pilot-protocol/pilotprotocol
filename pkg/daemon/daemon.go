@@ -710,7 +710,7 @@ func New(cfg Config) *Daemon {
 	// connections, and stalling every other inbound packet meanwhile. A
 	// peer trusted only through the registry now gets the redacted event,
 	// which is the conservative side.
-	d.tunnels.SetPeerTrustFn(d.handshakeTrusts)
+	d.tunnels.SetPeerTrustFn(d.handshakeTrustsCachedKey)
 	d.wireTunnelTrustStore()
 	d.tunnels.SetOpenConnPeers(d.ports.ActiveNodeIDs)
 	d.ipc = NewIPCServer(cfg.SocketPath, d)
@@ -3279,38 +3279,56 @@ func redactID(s string) string {
 // keyBoundHandshakeService is the optional half of HandshakeService for
 // trust stores that record which peer key each grant was made against.
 // Implementations that predate it (test fakes, older plugin builds) are
-// answered by node ID alone via handshakeTrusts.
+// answered by node ID alone.
+//
+// It is only ever called with a key. Plugin builds before the
+// key-binding hardening answered an empty key by node ID alone; later
+// ones refuse a key-bound record for it. Callers that mean the node ID
+// alone use handshakeTrustsNodeID, so the answer is the same either way.
 type keyBoundHandshakeService interface {
 	IsTrustedWithKey(nodeID uint32, pubKeyB64 string) bool
 }
 
-// cachedPeerKeyB64 returns the peer's Ed25519 key as base64, matching
-// crypto.EncodePublicKey, or "" when none is cached. Cache-only — no
-// registry lookup — so it is safe to call per packet.
-func (d *Daemon) cachedPeerKeyB64(nodeID uint32) string {
-	if d.tunnels == nil {
-		return ""
-	}
-	pk, ok := d.tunnels.peerPubKeyCached(nodeID)
-	if !ok || len(pk) == 0 {
-		return ""
-	}
-	return base64.StdEncoding.EncodeToString(pk)
+// handshakeTrustsNodeID reports whether the handshake trust store holds a
+// record for nodeID, whatever key that record is bound to. It answers for
+// the node ID, not for whoever presents it, so it is only for checks with
+// no proven key in scope where the node ID is the whole question: the
+// gate in front of a key exchange (the exchange itself is checked against
+// the registry), the trust-store membership the key exchange consults,
+// and plaintext mode, where nothing on the wire proves a source.
+func (d *Daemon) handshakeTrustsNodeID(nodeID uint32) bool {
+	hs := d.handshakes
+	return hs != nil && hs.IsTrusted(nodeID)
 }
 
-// handshakeTrusts consults the handshake trust store for srcNode,
-// passing along the peer's currently-known key so the store can check
-// it against the key the grant was bound to. A node ID whose key has
-// changed since trust was granted does not inherit that trust.
-func (d *Daemon) handshakeTrusts(srcNode uint32) bool {
-	if d.handshakes == nil {
+// handshakeTrustsKey checks nodeID's handshake trust against key, a key
+// the caller knows the peer proved (the one that authenticated its tunnel
+// session, or that verified a signature it made). A node ID whose key
+// has changed since trust was granted does not inherit that trust. No
+// key means no answer from the trust store: false.
+func (d *Daemon) handshakeTrustsKey(nodeID uint32, key ed25519.PublicKey) bool {
+	if d.handshakes == nil || len(key) == 0 {
 		return false
 	}
-	kb, ok := d.handshakes.(keyBoundHandshakeService)
-	if !ok {
-		return d.handshakes.IsTrusted(srcNode)
+	if kb, ok := d.handshakes.(keyBoundHandshakeService); ok {
+		return kb.IsTrustedWithKey(nodeID, base64.StdEncoding.EncodeToString(key))
 	}
-	return kb.IsTrustedWithKey(srcNode, d.cachedPeerKeyB64(srcNode))
+	// A store without key binding answers by node ID; the caller's key
+	// has already tied the peer to this node ID.
+	return d.handshakes.IsTrusted(nodeID)
+}
+
+// handshakeTrustsCachedKey checks nodeID's handshake trust against the
+// key cached for it (registry lookups and verified PILAs fill the cache).
+// It decides whether a tunnel.established event names the peer, and runs
+// right after a PILA was verified and its key cached. With nothing
+// cached it answers false, which only redacts the event.
+func (d *Daemon) handshakeTrustsCachedKey(nodeID uint32) bool {
+	if d.tunnels == nil {
+		return false
+	}
+	pk, _ := d.tunnels.peerPubKeyCached(nodeID)
+	return d.handshakeTrustsKey(nodeID, pk)
 }
 
 // handshakeTrustsSession is the handshake-trust check for a packet that
@@ -3323,26 +3341,18 @@ func (d *Daemon) handshakeTrusts(srcNode uint32) bool {
 // exchange (PILK) proves nothing: whoever sent the PILK chose the node
 // ID. So handshake trust needs an authenticated session, and the trust
 // store checks its binding against that session's key, never against an
-// empty key, which IsTrustedWithKey answers by node ID alone.
+// empty key.
 //
 // In plaintext mode nothing on the wire proves a source at all, so the
-// node-ID answer (handshakeTrusts) is all there is.
+// node-ID answer is all there is.
 func (d *Daemon) handshakeTrustsSession(srcNode uint32, peerKey ed25519.PublicKey) bool {
 	if d.handshakes == nil {
 		return false
 	}
 	if d.tunnels == nil || !d.tunnels.encrypt {
-		return d.handshakeTrusts(srcNode)
+		return d.handshakeTrustsNodeID(srcNode)
 	}
-	if len(peerKey) == 0 {
-		return false
-	}
-	if kb, ok := d.handshakes.(keyBoundHandshakeService); ok {
-		return kb.IsTrustedWithKey(srcNode, base64.StdEncoding.EncodeToString(peerKey))
-	}
-	// A store without key binding answers by node ID, which the
-	// authenticated session has already tied to its registered key.
-	return d.handshakes.IsTrusted(srcNode)
+	return d.handshakeTrustsKey(srcNode, peerKey)
 }
 
 // wireTunnelTrustStore lets the key-exchange layer see which node IDs are
@@ -3351,14 +3361,16 @@ func (d *Daemon) handshakeTrustsSession(srcNode uint32, peerKey ed25519.PublicKe
 // side effects; d.handshakes is read per call because the handshake
 // plugin registers after New.
 func (d *Daemon) wireTunnelTrustStore() {
-	d.tunnels.SetTrustStoreFn(func(nodeID uint32) bool {
-		hs := d.handshakes
-		return hs != nil && hs.IsTrusted(nodeID)
-	})
+	d.tunnels.SetTrustStoreFn(d.handshakeTrustsNodeID)
 }
 
+// isTrustedPeer is the strict data-plane check for a key-exchange frame
+// from srcNode, made before the frame's key is verified: local handshake
+// trust by node ID (the exchange that follows is checked against the
+// registry, and the SYN and datagram gates then check the trust record
+// against the session's key), else the registry's trust pairs.
 func (d *Daemon) isTrustedPeer(srcNode uint32) bool {
-	trusted := d.handshakeTrusts(srcNode)
+	trusted := d.handshakeTrustsNodeID(srcNode)
 	if !trusted && d.reg() != nil {
 		var err error
 		trusted, err = d.reg().CheckTrust(d.NodeID(), srcNode)
@@ -3374,6 +3386,25 @@ func (d *Daemon) admitDataPlanePeer(srcNode uint32) bool {
 		return true
 	}
 	return d.isTrustedPeer(srcNode)
+}
+
+// admitDataPlanePeerSession is admitDataPlanePeer for a packet that came
+// over a tunnel session authenticated by peerKey (nil if none): local
+// handshake trust is checked against that session's key, as at the SYN
+// and datagram gates, else the registry's trust pairs.
+func (d *Daemon) admitDataPlanePeerSession(srcNode uint32, peerKey ed25519.PublicKey) bool {
+	if !d.config.StrictDataPlaneTrust || d.config.Public {
+		return true
+	}
+	trusted := d.handshakeTrustsSession(srcNode, peerKey)
+	if !trusted && d.reg() != nil {
+		var err error
+		trusted, err = d.reg().CheckTrust(d.NodeID(), srcNode)
+		if err != nil {
+			slog.Warn("registry trust check failed (data-plane)", "src_node", srcNode, "err", err)
+		}
+	}
+	return trusted
 }
 
 // handlePacket routes a packet handled outside the receive path, taking
@@ -3406,7 +3437,7 @@ func (d *Daemon) handleInbound(pkt *protocol.Packet, from *net.UDPAddr, peerKey 
 	case protocol.ProtoDatagram:
 		d.handleDatagramPacketFrom(pkt, peerKey)
 	case protocol.ProtoControl:
-		d.handleControlPacket(pkt)
+		d.handleControlPacketFrom(pkt, peerKey)
 	}
 }
 
@@ -4108,7 +4139,15 @@ func (d *Daemon) handleDatagramPacketFrom(pkt *protocol.Packet, peerKey ed25519.
 	d.ipc.DeliverDatagram(pkt.Src, pkt.SrcPort, pkt.DstPort, pkt.Payload)
 }
 
+// handleControlPacket handles a control packet outside the receive path;
+// see handlePacket.
 func (d *Daemon) handleControlPacket(pkt *protocol.Packet) {
+	d.handleControlPacketFrom(pkt, d.tunnels.sessionPeerKey(pkt.Src.Node))
+}
+
+// handleControlPacketFrom handles a control packet that arrived over a
+// session authenticated by peerKey (nil if unauthenticated).
+func (d *Daemon) handleControlPacketFrom(pkt *protocol.Packet, peerKey ed25519.PublicKey) {
 	if pkt.DstPort == protocol.PortPing {
 		// Don't reply to a peer's pong: that would be a packet-amplification
 		// loop. The pong's SrcPort is PortPing too (so DstPort==PortPing on
@@ -4120,7 +4159,7 @@ func (d *Daemon) handleControlPacket(pkt *protocol.Packet) {
 		if pkt.HasFlag(protocol.FlagACK) {
 			return
 		}
-		if !d.admitDataPlanePeer(pkt.Src.Node) {
+		if !d.admitDataPlanePeerSession(pkt.Src.Node, peerKey) {
 			return
 		}
 		// Ping request — send pong back
