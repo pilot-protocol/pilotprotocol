@@ -9,6 +9,15 @@ Detailed per-release notes are on the
 
 ## [Unreleased]
 
+### Security
+- **Skill injection installs only signed content** (with the skillinject
+  release that requires signatures). Every file the injector fetches from
+  pilot-skills must be signed by the key skillinject has built in; if one
+  is unsigned or altered, the whole update is skipped, the files already on
+  the host stay as they are, and the daemon logs which file failed.
+  `PILOT_SKILLINJECT_MANIFEST_PUBKEY` still replaces the key, and now takes
+  hex as well as base64.
+
 ### Added
 - **`pilotctl send-message` can take its payload from stdin or a file**:
   `--data -` and `--data-file <path>`. A payload passed as an argument is
