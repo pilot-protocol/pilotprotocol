@@ -253,8 +253,8 @@ github.com/pilot-protocol/rendezvous v0.2.8 h1:GRJyNplqNrfhPuCUgOAaY5Dg5En4G2aO+
 github.com/pilot-protocol/rendezvous v0.2.8/go.mod h1:sv0TuqAosOCe3f3EIuZ9lmrNaHJTqyy5k/UGFqHskB4=
 github.com/pilot-protocol/runtime v0.3.3 h1:F8nzm9dHBDu0XTXxwM4rtWKo+j0wKdS2tVjzg8EAjeA=
 github.com/pilot-protocol/runtime v0.3.3/go.mod h1:6tXFAbLxXdxst1i5tlHrDG7wJehbk52RTLRRiUX/W2Q=
-github.com/pilot-protocol/skillinject v0.2.5 h1:ZLYjhBbEj/yB9Y4lEMxq7CiBS3FKoTVZiUY6EQqovpI=
-github.com/pilot-protocol/skillinject v0.2.5/go.mod h1:xzb3Bobbac9RwWp1svSIYvyBSEVP9HYSmPc59ntN89s=
+github.com/pilot-protocol/skillinject v0.2.6 h1:uIH0TfHGS+7rAi3OoND4muzQ0SNVtayd3Wz1ud9gb20=
+github.com/pilot-protocol/skillinject v0.2.6/go.mod h1:dSZQCLWUyF19Q7VJpm4+1f/GP0PYsfzCxryKyl6hpN8=
 github.com/pilot-protocol/trustedagents v0.2.6 h1:dFKr6V+lJr947v3iUyR7EflUTusGfKkItAmsqJfWc8g=
 github.com/pilot-protocol/trustedagents v0.2.6/go.mod h1:JAk89O4bg9NeXLnMJh4gUsCQ1R5BIHTQHjrGwNXaqZM=
 github.com/pilot-protocol/updater v0.2.6 h1:wBOKOrjNfp0T5t9AKQBzg6zGKy+neb+U83SN+LcVaiE=
