@@ -12,7 +12,7 @@ require (
 	github.com/pilot-protocol/handshake v0.3.3
 	github.com/pilot-protocol/policy v0.2.3
 	github.com/pilot-protocol/rendezvous v0.2.8
-	github.com/pilot-protocol/runtime v0.3.2
+	github.com/pilot-protocol/runtime v0.3.3
 	github.com/pilot-protocol/skillinject v0.2.5
 	github.com/pilot-protocol/trustedagents v0.2.6
 	github.com/pilot-protocol/updater v0.2.6
