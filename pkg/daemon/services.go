@@ -230,8 +230,13 @@ func (d *Daemon) handleEchoConn(conn *Connection) {
 	// (matches the SYN/datagram drop policy in daemon.go:2223 / 2636 — only
 	// private nodes filter inbound by trust). On private daemons, refuse to
 	// echo for untrusted peers; self-pings are always allowed.
+	//
+	// The check is made against the key of the tunnel session the peer
+	// is talking over now, as the SYN gate does, never by node ID alone
+	// while encryption is on.
 	if !d.config.Public && d.handshakes != nil && conn.RemoteAddr.Node != d.NodeID() {
-		if !d.handshakeTrusts(conn.RemoteAddr.Node) {
+		peer := conn.RemoteAddr.Node
+		if !d.handshakeTrustsSession(peer, d.tunnels.sessionPeerKey(peer)) {
 			slog.Debug("echo refused: peer not trusted (private node)",
 				"peer_node_id", conn.RemoteAddr.Node)
 			d.CloseConnection(conn)

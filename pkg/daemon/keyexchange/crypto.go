@@ -4,6 +4,7 @@ package keyexchange
 
 import (
 	"crypto/cipher"
+	"crypto/ed25519"
 	"sync"
 	"time"
 )
@@ -157,6 +158,11 @@ type Crypto struct {
 	Ready         bool     // true once key exchange is complete
 	Authenticated bool     // true if peer proved Ed25519 identity
 	PeerX25519Key [32]byte // peer's X25519 public key (for detecting rekeying)
+	// PeerEd25519 is the registry-verified key that signed the PILA this
+	// session came from (nil when !Authenticated). Trust checks on
+	// traffic from the session are bound to this key, not to whatever
+	// the peer-key cache holds when the packet is handled.
+	PeerEd25519 ed25519.PublicKey
 
 	// DecryptFailCount tracks consecutive AEAD authentication failures
 	// since the last successful decrypt. Older-version peer daemons drift

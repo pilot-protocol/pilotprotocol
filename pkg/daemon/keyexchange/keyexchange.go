@@ -43,6 +43,7 @@ package keyexchange
 import (
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -192,7 +193,9 @@ type FrameSender func(peerNodeID uint32, addr *net.UDPAddr, frame []byte) error
 type PeerAddrLookup func(peerNodeID uint32) *net.UDPAddr
 
 // VerifyFunc fetches the canonical Ed25519 public key for nodeID
-// (typically from the registry).
+// (typically from the registry). A node registered without a key is
+// reported as (nil, nil) or an error wrapping ErrPeerHasNoKey; any other
+// error means the lookup could not tell.
 type VerifyFunc func(nodeID uint32) (ed25519.PublicKey, error)
 
 // EventPublisher is the daemon's event-bus surface; nil-safe.
@@ -248,7 +251,7 @@ type Manager struct {
 	// peerPubKeys caches Ed25519 keys fetched via verifyFunc.
 	pubKeysMu   sync.RWMutex
 	peerPubKeys map[uint32]ed25519.PublicKey
-	negPubKeys  map[uint32]time.Time
+	negPubKeys  map[uint32]negPubKey
 
 	// rkPendingMu is the LEAF lock guarding pendingRekey +
 	// lastInboundDecrypt + rekeyGaveUp. NEVER held while taking any
@@ -294,6 +297,18 @@ type Manager struct {
 	preRetx     PreRetransmitHook
 	onGaveUp    func(nodeID uint32)
 	trustFn     func(nodeID uint32) bool
+	// trustStoreFn reports whether nodeID has a record in this node's
+	// local trust store. Such a node was trusted against its Ed25519
+	// key, so HandleUnauthFrame never opens a PILK session for it.
+	trustStoreFn func(nodeID uint32) bool
+}
+
+// negPubKey is a negatively cached key lookup. noKey records that the
+// registry answered authoritatively that the node has no key, as opposed
+// to a lookup that failed.
+type negPubKey struct {
+	at    time.Time
+	noKey bool
 }
 
 // New returns a fresh Manager. The Manager installs into store; pass
@@ -306,7 +321,7 @@ func New(store *Store) *Manager {
 	return &Manager{
 		env:                  store,
 		peerPubKeys:          make(map[uint32]ed25519.PublicKey),
-		negPubKeys:           make(map[uint32]time.Time),
+		negPubKeys:           make(map[uint32]negPubKey),
 		pendingRekey:         make(map[uint32]*PendingRekeyState),
 		lastInboundDecrypt:   make(map[uint32]time.Time),
 		rekeyGaveUp:          make(map[uint32]time.Time),
@@ -350,16 +365,44 @@ func (m *Manager) SetOnGaveUpHook(h func(nodeID uint32)) { m.onGaveUp = h }
 
 func (m *Manager) SetTrustFn(f func(nodeID uint32) bool) { m.trustFn = f }
 
+// SetTrustStoreFn installs the local trust-store membership check used by
+// HandleUnauthFrame. It must be cheap and free of side effects (no
+// registry round trip): it runs on the tunnel read loop.
+func (m *Manager) SetTrustStoreFn(f func(nodeID uint32) bool) { m.trustStoreFn = f }
+
+func (m *Manager) inTrustStore(nodeID uint32) bool {
+	return m.trustStoreFn != nil && m.trustStoreFn(nodeID)
+}
+
 // SetLocalNodeIDFn supplies the closure used to read our own node ID
 // (atomic read living in the daemon).
 func (m *Manager) SetLocalNodeIDFn(f func() uint32) { m.localNodeIDFn = f }
 
 // SetIdentity sets our Ed25519 identity for signing authenticated key
 // exchanges. May be called concurrently with HandleAuthFrame / Send.
-func (m *Manager) SetIdentity(id *crypto.Identity) {
+//
+// It reports whether this call gave the Manager its first identity. Until
+// then HandleUnauthFrame takes PILKs without asking the registry, so the
+// caller drops the sessions those opened (UnauthenticatedPeers): none of
+// them was ever checked.
+func (m *Manager) SetIdentity(id *crypto.Identity) (first bool) {
 	m.idMu.Lock()
+	first = m.identity == nil && id != nil
 	m.identity = id
 	m.idMu.Unlock()
+	return first
+}
+
+// UnauthenticatedPeers returns the peers whose installed session came
+// from an unauthenticated key exchange (PILK).
+func (m *Manager) UnauthenticatedPeers() []uint32 {
+	var out []uint32
+	for _, id := range m.env.PeerIDs() {
+		if c := m.env.Get(id); c != nil && !c.Authenticated {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // Identity returns the currently-set identity (or nil).
@@ -434,10 +477,13 @@ func (m *Manager) GetPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 		m.pubKeysMu.RUnlock()
 		return pk, nil
 	}
-	negAt, negOK := m.negPubKeys[nodeID]
+	neg, negOK := m.negPubKeys[nodeID]
 	m.pubKeysMu.RUnlock()
 
-	if negOK && time.Since(negAt) < NegativePubKeyCacheTTL {
+	if negOK && time.Since(neg.at) < NegativePubKeyCacheTTL {
+		if neg.noKey {
+			return nil, ErrPeerHasNoKey
+		}
 		return nil, errPubKeyUnresolved
 	}
 
@@ -450,7 +496,7 @@ func (m *Manager) GetPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 
 	pk, err := fn(nodeID)
 	if err != nil {
-		m.recordNegPubKey(nodeID)
+		m.recordNegPubKey(nodeID, errors.Is(err, ErrPeerHasNoKey))
 		return nil, err
 	}
 	m.pubKeysMu.Lock()
@@ -460,12 +506,12 @@ func (m *Manager) GetPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 	return pk, nil
 }
 
-func (m *Manager) recordNegPubKey(nodeID uint32) {
+func (m *Manager) recordNegPubKey(nodeID uint32, noKey bool) {
 	now := time.Now()
 	m.pubKeysMu.Lock()
 	if _, ok := m.negPubKeys[nodeID]; !ok && len(m.negPubKeys) >= MaxNegPubKeyEntries {
-		for id, at := range m.negPubKeys {
-			if now.Sub(at) >= NegativePubKeyCacheTTL {
+		for id, e := range m.negPubKeys {
+			if now.Sub(e.at) >= NegativePubKeyCacheTTL {
 				delete(m.negPubKeys, id)
 			}
 		}
@@ -474,7 +520,7 @@ func (m *Manager) recordNegPubKey(nodeID uint32) {
 			return
 		}
 	}
-	m.negPubKeys[nodeID] = now
+	m.negPubKeys[nodeID] = negPubKey{at: now, noKey: noKey}
 	m.pubKeysMu.Unlock()
 }
 

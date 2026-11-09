@@ -4,8 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
@@ -313,7 +311,7 @@ func main() {
 		IdentityPath:                    *identityPath,
 		TrustAutoApprove:                *trustAutoApprove,
 		DisableSkillinject:              *noSkillinject || os.Getenv("PILOT_NO_SKILLINJECT") == "1",
-		SkillinjectVerificationKeyFound: os.Getenv("PILOT_SKILLINJECT_MANIFEST_PUBKEY") != "" || os.Getenv("PILOT_SKILLINJECT_PUBKEY") != "",
+		SkillinjectVerificationKeyFound: os.Getenv(envSkillinjectPubkey) != "" || os.Getenv("PILOT_SKILLINJECT_PUBKEY") != "",
 		MOTDFeedURL:                     *motdFeedURL,
 		WebhookURL:                      *webhookURL,
 	}
@@ -452,20 +450,17 @@ func main() {
 	//     github.com/TeoSlayer/pilot-skills, the injector itself at
 	//     github.com/pilot-protocol/skillinject (AGPL-3.0). Nothing is
 	//     embedded or hidden.
+	//   - Everything it injects is signed. skillinject checks each fetched
+	//     file against the pilot-skills key it has built in (or the key in
+	//     PILOT_SKILLINJECT_MANIFEST_PUBKEY, see skillinject_config.go) and
+	//     writes nothing from an update in which one file fails.
 	//   - It only rewrites its own marker block, never operator content.
 	//   - Operators opt out anytime with `pilotctl skills disable all`
 	//     (persisted in ~/.pilot/config.json); see cmd/pilotctl/skills.go.
 	if !*noSkillinject && os.Getenv("PILOT_NO_SKILLINJECT") != "1" {
-		skillinjectCfg := skillinject.Config{}
-		if pk := os.Getenv("PILOT_SKILLINJECT_MANIFEST_PUBKEY"); pk != "" {
-			raw, err := base64.StdEncoding.DecodeString(pk)
-			if err != nil {
-				log.Fatalf("PILOT_SKILLINJECT_MANIFEST_PUBKEY: invalid base64 encoding")
-			}
-			if len(raw) != ed25519.PublicKeySize {
-				log.Fatalf("PILOT_SKILLINJECT_MANIFEST_PUBKEY: must be a %d-byte ed25519 key", ed25519.PublicKeySize)
-			}
-			skillinjectCfg.ManifestPublicKey = ed25519.PublicKey(raw)
+		skillinjectCfg, err := skillinjectConfigFromEnv(os.Getenv)
+		if err != nil {
+			log.Fatalf("%v", err)
 		}
 		if err := rt.Register(skillinject.NewService(skillinjectCfg)); err != nil {
 			log.Fatalf("register skillinject: %v", err)

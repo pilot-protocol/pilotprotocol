@@ -9,6 +9,24 @@ Detailed per-release notes are on the
 
 ## [Unreleased]
 
+### Security
+- **Skill injection installs only signed content** (skillinject v0.2.6). Every file the injector fetches from
+  pilot-skills must be signed by the key skillinject has built in; if one
+  is unsigned or altered, the whole update is skipped, the files already on
+  the host stay as they are, and the daemon logs which file failed.
+  `PILOT_SKILLINJECT_MANIFEST_PUBKEY` still replaces the key, and now takes
+  hex as well as base64.
+- **Trust is bound to keys the registry confirmed** (handshake v0.3.4,
+  runtime v0.3.3). The daemon checks handshake trust against the key a peer
+  proved in its session, or by node ID only where a caller means the node
+  ID, and does not open an unauthenticated session under a node ID that has
+  or may have a registered key. Automatic trust (`-trust-auto-approve`
+  included) and relayed requests need the registry to confirm the sender's
+  key; a request it cannot confirm waits in the pending queue for the
+  operator. Accept, reject and revoke messages must be signed.
+- **Role-based network administration is signed** (common v0.6.2), as the
+  canonical registry requires since 2026-11-08.
+
 ### Added
 - **`pilotctl send-message` can take its payload from stdin or a file**:
   `--data -` and `--data-file <path>`. A payload passed as an argument is
@@ -300,6 +318,8 @@ Detailed per-release notes are on the
   unknown type; before it answered that no verifier was configured.
 
 ### Changed
+- **Release binaries are built with Go 1.27.3** (daemon, pilotctl, updater).
+  go.mod's go line stays at 1.25.13.
 - **`pilotctl send-message` asks the daemon for its `info` reply once, not
   twice.** The auto-handshake read the daemon's `features` from a second
   `info` request, although the command had fetched one a moment earlier for
