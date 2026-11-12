@@ -1,26 +1,6 @@
 {
   "apps": [
     {
-      "bundle_sha256": "8d30b4331bc025c327dd2d8610362984cc9365843176e21b96a2637d8e18ff54",
-      "bundle_size": 9110758,
-      "bundle_url": "https://github.com/pilot-protocol/pilotprotocol/releases/download/wallet-v0.3.3/io.pilot.wallet-0.3.3.tar.gz",
-      "categories": [
-        "payments",
-        "crypto",
-        "finance"
-      ],
-      "description": "On-overlay USDC payments — multichain (Base + Ethereum + Polygon).",
-      "display_name": "Wallet",
-      "id": "io.pilot.wallet",
-      "license": "AGPL-3.0-or-later",
-      "metadata_sha256": "feed58970092e4ddb53d9a4d60923ff11e94af51c9ffd67e5c111e5cad5bd7f1",
-      "metadata_url": "https://raw.githubusercontent.com/pilot-protocol/pilotprotocol/main/catalogue/apps/io.pilot.wallet/metadata.json",
-      "publisher": "ed25519:xAD0ai5GYWo8v0cmdhytZYRjSbi2edgEthWkBnO+1ik=",
-      "source_url": "https://github.com/pilot-protocol/wallet",
-      "vendor": "Pilot Protocol",
-      "version": "0.3.3"
-    },
-    {
       "bundle_sha256": "faf60deeaa9a29298b447f7f0276f1bd4523af86390cf65c677452dc9718d5a0",
       "bundle_size": 4774876,
       "bundle_url": "https://github.com/pilot-protocol/catalog/releases/download/cosift-v0.1.2/io.pilot.cosift-0.1.2.tar.gz",
@@ -117,7 +97,7 @@
         "markets",
         "intelligence"
       ],
-      "description": "SLIPSTREAM — Polymarket smart-money leaderboard, signals, tape \u0026 opportunities (Ed25519-signed API).",
+      "description": "SLIPSTREAM — Polymarket smart-money leaderboard, signals, tape & opportunities (Ed25519-signed API).",
       "display_name": "Slipstream",
       "id": "io.pilot.slipstream",
       "license": "MIT",
@@ -649,7 +629,7 @@
         "scraping",
         "ai"
       ],
-      "description": "Connect your agent to Orthogonal — one key fronting 58 paid APIs / 851 endpoints (lead \u0026 contact enrichment, email \u0026 phone finding, web \u0026 social scraping, AI search, company/people/jobs data, weather, voice). Describe a task in plain English and Orthogonal's router returns the exact APIs to call; execute any of them through a single run, billed at the real per-call price and metered against a per-user $5 budget. Discovery, pricing and balance calls are free.",
+      "description": "Connect your agent to Orthogonal — one key fronting 58 paid APIs / 851 endpoints (lead & contact enrichment, email & phone finding, web & social scraping, AI search, company/people/jobs data, weather, voice). Describe a task in plain English and Orthogonal's router returns the exact APIs to call; execute any of them through a single run, billed at the real per-call price and metered against a per-user $5 budget. Discovery, pricing and balance calls are free.",
       "display_name": "Orthogonal",
       "id": "io.pilot.orthogonal",
       "license": "MIT",
@@ -1034,6 +1014,44 @@
       "id": "com.comos-federation.connector",
       "publisher": "ed25519:IB9iTy70SyMHnQjG1rMtOoXf3KIE3uDZpElGpBw5fUw=",
       "version": "0.1.0"
+    },
+    {
+      "id": "io.pilot.wallet",
+      "version": "0.4.1",
+      "description": "On-overlay USDC payments — multichain (Base + Ethereum + Polygon).",
+      "bundle_url": "https://github.com/pilot-protocol/catalog/releases/download/wallet-v0.4.1/io.pilot.wallet-0.4.1-linux-amd64.tar.gz",
+      "bundle_sha256": "362655029f4f1157adea8910e950538730d8c3dc7d3339eb1034f3a451b7695e",
+      "display_name": "Wallet",
+      "vendor": "Pilot Protocol",
+      "categories": [
+        "payments",
+        "crypto",
+        "finance"
+      ],
+      "bundle_size": 5145210,
+      "source_url": "https://github.com/pilot-protocol/wallet",
+      "license": "AGPL-3.0-or-later",
+      "metadata_url": "https://raw.githubusercontent.com/pilot-protocol/pilotprotocol/main/catalogue/apps/io.pilot.wallet/metadata.json",
+      "metadata_sha256": "1e08334e4fa54afa74afd9b9f418875b425ed4a6e6a4f8b191c7a4a4f8cc4175",
+      "bundles": {
+        "linux/amd64": {
+          "bundle_url": "https://github.com/pilot-protocol/catalog/releases/download/wallet-v0.4.1/io.pilot.wallet-0.4.1-linux-amd64.tar.gz",
+          "bundle_sha256": "362655029f4f1157adea8910e950538730d8c3dc7d3339eb1034f3a451b7695e"
+        },
+        "linux/arm64": {
+          "bundle_url": "https://github.com/pilot-protocol/catalog/releases/download/wallet-v0.4.1/io.pilot.wallet-0.4.1-linux-arm64.tar.gz",
+          "bundle_sha256": "70556dcf3c57c596d23d7feb37a39ebbff01ffd06a103f00a244aa00c60a3f24"
+        },
+        "darwin/amd64": {
+          "bundle_url": "https://github.com/pilot-protocol/catalog/releases/download/wallet-v0.4.1/io.pilot.wallet-0.4.1-darwin-amd64.tar.gz",
+          "bundle_sha256": "b3bf7b73869e5b8e03ffc24a7e6cef87dc51a3bd9b26e4f7cee0262f6af97eab"
+        },
+        "darwin/arm64": {
+          "bundle_url": "https://github.com/pilot-protocol/catalog/releases/download/wallet-v0.4.1/io.pilot.wallet-0.4.1-darwin-arm64.tar.gz",
+          "bundle_sha256": "4ce3766917a84a3c862c444bf560e8e26314ed50957aee108d7d421927890022"
+        }
+      },
+      "publisher": "ed25519:xAD0ai5GYWo8v0cmdhytZYRjSbi2edgEthWkBnO+1ik="
     }
   ],
   "updated_at": "2026-07-03T00:00:00Z",

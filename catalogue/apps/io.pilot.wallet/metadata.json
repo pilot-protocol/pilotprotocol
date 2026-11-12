@@ -3,7 +3,7 @@
   "id": "io.pilot.wallet",
   "display_name": "Wallet",
   "tagline": "On-overlay USDC payments across Base, Ethereum, and Polygon",
-  "description_md": "The Pilot reference wallet brings x402 + EIP-3009 USDC payments to the overlay, with spend caps the supervisor enforces. One secp256k1 address works across all three USDC mainnets (Base, Ethereum, Polygon); per-chain RPC is configurable via PILOT_EVM_RPC_\u003cchainID\u003e.\n\nInstalling this app lets other apps and agents settle payments without leaving the network. Spend caps declared in the manifest are reviewed at install time and enforced on every signing operation — see `pilotctl appstore caps io.pilot.wallet`.",
+  "description_md": "The Pilot reference wallet brings x402 + EIP-3009 USDC payments to the overlay, with spend caps the supervisor enforces. One secp256k1 address works across all three USDC mainnets (Base, Ethereum, Polygon); per-chain RPC is configurable via PILOT_EVM_RPC_<chainID>.\n\nInstalling this app lets other apps and agents settle payments without leaving the network. Spend caps declared in the manifest are reviewed at install time and enforced on every signing operation — see `pilotctl appstore caps io.pilot.wallet`.",
   "vendor": {
     "name": "Pilot Protocol",
     "url": "https://pilotprotocol.network",
@@ -28,7 +28,7 @@
     "payments"
   ],
   "size": {
-    "bundle_bytes": 9110758,
+    "bundle_bytes": 5145210,
     "installed_bytes": 0
   },
   "compat": {
@@ -101,6 +101,21 @@
   ],
   "changelog": [
     {
+      "version": "0.4.1",
+      "date": "2026-10-08",
+      "notes": [
+        "Builds for macOS (Apple silicon and Intel) and Linux (arm64 and amd64); 0.3.3 shipped for Apple-silicon Macs only",
+        "Never loses its keys: keeps a copy of both identity files outside the install dir, restores a missing one (after an uninstall, or an old pilotctl's upgrade) instead of creating a new key, and refuses to create one while any copy exists",
+        "pilotctl v1.13.0-v1.13.9 refuse this upgrade instead of deleting the wallet's keys (they delete an app's state on upgrade); the 0.3.3 key stays on disk until pilotctl is v1.13.10 or later",
+        "Exits when the daemon that started it dies; no per-call logging; never removes a newer instance's socket",
+        "wallet.help lists every method",
+        "Settler client; settler.transfer goes through the wallet spend cap",
+        "Spend-cap state is tamper-evident",
+        "The EVM contract asset is resolved before the cap check",
+        "Base Sepolia USDC EIP-712 domain name fixed (\"USDC\")"
+      ]
+    },
+    {
       "version": "0.3.3",
       "date": "2026-06-08",
       "notes": [
@@ -114,7 +129,7 @@
       "notes": [
         "Multichain EVM: same secp256k1 address across Base, Ethereum, Polygon",
         "New wallet.evm.chains method; all evm.* methods accept an optional chain_id",
-        "Per-chain RPC via PILOT_EVM_RPC_\u003cchainID\u003e"
+        "Per-chain RPC via PILOT_EVM_RPC_<chainID>"
       ]
     },
     {
@@ -187,7 +202,7 @@
     ]
   },
   "published_at": "2026-06-08T08:00:26Z",
-  "updated_at": "2026-06-08T09:16:19Z",
+  "updated_at": "2026-10-08T00:00:00Z",
   "next_steps": {
     "schema": 1,
     "app": "io.pilot.wallet",
